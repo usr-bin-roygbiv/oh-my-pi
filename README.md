@@ -12,7 +12,7 @@ For every issue opened on an allowlisted repository, robomp:
 3. **Keeps the conversation going** — follow-up comments and PR review comments resume the same omp session so the agent retains its prior reasoning and tool history.
 4. **Cleans up** on issue close / PR merge.
 
-The orchestrator runs in Docker on a single developer machine. There is no multi-tenant story; the LLM provider is whatever your local `~/.omp/agent/models.yml` points at; the only credentials inside the container are a GitHub PAT and the bot account's webhook secret.
+The orchestrator runs in Docker on a single developer machine alongside a sibling **gh-proxy** container that is the only process holding the GitHub PAT. The orchestrator authenticates to gh-proxy with a shared HMAC key over an internal-only Docker network; it never sees `GITHUB_TOKEN` itself. There is no multi-tenant story; the LLM provider is whatever your local `~/.omp/agent/models.yml` points at.
 
 ---
 
@@ -39,42 +39,46 @@ The orchestrator runs in Docker on a single developer machine. There is no multi
 
 ```
                 ┌──────────────────────────────────────────────────────┐
-                │ robomp container                                     │
+                │ default network (host-reachable)                     │
                 │                                                      │
- GitHub ─webhook─▶ FastAPI (server.py)                                 │
-                │      │ HMAC-verify + route()                         │
-                │      ▼                                               │
-                │  sqlite events table (durable queue)                 │
-                │      │                                               │
-                │      ▼                                               │
-                │  WorkerPool (queue.py) — MAX_CONCURRENCY tasks       │
-                │      │ per-issue serialization                       │
-                │      ▼                                               │
-                │  tasks.{triage_issue, handle_comment,                │
-                │         handle_review, handle_pr_conversation,      │
-                │         cleanup_workspace}                           │
-                │      │                                               │
-                │      ▼                                               │
-                │  worker.run_task — spawns RpcClient                  │
-                │      │ ┌── omp subprocess (bun … coding-agent) ───┐  │
-                │      └─┤   - cwd  = per-issue git worktree         │  │
-                │        │   - host tools: gh_*, classify_*, repro_  │  │
-                │        │   - session resumed across follow-ups     │  │
-                │        └────────────────────────────────────────────┘ │
-                │                                                      │
-                │  github_client.py (httpx, follow_redirects)         │
-                │  sandbox.py (clone pool, worktree lifecycle)        │
-                │  host_tools.py (audited, credential-redacted)        │
+                │  ┌────────────────────────────────────────────────┐  │
+ GitHub ─webhook─▶│ robomp container                                │  │
+                │  │   FastAPI (server.py) — HMAC-verify + route()  │  │
+                │  │   sqlite events table (durable queue)          │  │
+                │  │   WorkerPool — MAX_CONCURRENCY tasks           │  │
+                │  │   tasks.{triage_issue, handle_comment, …}      │  │
+                │  │   worker.run_task → omp subprocess (bun)       │  │
+                │  │     - cwd = per-issue git worktree              │  │
+                │  │     - host tools: gh_*, classify_*, repro_      │  │
+                │  │   host_tools.py (audited, credential-redacted)  │  │
+                │  │   github surface = GitHubProxyClient + Proxy-  │  │
+                │  │     GitTransport (HMAC-signed → gh-proxy)      │  │
+                │  │   ENV: ROBOMP_GH_PROXY_HMAC_KEY only           │  │
+                │  │        (NO GITHUB_TOKEN — refuses to start)    │  │
+                │  └──────────────┬─────────────────────────────────┘  │
+                │                 │  HMAC-signed HTTP                  │
+                └─────────────────┼────────────────────────────────────┘
+                                  │
+                ┌─────────────────┼────────────────────────────────────┐
+                │ robomp_internal network (internal: true — no egress)│
+                │                 ▼                                    │
+                │  ┌────────────────────────────────────────────────┐  │
+                │  │ gh-proxy container (python -m robomp.proxy)   │  │
+                │  │   FastAPI on :8081 (no host port mapping)     │  │
+                │  │   verifies HMAC → injects PAT into REST calls │  │
+                │  │   drives `git push` via --config-env auth     │  │
+                │  │   ENV: GITHUB_TOKEN + ROBOMP_GH_PROXY_HMAC_KEY │  │
+                │  └────────────────────────────────────────────────┘  │
                 └──────────────────────────────────────────────────────┘
    Mounts (host → container, read-only unless noted):
-     /work/pi                       → /work/pi              (omp source)
-     ~/.omp/agent/models.yml        → /root/.omp/agent/models.yml
-     ./data                         → /data                 (rw — sqlite, logs, workspaces)
-   extra_hosts:
+     /work/pi                       → /work/pi              (orchestrator only)
+     ~/.omp/agent/models.yml        → /root/.omp/agent/models.yml (orchestrator only)
+     ./data                         → /data                 (rw — shared by both containers)
+   extra_hosts (orchestrator only):
      llm-gateway.internal:host-gateway  (so models.yml URLs reach the host proxy)
 ```
 
-The orchestrator container is the isolation boundary. Per-issue git worktrees under `/data/workspaces/<owner>__<repo>__<n>/repo/` give per-task filesystem isolation. There is no docker-in-docker.
+Two containers form the trust boundary: the **orchestrator** runs FastAPI + the omp subprocess + host tools, while the **gh-proxy** sibling is the only process that holds `GITHUB_TOKEN` and the only one that talks to api.github.com. Per-issue git worktrees under `/data/workspaces/<owner>__<repo>__<n>/repo/` (shared between both containers via the `./data` bind mount) give per-task filesystem isolation. There is no docker-in-docker.
 
 ---
 
@@ -91,7 +95,7 @@ Numbered concretely so you can grep logs for each step.
    - Worktree at `/data/workspaces/<owner>__<repo>__<n>/repo` on a deterministic branch `farm/<8hex>/<slug>` derived from `(repo, number)`.
    - `git remote set-url origin` always re-set with the credentialed URL (rotates with PAT).
    - `git config user.email/user.name` set to the configured identity.
-6. **omp subprocess** — `RpcClient(omp --mode rpc, cwd=worktree, session_dir=…, no_session=False)` so follow-ups resume the same conversation/tool history. Model is randomly picked from `ROBOMP_MODEL` (CSV pool).
+6. **omp subprocess** — `RpcClient(omp --mode rpc, cwd=worktree, session_dir=…, no_session=False)` so follow-ups resume the same conversation/tool history. When `<session_dir>/*.jsonl` already exists (follow-up event or crash-restarted task) the worker passes `--continue` so the agent re-enters its prior reasoning, todos, and tool history from the JSONL transcript. Model is randomly picked from `ROBOMP_MODEL` (CSV pool).
 7. **Agent (Claude / GPT / …)** drives the work via:
    - **Built-in omp tools** — `read`, `edit`, `write`, `bash`, `lsp`, etc. — operate on the worktree only.
    - **Host tools** — the only surface that mutates GitHub or persists audit rows. See below.
@@ -232,7 +236,9 @@ All variables are read from `.env` (via `env_file:` in `docker-compose.yml`). Va
 
 | Variable | Required | Description |
 |---|---|---|
-| `GITHUB_TOKEN` | yes | PAT for the bot account. Used as both REST bearer and HTTPS-clone password. |
+| `GITHUB_TOKEN` | yes (gh-proxy only) | PAT for the bot account. Lives ONLY in the gh-proxy container. The orchestrator container refuses to start if `GITHUB_TOKEN` is set in its env. |
+| `ROBOMP_GH_PROXY_HMAC_KEY` | yes (both) | Shared HMAC secret the orchestrator uses to authenticate every request to gh-proxy (`openssl rand -hex 32`). Both containers MUST read the same value. |
+| `ROBOMP_GH_PROXY_URL` | no (default: `http://gh-proxy:8081`) | URL the orchestrator uses to reach gh-proxy over the internal-only docker network. |
 | `GITHUB_WEBHOOK_SECRET` | yes | Shared HMAC secret with the GitHub webhook config. |
 | `ROBOMP_BOT_LOGIN` | yes | The bot account's login name (e.g. `roboomp`). Used to skip self-comments and as default `git user.name`. |
 | `ROBOMP_REPO_ALLOWLIST` | yes | Comma-separated `owner/repo` entries. Case-insensitive. |
@@ -273,7 +279,7 @@ docker compose exec robomp robomp cleanup owner/repo#123   # force workspace rem
 - **No PR without a recorded repro.** The persona prompt requires `repro_record` before any code change; if reproduction genuinely fails, `mark_unable_to_reproduce` closes the loop politely.
 - **One PR per issue.** Follow-up comments and reviews push commits to the same `farm/<hex>/<slug>` branch; the same PR receives all amendments.
 - **Session persistence.** Each issue has its own `.omp-session/` directory under the workspace, mounted via `/data` so it survives container restarts. Follow-ups resume the prior conversation without re-reading the issue.
-- **At-least-once.** On crash mid-task, `WorkerPool.start()` resets `running` events to `queued` and retries. A comment/PR posted before the crash *will* be reposted; design follow-ups to be idempotent (e.g. don't repeat the same `gh_post_comment` if you can detect via `fetch_issue_thread` that you already posted).
+- **Crash recovery.** The sqlite `events` queue persists every verified webhook before the receiver returns `202`. On next start, `db.reset_stuck_running()` flips any `running` row back to `queued`; the dispatcher then re-runs that task, and because `<session_dir>/*.jsonl` already exists the worker passes `--continue` so the agent re-enters its prior reasoning, todos, and tool history from the JSONL transcript instead of restarting from scratch. Cleanly-drained shutdown is bounded by `ROBOMP_SHUTDOWN_DRAIN_TIMEOUT_SECONDS` (default 25s) plus `ROBOMP_SHUTDOWN_KILL_TIMEOUT_SECONDS` (default 5s); `stop_grace_period: 30s` in `docker-compose.yml` covers both. Side-effect idempotency (e.g. don't double-post the same `gh_post_comment` — detect prior posts via `fetch_issue_thread`) remains the agent's responsibility; the residual write-then-crash race is documented as out-of-scope follow-up.
 - **Logs.** All output is structured JSON (`{"ts","level","logger","msg",…}`) on stdout and rotated into `/data/logs/robomp.log.jsonl`. Useful filters:
   ```bash
   docker compose logs -f robomp | grep -v issues.labeled
@@ -312,18 +318,27 @@ docker compose logs -f robomp                 # in another shell, watch each too
 
 ## Security posture (v1)
 
-- **GitHub PAT** is the only credential needed for normal operation. A fine-grained token scoped to the allowlisted repos is the recommended posture (and what `gh_push_branch` assumes for HTTPS auth).
+### Credential isolation
+
+- **`GITHUB_TOKEN` lives only in the gh-proxy container.** docker-compose injects it via `env_file: .env` into gh-proxy and nowhere else. The orchestrator's startup explicitly refuses to boot if it observes `GITHUB_TOKEN` in its own environment (`_require_proxy_mode` in `cli.py` / `server.py`), so a misconfigured `.env` fails loudly instead of leaking the PAT into the agent subprocess.
+- **Orchestrator holds only the HMAC key.** `ROBOMP_GH_PROXY_HMAC_KEY` is the sole credential the orchestrator carries. It signs every proxy request (`proxy_hmac.sign`) with a timestamp + HMAC-SHA256 over the canonical request; gh-proxy verifies with a ±30s skew window and constant-time compare.
+- **Agent subprocess gets neither.** `worker._SCRUBBED_ENV_KEYS` strips `GITHUB_TOKEN`, `ROBOMP_GH_PROXY_HMAC_KEY`, and friends out of the env passed to the omp subprocess; the agent's host tools authenticate to gh-proxy through the orchestrator's in-process `GitHubProxyClient`, never by reading env vars.
+- **`git push` uses `--config-env` PAT injection inside gh-proxy.** The proxy never writes the PAT to disk or to a credentialed remote URL. It invokes `git -c http.extraheader=AUTHORIZATION:basic\ <base64-via-env> push …` so the token is passed through a process env var that lives only for the duration of the push; the remote URL stays token-free in `.git/config`.
+- **Network isolation.** gh-proxy is reachable only on the `robomp_internal` Docker network (`internal: true` — no host port mapping, no external egress allowed into it). The orchestrator joins both the default network (for webhook ingress + the host LLM gateway) and `robomp_internal`. gh-proxy never joins the default network.
+
+### Request hygiene
+
 - **Webhook signature** is verified with constant-time HMAC-SHA256; bad signatures return `401` (not `5xx`) so GitHub stops retrying spam.
 - **Allowlist**. `route()` skips any event whose `repository.full_name` isn't in `ROBOMP_REPO_ALLOWLIST` (case-insensitive). No state mutation, no audit row beyond `state=skipped`.
 - **Bot self-comments + bot-authored review comments** are filtered out at routing time (by `login == bot_login`, `*[bot]` suffix, or `user.type == "Bot"`).
-- **Token never enters audited data.** `subprocess` errors flow through `sandbox.GitCommandError` which redacts `https://user:password@host` → `https://***@host` from argv, stdout, and stderr before raising. `host_tools._audit` only records the agent's tool arguments and structured results, never the credentialed clone URL.
+- **Token never enters audited data.** `git` subprocess errors flow through `git_ops.GitCommandError` which redacts `https://user:password@host` → `https://***@host` from argv, stdout, and stderr before raising. `host_tools._audit` only records the agent's tool arguments and structured results, never the credentialed clone URL.
 - **Pre-push gates** in `gh_push_branch`:
   1. branch must match the workspace branch (no opportunistic pushing to arbitrary refs),
   2. working tree must be clean,
   3. every commit between `origin/<default-branch>..HEAD` must carry the configured `ROBOMP_GIT_AUTHOR_NAME` + `ROBOMP_GIT_AUTHOR_EMAIL`.
 - **Pre-PR gates** in `gh_open_pr`: when the repository defines them, `bun run fix` runs first (any resulting diff is auto-committed as `style: bun run fix` with the configured bot identity) and `bun check` runs second. A failing `bun check` is returned to the agent as `RpcCommandError` so it can iterate at the source and retry. Both gates short-circuit before the PR is pushed/created.
 - **`/webhook/github` is the only public path.** The recommended Cloudflare ingress config restricts the tunnel hostname to that exact path; admin/inspection routes are localhost-only.
-- **LLM credentials never enter the container.** The host's LiteLLM proxy is reached via `extra_hosts: ["llm-gateway.internal:host-gateway"]`; the only thing mounted in is `~/.omp/agent/models.yml` (whose `apiKey` fields are stub characters — real auth happens at the gateway).
+- **LLM credentials never enter either container.** The host's LiteLLM proxy is reached via `extra_hosts: ["llm-gateway.internal:host-gateway"]` from the orchestrator only; the only thing mounted in is `~/.omp/agent/models.yml` (whose `apiKey` fields are stub characters — real auth happens at the gateway).
 
 ---
 

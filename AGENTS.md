@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-`robomp` is a self-hosted GitHub triage-and-fix bot that drives [`omp --mode rpc`](https://github.com/can1357/oh-my-pi) as a subprocess. On every issue opened in an allowlisted repository it classifies the issue, applies labels, then branches into one of: reproduce → fix → PR (`bug` / `documentation`), single-comment answer (`question`), single thoughtful comment (`enhancement` / `proposal`), or brief comment (`invalid` / `duplicate`). Follow-up comments and PR review comments resume the same omp session so the agent keeps its prior reasoning. The orchestrator runs as a single FastAPI process inside Docker with SQLite-backed durable event state.
+`robomp` is a self-hosted GitHub triage-and-fix bot that drives [`omp --mode rpc`](https://github.com/can1357/oh-my-pi) as a subprocess. On every issue opened in an allowlisted repository it classifies the issue, applies labels, then branches into one of: reproduce → fix → PR (`bug` / `documentation`), single-comment answer (`question`), single thoughtful comment (`enhancement` / `proposal`), or brief comment (`invalid` / `duplicate`). Follow-up comments and PR review comments resume the same omp session so the agent keeps its prior reasoning. If the orchestrator restarts mid-task, the dispatcher resumes the same session via `omp --continue` from the per-issue `session_dir`, so an interrupted task re-enters its prior reasoning instead of restarting from scratch. The orchestrator runs as a single FastAPI process inside Docker with SQLite-backed durable event state.
 
 ## Architecture & Data Flow
 
@@ -13,7 +13,7 @@ Webhook → durable queue → async dispatcher → per-issue git worktree → om
 3. `db.record_event()` inserts the event with `INSERT OR IGNORE` on `X-GitHub-Delivery` (dedup). Endpoint returns `202`.
 4. `queue.WorkerPool._dispatch_loop` atomically claims `state='queued'` rows under `BEGIN IMMEDIATE`, guarded by an in-process `_inflight` set keyed by `(owner, repo, number)` to serialize per-issue work. Cap: `ROBOMP_MAX_CONCURRENCY` (default 8).
 5. `sandbox.SandboxManager.ensure_workspace()` produces a worktree at `/data/workspaces/<owner>__<repo>__<n>/repo` on a deterministic branch `farm/<8hex>/<slug>`, backed by a shared `--filter=blob:none` clone pool. Credentialed remote URL and git identity are reset every time.
-6. `tasks.*` dispatchers build `TaskInputs` and call `worker.run_task()` which spawns `omp --mode rpc` with `cwd=worktree`, persistent `session_dir`, and a randomly-picked model from `ROBOMP_MODEL` (CSV pool).
+6. `tasks.*` dispatchers build `TaskInputs` and call `worker.run_task()` which spawns `omp --mode rpc` with `cwd=worktree`, persistent `session_dir`, and a randomly-picked model from `ROBOMP_MODEL` (CSV pool). When `<session_dir>/*.jsonl` already exists the worker passes `--continue`, so both follow-up events and crash-restarted events resume the same session.
 7. Inside the subprocess the agent uses **built-in omp tools** (read/edit/write/bash/lsp, scoped to the worktree) and **host tools** from `host_tools.py` (the only surface allowed to mutate GitHub or write audit rows).
 8. Success → event `state='done'`. Exception → `state='failed'` with a credential-redacted traceback in `events.last_error`. The `_inflight` slot is released either way.
 

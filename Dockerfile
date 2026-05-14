@@ -144,6 +144,7 @@ RUN chmod +x /usr/local/bin/robomp-entrypoint
 
 VOLUME ["/data"]
 EXPOSE 8080
+EXPOSE 8081
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/robomp-entrypoint"]
 CMD ["python", "-m", "robomp", "serve"]

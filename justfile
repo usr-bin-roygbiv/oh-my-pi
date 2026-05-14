@@ -84,6 +84,11 @@ logs:
     docker compose logs -f {{SERVICE}}
 
 [group('lifecycle')]
+[doc('follow gh-proxy logs (Ctrl-C to detach)')]
+proxy-logs:
+    docker compose logs -f gh-proxy
+
+[group('lifecycle')]
 [doc('tail the last N lines without following (default 200)')]
 tail LINES='200':
     docker compose logs --no-color --tail '{{LINES}}' {{SERVICE}}

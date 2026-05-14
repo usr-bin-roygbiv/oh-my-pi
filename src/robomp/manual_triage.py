@@ -9,7 +9,7 @@ import re
 from typing import Any
 
 from robomp.db import INACTIVE_EVENT_STATES, Database, issue_key
-from robomp.github_client import GitHubClient
+from robomp.github_backend import GitHubBackend
 
 _ISSUE_REF = re.compile(r"^(?P<owner>[^/\s]+)/(?P<repo>[^#\s]+)#(?P<number>\d+)$")
 
@@ -44,7 +44,7 @@ def manual_delivery_id(repo_full: str, number: int) -> str:
     return f"manual-{repo_full.replace('/', '__')}-{number}"
 
 
-async def build_issues_opened_payload(github: GitHubClient, repo_full: str, number: int) -> dict[str, Any]:
+async def build_issues_opened_payload(github: GitHubBackend, repo_full: str, number: int) -> dict[str, Any]:
     """Fetch the issue + repo metadata and synthesize an `issues.opened` payload."""
     issue = await github.get_issue(repo_full, number)
     if issue.is_pull_request:
@@ -69,7 +69,7 @@ async def build_issues_opened_payload(github: GitHubClient, repo_full: str, numb
     }
 
 
-async def enqueue_manual_triage(*, db: Database, github: GitHubClient, repo_full: str, number: int) -> str:
+async def enqueue_manual_triage(*, db: Database, github: GitHubBackend, repo_full: str, number: int) -> str:
     """Fetch the issue from GitHub and queue it for the worker pool.
 
     Returns the delivery_id. A row may already exist from a previous manual

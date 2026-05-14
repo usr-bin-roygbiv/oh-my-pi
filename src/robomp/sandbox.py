@@ -99,12 +99,15 @@ class GitTransport(Protocol):
 
     def clone_pool(self, *, repo: str, clone_url: str, default_branch: str, target: Path) -> None:
         """Fresh clone into `target`. `target` must not exist (or be empty)."""
+        ...
 
     def fetch_pool(self, *, repo: str, pool_dir: Path) -> None:
         """`git fetch --prune origin` against the shared pool clone."""
+        ...
 
     def fetch_base_ref(self, *, repo: str, pool_dir: Path, ref: str) -> None:
         """Best-effort `git fetch origin <ref>` to ensure the base branch is local."""
+        ...
 
     def push_branch(
         self,
@@ -116,6 +119,7 @@ class GitTransport(Protocol):
         expected_head: str,
     ) -> PushResult:
         """Push `branch` to origin. MUST refuse if HEAD has drifted from `expected_head`."""
+        ...
 
 
 class LocalGitTransport:
