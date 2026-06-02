@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as tls from "node:tls";
+import type { MessageCreateParamsStreaming } from "@anthropic-ai/sdk/resources/messages";
 import { Effort } from "@oh-my-pi/pi-ai";
 import type { CacheOptimizerOptions } from "@oh-my-pi/pi-ai/cache-optimizer";
 import {
@@ -15,6 +16,7 @@ import {
 	isClaudeCloakingUserId,
 	mapStainlessArch,
 	mapStainlessOs,
+	optimizeAnthropicCacheAlignment,
 	streamAnthropic,
 	stripClaudeToolPrefix,
 } from "@oh-my-pi/pi-ai/providers/anthropic";
@@ -173,6 +175,49 @@ describe("Anthropic request fingerprint alignment", () => {
 		)) as { system?: Array<{ type: string; text?: string; cache_control?: unknown }> };
 
 		expect(payload.system).toEqual([{ type: "text", text: "stable..", cache_control: { type: "ephemeral" } }]);
+	});
+
+	it("passes non-text Anthropic blocks to the tokenizer before padding cached text breakpoints", () => {
+		const countedPrefixes: string[][] = [];
+		const params: MessageCreateParamsStreaming = {
+			model: ANTHROPIC_MODEL.id,
+			max_tokens: 1024,
+			stream: true,
+			messages: [
+				{
+					role: "user",
+					content: [
+						{
+							type: "image",
+							source: { type: "base64", media_type: "image/png", data: "AAAAAAAA" },
+						},
+						{
+							type: "text",
+							text: "describe",
+							cache_control: { type: "ephemeral" },
+						},
+					],
+				},
+			],
+		};
+
+		optimizeAnthropicCacheAlignment(params, ANTHROPIC_MODEL, {
+			cacheOptimizer: {
+				enabled: true,
+				blockSize: 64,
+				paddingText: ".",
+				countTokens: segments => {
+					countedPrefixes.push(segments.map(segment => segment.text));
+					return countCacheOptimizerCharacters(segments);
+				},
+			},
+		});
+
+		expect(
+			countedPrefixes.some(
+				prefix => prefix.some(segment => segment.includes('"type":"image"')) && prefix.includes("describe"),
+			),
+		).toBe(true);
 	});
 
 	it("uses Bearer auth for non-Anthropic API bases with api-key credentials", () => {

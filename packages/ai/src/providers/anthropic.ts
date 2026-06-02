@@ -1959,7 +1959,8 @@ function updateAnthropicTextSegment(segments: CachePrefixSegment[], segmentIndex
 	segments[segmentIndex] = { ...segment, text };
 }
 
-function optimizeAnthropicCacheAlignment(
+/** Aligns Anthropic cache breakpoints against the complete cumulative wire prefix. */
+export function optimizeAnthropicCacheAlignment(
 	params: MessageCreateParamsStreaming,
 	model: Model<"anthropic-messages">,
 	options?: AnthropicOptions,
@@ -1999,14 +2000,24 @@ function optimizeAnthropicCacheAlignment(
 		const blocks = message.content as Array<ContentBlockParam & CacheControlBlock>;
 		for (let index = 0; index < blocks.length; index++) {
 			const block = blocks[index];
-			if (block?.type !== "text") continue;
-			const segmentIndex = pushAnthropicTextSegment(segments, "message", block.text, message.role);
-			if (!block.cache_control) continue;
-			const padding = buildCacheAlignmentPadding({ options: cacheOptimizer, model, segments, segmentIndex });
-			if (!padding) continue;
-			const text = block.text + padding;
-			blocks[index] = { ...block, text };
-			updateAnthropicTextSegment(segments, segmentIndex, text);
+			if (!block) continue;
+			if (block.type === "text") {
+				const segmentIndex = pushAnthropicTextSegment(segments, "message", block.text, message.role);
+				if (!block.cache_control) continue;
+				const padding = buildCacheAlignmentPadding({ options: cacheOptimizer, model, segments, segmentIndex });
+				if (!padding) continue;
+				const text = block.text + padding;
+				blocks[index] = { ...block, text };
+				updateAnthropicTextSegment(segments, segmentIndex, text);
+				continue;
+			}
+			// Non-text blocks (image, tool_use, tool_result, document, …) are part of
+			// Anthropic's cumulative prefix even though we cannot append padding to
+			// them. Serialize them so the supplied tokenizer sees the same prefix the
+			// provider will hash. cache_control breakpoints are stripped because they
+			// are wire-only annotations, not part of the cached content.
+			const { cache_control: _cacheControl, ...wireBlock } = block;
+			segments.push({ kind: "message", role: message.role, text: JSON.stringify(wireBlock) });
 		}
 	}
 }
