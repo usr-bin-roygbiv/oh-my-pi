@@ -25,22 +25,35 @@ interface FrameSink {
 	flush(): unknown;
 }
 
+function isThenable(value: unknown): value is PromiseLike<unknown> {
+	return value != null && typeof (value as { then?: unknown }).then === "function";
+}
+
 /**
  * Write a newline-delimited JSON-RPC frame to the subprocess's stdin sink,
- * swallowing synchronous errors so the caller can decide how to react.
+ * swallowing both synchronous throws and asynchronous Promise rejections
+ * so the caller can decide how to react.
  *
- * Bun's `FileSink` may throw synchronously (most reliably on Windows) when
- * the read end of the pipe has been closed by a subprocess that exited
- * between read-loop ticks. Letting that throw escape an `async` method
- * surfaces as an unhandled promise rejection at the call site.
+ * Bun's `FileSink` surfaces broken-pipe failures two ways: synchronously
+ * (most reliably on Windows when the read end has been closed between
+ * read-loop ticks), or asynchronously via a rejected Promise returned
+ * from `write()` / `flush()` once Bun's streaming writer has been engaged
+ * by a prior successful write. A sync `try/catch` catches only the first
+ * shape, leaving the async rejection floating — which the postmortem
+ * `unhandledRejection` handler turns into a fatal `process.exit(1)` (see
+ * issue #1782). Awaiting the thenables here funnels both shapes into the
+ * same `catch` clause so the helper returns `false` either way.
  *
- * Returns `true` when the frame was accepted by the sink, `false` when the
- * sink threw — callers signal transport closure on `false`.
+ * The returned Promise itself never rejects. Callers that want
+ * fire-and-forget semantics MAY `void` it; callers that want to detect
+ * failure MUST `await` it and branch on the `false` return.
  */
-export function writeFrame(stdin: FrameSink, frame: string): boolean {
+export async function writeFrame(stdin: FrameSink, frame: string): Promise<boolean> {
 	try {
-		stdin.write(frame);
-		stdin.flush();
+		const w = stdin.write(frame);
+		if (isThenable(w)) await w;
+		const f = stdin.flush();
+		if (isThenable(f)) await f;
 		return true;
 	} catch {
 		return false;
@@ -200,8 +213,10 @@ export class StdioTransport implements MCPTransport {
 			? { jsonrpc: "2.0" as const, id, error }
 			: { jsonrpc: "2.0" as const, id, result: result ?? {} };
 		// Silent on failure — a dead subprocess has no use for the response,
-		// and the read loop will close the transport on EOF.
-		writeFrame(this.#process.stdin, `${JSON.stringify(response)}\n`);
+		// and the read loop will close the transport on EOF. `writeFrame`
+		// resolves to `false` instead of rejecting, so the floating promise
+		// here is safe to discard.
+		void writeFrame(this.#process.stdin, `${JSON.stringify(response)}\n`);
 	}
 
 	#handleClose(): void {
@@ -287,14 +302,18 @@ export class StdioTransport implements MCPTransport {
 			}, timeout);
 		}
 
+		// Route through `writeFrame` so async EPIPE rejections from
+		// Bun's streaming writer land in this caller instead of escaping as
+		// an unhandled promise rejection. Sync throws are caught too. The
+		// pending request is already registered, so a race with the read
+		// loop closing the transport (which would reject our pending entry
+		// with "Transport closed") is harmless — the duplicate reject below
+		// is a no-op on an already-settled Promise.
 		const message = `${JSON.stringify(request)}\n`;
-		try {
-			// Bun's FileSink has write() method directly
-			this.#process.stdin.write(message);
-			this.#process.stdin.flush();
-		} catch (error: unknown) {
+		if (!(await writeFrame(this.#process.stdin, message))) {
 			cleanup();
-			reject(error instanceof Error ? error : new Error(String(error)));
+			reject(new Error(`Transport closed while sending request "${method}"`));
+			this.#handleClose();
 		}
 
 		return promise;
@@ -311,17 +330,20 @@ export class StdioTransport implements MCPTransport {
 			params: params ?? {},
 		};
 
-		// Bun's FileSink can throw EPIPE synchronously on Windows when the
-		// subprocess has exited between the last read-loop tick and this
-		// write (e.g. an MCP server that dies after returning `initialize`
-		// but before `notifications/initialized` is delivered). Tear the
-		// transport down so any wired `onClose` (and reconnect machinery)
-		// engages, then surface the failure to the caller so a write that
-		// dropped on the floor is never silently treated as delivered —
-		// `initializeConnection()` runs before the manager installs its
-		// `onClose` handler, so a swallowed failure there would yield a
-		// "connected" handle wrapping a dead transport. See #1710.
-		if (!writeFrame(this.#process.stdin, `${JSON.stringify(notification)}\n`)) {
+		// Bun's `FileSink` can fail in two ways when the subprocess has
+		// exited between the last read-loop tick and this write: a sync
+		// throw, or an asynchronously rejected Promise returned from
+		// `write()`/`flush()` (engaged on Windows by Bun's streaming
+		// writer once a prior successful write has been issued — the real
+		// `initialize` request immediately preceding this notify). Both
+		// shapes are funneled through `writeFrame` so this caller sees a
+		// single `false` return. Tear the transport down so any wired
+		// `onClose` (and reconnect machinery) engages, then surface the
+		// failure to the caller — `initializeConnection()` runs before the
+		// manager installs its `onClose` handler, so a swallowed failure
+		// would yield a "connected" handle wrapping a dead transport.
+		// See issues #1710 and #1782.
+		if (!(await writeFrame(this.#process.stdin, `${JSON.stringify(notification)}\n`))) {
 			this.#handleClose();
 			throw new Error(`Transport closed while sending notification "${method}"`);
 		}

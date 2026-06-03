@@ -2,13 +2,15 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { StdioTransport, writeFrame } from "../src/mcp/transports/stdio";
 
 // ---------------------------------------------------------------------------
-// writeFrame — the seam that catches synchronous FileSink failures so the
-// async `notify` / `#sendResponse` paths can decide whether to swallow or
-// surface the error. See issue #1710.
+// writeFrame — the seam that catches both synchronous FileSink throws and
+// asynchronous rejected Promises returned from write()/flush(), so every
+// caller (`notify`, `request`, `#sendResponse`) settles on `false` instead
+// of leaking the rejection as a fatal `unhandledRejection`. See issues
+// #1710 (sync throws) and #1782 (async rejections).
 // ---------------------------------------------------------------------------
 
 describe("writeFrame", () => {
-	it("writes and flushes, returning true on success", () => {
+	it("writes and flushes, returning true on success", async () => {
 		const sink = {
 			writes: [] as string[],
 			flushed: 0,
@@ -20,12 +22,12 @@ describe("writeFrame", () => {
 			},
 		};
 
-		expect(writeFrame(sink, '{"k":1}\n')).toBe(true);
+		await expect(writeFrame(sink, '{"k":1}\n')).resolves.toBe(true);
 		expect(sink.writes).toEqual(['{"k":1}\n']);
 		expect(sink.flushed).toBe(1);
 	});
 
-	it("returns false when write() throws synchronously (broken pipe)", () => {
+	it("returns false when write() throws synchronously (broken pipe)", async () => {
 		const sink = {
 			flushed: 0,
 			write() {
@@ -36,11 +38,11 @@ describe("writeFrame", () => {
 			},
 		};
 
-		expect(writeFrame(sink, "anything\n")).toBe(false);
+		await expect(writeFrame(sink, "anything\n")).resolves.toBe(false);
 		expect(sink.flushed).toBe(0);
 	});
 
-	it("returns false when flush() throws after a successful write", () => {
+	it("returns false when flush() throws after a successful write", async () => {
 		const sink = {
 			writes: [] as string[],
 			write(chunk: string) {
@@ -51,11 +53,11 @@ describe("writeFrame", () => {
 			},
 		};
 
-		expect(writeFrame(sink, "anything\n")).toBe(false);
+		await expect(writeFrame(sink, "anything\n")).resolves.toBe(false);
 		expect(sink.writes).toEqual(["anything\n"]);
 	});
 
-	it("does not propagate non-Error throws either", () => {
+	it("does not propagate non-Error throws either", async () => {
 		const sink = {
 			write() {
 				throw "string-thrown-non-error";
@@ -63,7 +65,78 @@ describe("writeFrame", () => {
 			flush() {},
 		};
 
-		expect(writeFrame(sink, "x")).toBe(false);
+		await expect(writeFrame(sink, "x")).resolves.toBe(false);
+	});
+
+	// ---- Async-rejection guards. These would fail on every platform if
+	// writeFrame only caught synchronous throws. They reproduce the Windows
+	// failure mode from #1782 against an arbitrary host because the sink
+	// is synthetic — a real Bun FileSink absorbs broken pipes on Linux.
+
+	it("returns false when write() returns a rejected Promise (async EPIPE)", async () => {
+		const sink = {
+			flushed: 0,
+			write() {
+				return Promise.reject(new Error("EPIPE: broken pipe, write"));
+			},
+			flush() {
+				this.flushed++;
+			},
+		};
+
+		const tracker = trackUnhandled();
+		try {
+			await expect(writeFrame(sink, "x\n")).resolves.toBe(false);
+			// flush() must not run after an async write failure.
+			expect(sink.flushed).toBe(0);
+			// Crucially: the rejected Promise from write() is consumed by
+			// writeFrame's await, so no rejection is left floating.
+			await Bun.sleep(20);
+			expect(tracker.capture()).toEqual([]);
+		} finally {
+			tracker.release();
+		}
+	});
+
+	it("returns false when flush() returns a rejected Promise after a successful write", async () => {
+		const sink = {
+			writes: [] as string[],
+			write(chunk: string) {
+				this.writes.push(chunk);
+			},
+			flush() {
+				return Promise.reject(new Error("EPIPE: broken pipe, flush"));
+			},
+		};
+
+		const tracker = trackUnhandled();
+		try {
+			await expect(writeFrame(sink, "x\n")).resolves.toBe(false);
+			expect(sink.writes).toEqual(["x\n"]);
+			await Bun.sleep(20);
+			expect(tracker.capture()).toEqual([]);
+		} finally {
+			tracker.release();
+		}
+	});
+
+	it("returns true when write()/flush() resolve asynchronously", async () => {
+		const sink = {
+			writes: [] as string[],
+			flushed: 0,
+			write(chunk: string) {
+				this.writes.push(chunk);
+				return Promise.resolve(chunk.length);
+			},
+			flush() {
+				this.flushed++;
+				return Promise.resolve(1);
+			},
+		};
+
+		await expect(writeFrame(sink, "ok\n")).resolves.toBe(true);
+		expect(sink.writes).toEqual(["ok\n"]);
+		expect(sink.flushed).toBe(1);
 	});
 });
 
@@ -174,6 +247,101 @@ describe("StdioTransport.notify", () => {
 
 			expect(tracker.capture()).toEqual([]);
 			expect(closed).toBe(true);
+			expect(transport.connected).toBe(false);
+		} finally {
+			tracker.release();
+		}
+	});
+});
+
+// ---------------------------------------------------------------------------
+// StdioTransport.request — same contract as `notify`, defended over the
+// request() path. The crash trace in #1782 is on this branch (the
+// `initialize` request), and #1711 fixed only the `notify`/`#sendResponse`
+// routes that went through `writeFrame`; `request()` had its own sync-only
+// `try/catch` until now. The handshake-shaped subprocess below mirrors the
+// real reporter scenario where the server dies while requests are in
+// flight. On Linux Bun absorbs the broken pipe so the test passes both
+// before and after the fix; on Windows it would unhandled-reject without
+// the fix, in lockstep with the writeFrame async-rejection unit tests
+// above that defend the seam itself cross-platform.
+// ---------------------------------------------------------------------------
+
+describe("StdioTransport.request", () => {
+	let transport: StdioTransport | undefined;
+
+	afterEach(async () => {
+		await transport?.close().catch(() => {});
+		transport = undefined;
+	});
+
+	it("rejects with 'Transport not connected' when called before connect()", async () => {
+		transport = new StdioTransport({
+			type: "stdio",
+			command: "bun",
+			args: ["-e", "process.exit(0)"],
+		});
+
+		await expect(transport.request("noop", {})).rejects.toThrow("Transport not connected");
+	});
+
+	it("does not surface unhandled rejections when the subprocess exits mid-handshake", async () => {
+		// Subprocess responds to the first JSON-RPC line, then exits — so the
+		// SECOND request races against a dead pipe. On Windows Bun's
+		// streaming writer surfaces the broken pipe as an asynchronously
+		// rejected Promise from write()/flush(); without routing through
+		// writeFrame, request()'s legacy sync-only `try/catch` missed it and
+		// the rejection escaped as a fatal `unhandledRejection`. See #1782.
+		const script = [
+			'let buf = "";',
+			"let served = 0;",
+			'process.stdin.on("data", (chunk) => {',
+			"  buf += chunk;",
+			'  let nl = buf.indexOf("\\n");',
+			"  while (nl >= 0) {",
+			"    const line = buf.slice(0, nl);",
+			"    buf = buf.slice(nl + 1);",
+			"    const msg = JSON.parse(line);",
+			"    if (served === 0 && msg.id != null) {",
+			"      process.stdout.write(",
+			'        JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: {} }) + "\\n",',
+			"      );",
+			"      served++;",
+			"      process.exit(0);",
+			"    }",
+			'    nl = buf.indexOf("\\n");',
+			"  }",
+			"});",
+		].join("\n");
+
+		const tracker = trackUnhandled();
+		transport = new StdioTransport({
+			type: "stdio",
+			command: "bun",
+			args: ["-e", script],
+			// Tight per-request timeout so the second request settles quickly
+			// when the read loop has closed but the dead-pipe race didn't.
+			timeout: 500,
+		});
+
+		try {
+			await transport.connect();
+
+			// First request completes — engages Bun's streaming writer.
+			await expect(transport.request("initialize", {})).resolves.toEqual({});
+
+			// Subsequent requests must reject (either from the write failing,
+			// the read loop closing, or the timeout) and NEVER leak as an
+			// unhandled rejection. Cover both the immediate-race and the
+			// post-handleClose path.
+			for (let i = 0; i < 5; i++) {
+				await transport.request("ping", {}).catch(() => {});
+			}
+
+			// Let any deferred microtasks settle before asserting.
+			await Bun.sleep(50);
+
+			expect(tracker.capture()).toEqual([]);
 			expect(transport.connected).toBe(false);
 		} finally {
 			tracker.release();
