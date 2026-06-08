@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed hide-secrets redaction so configured secrets are scrubbed from provider-facing system prompts, tool definitions, developer/system-reminder messages, and assistant tool-call arguments before model requests ([#2146](https://github.com/can1357/oh-my-pi/issues/2146)).
+
 ## [15.10.6] - 2026-06-08
 
 ### Added
