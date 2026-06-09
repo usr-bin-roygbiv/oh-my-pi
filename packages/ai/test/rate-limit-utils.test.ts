@@ -63,6 +63,12 @@ describe("isUsageLimitError", () => {
 			),
 		).toBe(true);
 	});
+
+	it("detects Antigravity individual quota exhaustion as a usage limit", () => {
+		expect(
+			isUsageLimitError("Cloud Code Assist API error (429): Individual quota reached. Contact your administrator."),
+		).toBe(true);
+	});
 });
 
 describe("calculateRateLimitBackoffMs", () => {

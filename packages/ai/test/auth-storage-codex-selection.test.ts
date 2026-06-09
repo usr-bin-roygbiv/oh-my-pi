@@ -854,3 +854,137 @@ describe("AuthStorage claude oauth ranking", () => {
 		expect(apiKey).toBe("api-acct-solo");
 	});
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Antigravity ranking tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+function createAntigravityLimit(args: { windowId: string; remainingFraction: number; resetInMs: number }): UsageLimit {
+	const remaining = Math.min(Math.max(args.remainingFraction, 0), 1);
+	const used = 1 - remaining;
+	return {
+		id: `google-antigravity:${args.windowId}`,
+		label: "Antigravity Usage",
+		scope: {
+			provider: "google-antigravity",
+			windowId: args.windowId,
+		},
+		window: {
+			id: args.windowId,
+			label: args.windowId,
+			resetsAt: Date.now() + args.resetInMs,
+		},
+		amount: {
+			unit: "percent",
+			remaining: remaining * 100,
+			used: used * 100,
+			limit: 100,
+			remainingFraction: remaining,
+			usedFraction: used,
+		},
+		status: remaining <= 0 ? "exhausted" : remaining <= 0.1 ? "warning" : "ok",
+	};
+}
+
+function createAntigravityUsageReport(args: {
+	accountId: string;
+	primary: { remainingFraction: number; resetInMs: number };
+	secondary: { remainingFraction: number; resetInMs: number };
+}): UsageReport {
+	return {
+		provider: "google-antigravity",
+		fetchedAt: Date.now(),
+		limits: [
+			createAntigravityLimit({
+				windowId: "5h",
+				remainingFraction: args.primary.remainingFraction,
+				resetInMs: args.primary.resetInMs,
+			}),
+			createAntigravityLimit({
+				windowId: "daily",
+				remainingFraction: args.secondary.remainingFraction,
+				resetInMs: args.secondary.resetInMs,
+			}),
+		],
+		metadata: { accountId: args.accountId },
+	};
+}
+
+describe("AuthStorage Antigravity oauth ranking", () => {
+	let tempDir = "";
+	let store: AuthCredentialStore | null = null;
+	let authStorage: AuthStorage | null = null;
+	const usageByAccount = new Map<string, UsageReport>();
+
+	const usageProvider: UsageProvider = {
+		id: "google-antigravity",
+		async fetchUsage(params) {
+			const accountId = params.credential.accountId;
+			if (!accountId) return null;
+			return usageByAccount.get(accountId) ?? null;
+		},
+	};
+
+	beforeEach(async () => {
+		tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-ai-auth-antigravity-selection-"));
+		store = await SqliteAuthCredentialStore.open(path.join(tempDir, "agent.db"));
+		authStorage = new AuthStorage(store, {
+			usageProviderResolver: provider => (provider === "google-antigravity" ? usageProvider : undefined),
+		});
+		usageByAccount.clear();
+		vi.spyOn(oauthUtils, "getOAuthApiKey").mockImplementation(async (_provider, credentials) => {
+			const credential = credentials["google-antigravity"] as OAuthCredentials | undefined;
+			if (!credential?.accountId) return null;
+			return {
+				apiKey: `api-${credential.accountId}`,
+				newCredentials: credential,
+			};
+		});
+	});
+
+	afterEach(async () => {
+		vi.restoreAllMocks();
+		store?.close();
+		store = null;
+		authStorage = null;
+		if (tempDir) {
+			await fs.rm(tempDir, { recursive: true, force: true });
+			tempDir = "";
+		}
+	});
+
+	test("skips exhausted account using default ranking", async () => {
+		if (!authStorage) throw new Error("test setup failed");
+
+		await authStorage.set("google-antigravity", [
+			{ type: "oauth", ...createCredential("acct-exhausted", "exhausted@example.com") },
+			{ type: "oauth", ...createCredential("acct-healthy", "healthy@example.com") },
+		]);
+
+		usageByAccount.set(
+			"acct-exhausted",
+			createAntigravityUsageReport({
+				accountId: "acct-exhausted",
+				primary: { remainingFraction: 0, resetInMs: 5 * 60 * 1000 },
+				secondary: { remainingFraction: 0, resetInMs: 5 * 60 * 1000 },
+			}),
+		);
+		usageByAccount.set(
+			"acct-healthy",
+			createAntigravityUsageReport({
+				accountId: "acct-healthy",
+				primary: { remainingFraction: 0.5, resetInMs: 3 * HOUR_MS },
+				secondary: { remainingFraction: 0.4, resetInMs: 18 * HOUR_MS },
+			}),
+		);
+
+		const counts = await countApiKeySelections(
+			authStorage,
+			"google-antigravity",
+			"session-antigravity-exhausted",
+			50,
+		);
+		expect(countFor(counts, "api-acct-exhausted")).toBe(0);
+		expect(countFor(counts, "api-acct-healthy")).toBeGreaterThan(0);
+	});
+});

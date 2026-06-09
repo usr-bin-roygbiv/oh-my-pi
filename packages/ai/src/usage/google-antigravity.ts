@@ -1,5 +1,6 @@
 import { getAntigravityUserAgent } from "../providers/google-gemini-headers";
 import type {
+	CredentialRankingStrategy,
 	UsageAmount,
 	UsageFetchContext,
 	UsageFetchParams,
@@ -293,6 +294,33 @@ async function fetchAntigravityUsage(params: UsageFetchParams, ctx: UsageFetchCo
 
 	return report;
 }
+
+const ANTIGRAVITY_DEFAULT_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+function usageRemainingFraction(limit: UsageLimit): number {
+	const remaining = limit.amount.remainingFraction;
+	if (typeof remaining === "number" && Number.isFinite(remaining)) return Math.max(0, Math.min(1, remaining));
+	const used = limit.amount.usedFraction;
+	if (typeof used === "number" && Number.isFinite(used)) return 1 - Math.max(0, Math.min(1, used));
+	return 0.5;
+}
+
+function compareAntigravityLimitPressure(left: UsageLimit, right: UsageLimit): number {
+	return usageRemainingFraction(left) - usageRemainingFraction(right);
+}
+
+export const antigravityRankingStrategy: CredentialRankingStrategy = {
+	findWindowLimits(report) {
+		const rankedLimits = [...report.limits].sort(compareAntigravityLimitPressure);
+		const primary = rankedLimits[0];
+		const secondary =
+			rankedLimits.find(limit => limit !== primary && limit.scope.windowId !== primary?.scope.windowId) ??
+			rankedLimits[1] ??
+			primary;
+		return { primary, secondary };
+	},
+	windowDefaults: { primaryMs: ANTIGRAVITY_DEFAULT_WINDOW_MS, secondaryMs: ANTIGRAVITY_DEFAULT_WINDOW_MS },
+};
 
 export const antigravityUsageProvider: UsageProvider = {
 	id: "google-antigravity",
