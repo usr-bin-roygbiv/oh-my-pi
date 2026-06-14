@@ -31,6 +31,379 @@ function isOsc66Line(line: string): boolean {
 	return line.includes(OSC66_LINE_PREFIX);
 }
 
+function normalizeHtmlEntitiesForTerminal(raw: string): string {
+	return raw.replace(/&nbsp;/gi, " ");
+}
+
+interface HtmlListState {
+	type: "ol" | "ul";
+	next: number;
+}
+
+interface HtmlNormalizationState {
+	lists: HtmlListState[];
+	openItems: boolean[];
+	itemHasContent: boolean[];
+	previousTagName: string;
+}
+
+function createHtmlNormalizationState(): HtmlNormalizationState {
+	return { lists: [], openItems: [], itemHasContent: [], previousTagName: "" };
+}
+
+const HTML_TAG_REGEX = /<\/?(?:br|p|ol|ul|li)\b(?:\s[^>]*)?\s*\/?>/gi;
+
+function isHtmlFormattingBoundaryTagName(name: string): boolean {
+	switch (name) {
+		case "br":
+		case "p":
+		case "ol":
+		case "ul":
+		case "li":
+			return true;
+		default:
+			return false;
+	}
+}
+
+function isHtmlFormattingWhitespace(text: string, previousTagName: string, nextTagName: string): boolean {
+	return (
+		text.trim() === "" &&
+		(isHtmlFormattingBoundaryTagName(previousTagName) || isHtmlFormattingBoundaryTagName(nextTagName))
+	);
+}
+
+function htmlTagName(tag: string): string {
+	const match = /^<\/?\s*([A-Za-z][A-Za-z0-9:-]*)/.exec(tag);
+	return match ? match[1].toLowerCase() : "";
+}
+
+function htmlOlStart(tag: string): number {
+	const match = /\bstart\s*=\s*(?:"(\d+)"|'(\d+)'|(\d+))/i.exec(tag);
+	if (!match) return 1;
+	return Number(match[1] ?? match[2] ?? match[3]);
+}
+
+function htmlTagNameFromToken(token: Token | undefined): string {
+	return token?.type === "html" && "raw" in token && typeof token.raw === "string" ? htmlTagName(token.raw) : "";
+}
+
+function appendHtmlLineBreak(output: string, force: boolean = false): string {
+	const trimmed = output.replace(/[ \t]+$/u, "");
+	return !force && trimmed.endsWith("\n") ? trimmed : `${trimmed}\n`;
+}
+
+function htmlListIndent(state: HtmlNormalizationState): string {
+	return "  ".repeat(Math.max(0, state.lists.length - 1));
+}
+
+function appendHtmlListBreak(output: string, state: HtmlNormalizationState): string {
+	const indent = htmlListIndent(state);
+	return output.endsWith(`${indent}\n`) ? output : appendHtmlLineBreak(output);
+}
+
+function markCurrentHtmlItemContent(state: HtmlNormalizationState, text: string): void {
+	if (text.trim() !== "" && state.itemHasContent.length > 0) {
+		state.itemHasContent[state.itemHasContent.length - 1] = true;
+	}
+}
+
+function isAtEmptyHtmlListItem(state: HtmlNormalizationState): boolean {
+	const itemIndex = state.itemHasContent.length - 1;
+	return state.openItems[itemIndex] === true && state.itemHasContent[itemIndex] !== true;
+}
+
+function shouldSkipHtmlListBreak(state: HtmlNormalizationState): boolean {
+	const itemIndex = state.openItems.length - 1;
+	return state.lists.length > 0 && state.openItems[itemIndex] === true && state.itemHasContent[itemIndex] === false;
+}
+
+function normalizeHtmlForTerminal(raw: string, state: HtmlNormalizationState = createHtmlNormalizationState()): string {
+	let output = "";
+	let lastIndex = 0;
+
+	for (const match of raw.matchAll(HTML_TAG_REGEX)) {
+		const tag = match[0];
+		const name = htmlTagName(tag);
+		const index = match.index ?? 0;
+		const textBeforeTag = normalizeHtmlEntitiesForTerminal(raw.slice(lastIndex, index));
+		if (!isHtmlFormattingWhitespace(textBeforeTag, state.previousTagName, name)) {
+			output += textBeforeTag;
+			markCurrentHtmlItemContent(state, textBeforeTag);
+			if (textBeforeTag.trim() !== "") state.previousTagName = "";
+		}
+		lastIndex = index + tag.length;
+
+		const previousTagName = state.previousTagName;
+		state.previousTagName = name;
+		const isClosing = /^<\//.test(tag);
+		const isSelfClosing = /\/\s*>$/.test(tag);
+
+		switch (name) {
+			case "br":
+				output = appendHtmlLineBreak(output, true);
+				break;
+			case "p":
+				if (isClosing) {
+					output = appendHtmlLineBreak(output);
+				} else if (output.trim() !== "" && !output.endsWith("\n") && !isAtEmptyHtmlListItem(state)) {
+					output = appendHtmlLineBreak(output);
+				}
+				break;
+			case "ol":
+				if (isClosing) {
+					state.lists.pop();
+					state.openItems.pop();
+					state.itemHasContent.pop();
+				} else if (!isSelfClosing) {
+					if (state.openItems.length > 0 && state.openItems[state.openItems.length - 1]) {
+						output = appendHtmlListBreak(output, state);
+					}
+					state.lists.push({ type: "ol", next: htmlOlStart(tag) });
+					state.openItems.push(false);
+					state.itemHasContent.push(false);
+				}
+				break;
+			case "ul":
+				if (isClosing) {
+					state.lists.pop();
+					state.openItems.pop();
+					state.itemHasContent.pop();
+				} else if (!isSelfClosing) {
+					if (state.openItems.length > 0 && state.openItems[state.openItems.length - 1]) {
+						output = appendHtmlListBreak(output, state);
+					}
+					state.lists.push({ type: "ul", next: 1 });
+					state.openItems.push(false);
+					state.itemHasContent.push(false);
+				}
+				break;
+			case "li": {
+				if (isClosing) {
+					output = appendHtmlLineBreak(output);
+					break;
+				}
+				if (state.openItems.length > 0) {
+					const itemOpenIndex = state.openItems.length - 1;
+					if (state.openItems[itemOpenIndex] && state.itemHasContent[itemOpenIndex] && previousTagName !== "li") {
+						output = appendHtmlListBreak(output, state);
+					}
+					state.openItems[itemOpenIndex] = true;
+					state.itemHasContent[itemOpenIndex] = false;
+				} else if (output.trim() !== "" && !output.endsWith("\n")) {
+					output = appendHtmlLineBreak(output);
+				}
+				const list = state.lists[state.lists.length - 1];
+				const indent = htmlListIndent(state);
+				if (list?.type === "ol") {
+					output += `${indent}${list.next}. `;
+					list.next++;
+				} else {
+					output += `${indent}• `;
+				}
+				break;
+			}
+			default:
+				output += tag;
+				break;
+		}
+	}
+
+	const remainingText = normalizeHtmlEntitiesForTerminal(raw.slice(lastIndex));
+	if (isHtmlFormattingWhitespace(remainingText, state.previousTagName, "")) return output;
+	markCurrentHtmlItemContent(state, remainingText);
+	if (remainingText.trim() !== "") state.previousTagName = "";
+	return output + remainingText;
+}
+
+const SGR_SEQUENCE_REGEX = /\x1b\[([0-9;:]*)m/g;
+
+interface AnsiCarryState {
+	bold: string;
+	dim: string;
+	italic: string;
+	underline: string;
+	strikethrough: string;
+	foreground: string;
+	background: string;
+}
+
+function createAnsiCarryState(): AnsiCarryState {
+	return {
+		bold: "",
+		dim: "",
+		italic: "",
+		underline: "",
+		strikethrough: "",
+		foreground: "",
+		background: "",
+	};
+}
+
+function ansiCarryPrefix(state: AnsiCarryState): string {
+	return (
+		state.bold +
+		state.dim +
+		state.italic +
+		state.underline +
+		state.strikethrough +
+		state.foreground +
+		state.background
+	);
+}
+
+function clearAnsiCarryState(state: AnsiCarryState): void {
+	state.bold = "";
+	state.dim = "";
+	state.italic = "";
+	state.underline = "";
+	state.strikethrough = "";
+	state.foreground = "";
+	state.background = "";
+}
+
+function sgrSequence(params: string): string {
+	return `\x1b[${params}m`;
+}
+
+function sgrExtendedColorEnd(parts: string[], index: number): number {
+	const mode = Number(parts[index + 1]);
+	if (mode === 5 && index + 2 < parts.length) return index + 2;
+	if (mode === 2 && index + 4 < parts.length) return index + 4;
+	return index;
+}
+
+function applyAnsiCarrySequence(state: AnsiCarryState, params: string): void {
+	if (params === "") {
+		clearAnsiCarryState(state);
+		return;
+	}
+	const parts = params.split(";");
+	for (let i = 0; i < parts.length; i++) {
+		const part = parts[i];
+		if (part.startsWith("38:")) {
+			state.foreground = sgrSequence(part);
+			continue;
+		}
+		if (part.startsWith("48:")) {
+			state.background = sgrSequence(part);
+			continue;
+		}
+		const code = part === "" ? 0 : Number(part);
+		if (!Number.isInteger(code)) continue;
+		switch (code) {
+			case 0:
+				clearAnsiCarryState(state);
+				break;
+			case 1:
+				state.bold = sgrSequence("1");
+				break;
+			case 2:
+				state.dim = sgrSequence("2");
+				break;
+			case 3:
+				state.italic = sgrSequence("3");
+				break;
+			case 4:
+				state.underline = sgrSequence("4");
+				break;
+			case 9:
+				state.strikethrough = sgrSequence("9");
+				break;
+			case 22:
+				state.bold = "";
+				state.dim = "";
+				break;
+			case 23:
+				state.italic = "";
+				break;
+			case 24:
+				state.underline = "";
+				break;
+			case 29:
+				state.strikethrough = "";
+				break;
+			case 38: {
+				const end = sgrExtendedColorEnd(parts, i);
+				if (end !== i) {
+					state.foreground = sgrSequence(parts.slice(i, end + 1).join(";"));
+					i = end;
+				}
+				break;
+			}
+			case 39:
+				state.foreground = "";
+				break;
+			case 48: {
+				const end = sgrExtendedColorEnd(parts, i);
+				if (end !== i) {
+					state.background = sgrSequence(parts.slice(i, end + 1).join(";"));
+					i = end;
+				}
+				break;
+			}
+			case 49:
+				state.background = "";
+				break;
+			default:
+				if ((code >= 30 && code <= 37) || (code >= 90 && code <= 97)) {
+					state.foreground = sgrSequence(part);
+				} else if ((code >= 40 && code <= 47) || (code >= 100 && code <= 107)) {
+					state.background = sgrSequence(part);
+				}
+				break;
+		}
+	}
+}
+
+function pushTerminalLine(lines: string[], line: string): void {
+	lines.push(visibleWidth(line) === 0 ? "" : line);
+}
+
+function appendSplitTerminalText(lines: string[], state: AnsiCarryState, line: string, text: string): string {
+	let start = 0;
+	while (start < text.length) {
+		const newlineIndex = text.indexOf("\n", start);
+		if (newlineIndex === -1) break;
+		line += text.slice(start, newlineIndex);
+		pushTerminalLine(lines, line);
+		line = ansiCarryPrefix(state);
+		start = newlineIndex + 1;
+	}
+	return line + text.slice(start);
+}
+
+function splitTerminalLines(text: string): string[] {
+	if (!text.includes("\x1b[")) {
+		const lines = text.split("\n");
+		while (lines.length > 1 && lines[lines.length - 1] === "") {
+			lines.pop();
+		}
+		return lines;
+	}
+
+	const state = createAnsiCarryState();
+	const lines: string[] = [];
+	let line = "";
+	let lastIndex = 0;
+
+	for (const match of text.matchAll(SGR_SEQUENCE_REGEX)) {
+		const sequence = match[0];
+		const index = match.index ?? 0;
+		line = appendSplitTerminalText(lines, state, line, text.slice(lastIndex, index));
+		line += sequence;
+		applyAnsiCarrySequence(state, match[1] ?? "");
+		lastIndex = index + sequence.length;
+	}
+
+	line = appendSplitTerminalText(lines, state, line, text.slice(lastIndex));
+	pushTerminalLine(lines, line);
+	while (lines.length > 1 && lines[lines.length - 1] === "") {
+		lines.pop();
+	}
+	return lines;
+}
+
 class StrictStrikethroughTokenizer extends Tokenizer {
 	override del(src: string): Tokens.Del | undefined {
 		const match = STRICT_STRIKETHROUGH_REGEX.exec(src);
@@ -997,9 +1370,13 @@ export class Markdown implements Component {
 				break;
 
 			case "html":
-				// Render HTML as plain text (escaped for terminal)
 				if ("raw" in token && typeof token.raw === "string") {
-					lines.push(this.#applyDefaultStyle(token.raw.trim()));
+					const cleaned = normalizeHtmlForTerminal(token.raw);
+					const blockLines = splitTerminalLines(cleaned);
+					for (const line of blockLines) {
+						const trimmed = line.trimEnd();
+						lines.push(trimmed.trim() === "" ? "" : this.#applyDefaultStyle(trimmed));
+					}
 				}
 				break;
 
@@ -1024,31 +1401,64 @@ export class Markdown implements Component {
 		const { applyText, stylePrefix } = resolvedStyleContext;
 		const applyTextWithNewlines = (text: string): string => {
 			const segments: string[] = text.split("\n");
-			return segments.map((segment: string) => applyText(segment)).join("\n");
+			return segments.map((segment: string) => (segment === "" ? "" : applyText(segment))).join("\n");
 		};
 		const swatchGlyph = this.#theme.symbols.colorSwatch || DEFAULT_COLOR_SWATCH_GLYPH;
+		let trimLeadingWhitespace = false;
+		const htmlState = createHtmlNormalizationState();
+		const markHtmlItemWhenContent = (text: string): void => {
+			markCurrentHtmlItemContent(htmlState, text);
+		};
+		const nextHtmlTagName = (index: number): string => {
+			for (let i = index + 1; i < tokens.length; i++) {
+				const token = tokens[i];
+				if (token?.type === "html") return htmlTagNameFromToken(token);
+				if (
+					token?.type === "text" &&
+					"text" in token &&
+					typeof token.text === "string" &&
+					token.text.trim() === ""
+				) {
+					continue;
+				}
+				return "";
+			}
+			return "";
+		};
 
-		for (const token of tokens) {
+		for (let tokenIndex = 0; tokenIndex < tokens.length; tokenIndex++) {
+			const token = tokens[tokenIndex];
 			if (isMathToken(token)) {
+				markHtmlItemWhenContent(token.text);
 				result += applyTextWithNewlines(renderMathToken(token.text));
 				continue;
 			}
 			switch (token.type) {
-				case "text":
+				case "text": {
+					const rawText = trimLeadingWhitespace ? token.text.replace(/^\s+/, "") : token.text;
+					const text = normalizeHtmlEntitiesForTerminal(rawText);
+					if (isHtmlFormattingWhitespace(text, htmlState.previousTagName, nextHtmlTagName(tokenIndex))) break;
+					trimLeadingWhitespace = false;
+					markHtmlItemWhenContent(text);
+					if (token.tokens) markHtmlItemWhenContent(plainInlineTokens(token.tokens));
 					// Text tokens in list items can have nested tokens for inline formatting
 					if (token.tokens && token.tokens.length > 0) {
 						result += this.#renderInlineTokens(token.tokens, resolvedStyleContext);
 					} else {
-						result += renderTextWithSwatches(token.text, applyTextWithNewlines, swatchGlyph);
+						result += renderTextWithSwatches(text, applyTextWithNewlines, swatchGlyph);
 					}
+					if (text.trim() !== "") htmlState.previousTagName = "";
 					break;
+				}
 
 				case "paragraph":
 					// Paragraph tokens contain nested inline tokens
+					markHtmlItemWhenContent(plainInlineTokens(token.tokens || []));
 					result += this.#renderInlineTokens(token.tokens || [], resolvedStyleContext);
 					break;
 
 				case "strong": {
+					markHtmlItemWhenContent(plainInlineTokens(token.tokens || []));
 					const boldContent = this.#renderInlineTokens(token.tokens || [], resolvedStyleContext);
 					result += this.#theme.bold(boldContent) + stylePrefix;
 					break;
@@ -1056,16 +1466,19 @@ export class Markdown implements Component {
 
 				case "em": {
 					const italicContent = this.#renderInlineTokens(token.tokens || [], resolvedStyleContext);
+					markHtmlItemWhenContent(plainInlineTokens(token.tokens || []));
 					result += this.#theme.italic(italicContent) + stylePrefix;
 					break;
 				}
 
 				case "codespan": {
+					markHtmlItemWhenContent(token.text);
 					result += codespanSwatch(token.text, swatchGlyph) + this.#theme.code(token.text) + stylePrefix;
 					break;
 				}
 
 				case "link": {
+					markHtmlItemWhenContent(token.text);
 					const linkText = this.#renderInlineTokens(token.tokens || [], resolvedStyleContext);
 					const styledLinkText = this.#theme.link(this.#theme.underline(linkText));
 					const clickableLinkText = formatHyperlink(styledLinkText, token.href);
@@ -1085,25 +1498,39 @@ export class Markdown implements Component {
 
 				case "br":
 					result += "\n";
+					trimLeadingWhitespace = true;
 					break;
 
 				case "del": {
 					const delContent = this.#renderInlineTokens(token.tokens || [], resolvedStyleContext);
+					markHtmlItemWhenContent(plainInlineTokens(token.tokens || []));
 					result += this.#theme.strikethrough(delContent) + stylePrefix;
 					break;
 				}
 
 				case "html":
-					// Render inline HTML as plain text
 					if ("raw" in token && typeof token.raw === "string") {
-						result += applyTextWithNewlines(token.raw);
+						const cleaned = normalizeHtmlForTerminal(token.raw, htmlState);
+						if (cleaned === "\n" && shouldSkipHtmlListBreak(htmlState)) break;
+						result += applyTextWithNewlines(cleaned);
+						if (cleaned.endsWith("\n")) {
+							trimLeadingWhitespace = true;
+						} else if (cleaned.length > 0) {
+							trimLeadingWhitespace = false;
+						}
 					}
 					break;
 
 				default:
 					// Handle any other inline token types as plain text
 					if ("text" in token && typeof token.text === "string") {
-						result += applyTextWithNewlines(token.text);
+						const rawText = trimLeadingWhitespace ? token.text.replace(/^\s+/, "") : token.text;
+						const text = normalizeHtmlEntitiesForTerminal(rawText);
+						if (isHtmlFormattingWhitespace(text, htmlState.previousTagName, nextHtmlTagName(tokenIndex))) break;
+						trimLeadingWhitespace = false;
+						markHtmlItemWhenContent(text);
+						result += applyTextWithNewlines(text);
+						if (text.trim() !== "") htmlState.previousTagName = "";
 					}
 			}
 		}
@@ -1260,6 +1687,10 @@ export class Markdown implements Component {
 		return Math.min(longest, maxWidth);
 	}
 
+	#terminalLineWidths(text: string): number[] {
+		return splitTerminalLines(text).map(line => visibleWidth(line));
+	}
+
 	/**
 	 * Wrap a table cell to fit into a column.
 	 *
@@ -1267,7 +1698,8 @@ export class Markdown implements Component {
 	 * consistently with the rest of the renderer.
 	 */
 	#wrapCellText(text: string, maxWidth: number): string[] {
-		return wrapTextWithAnsi(text, Math.max(1, maxWidth));
+		const cellWidth = Math.max(1, maxWidth);
+		return splitTerminalLines(text).flatMap(line => wrapTextWithAnsi(line, cellWidth));
 	}
 
 	/**
@@ -1307,13 +1739,15 @@ export class Markdown implements Component {
 		const minWordWidths: number[] = [];
 		for (let i = 0; i < numCols; i++) {
 			const headerText = this.#renderInlineTokens(token.header[i].tokens || [], styleContext);
-			naturalWidths[i] = visibleWidth(headerText);
+			const headerLineWidths = this.#terminalLineWidths(headerText);
+			naturalWidths[i] = Math.max(...headerLineWidths, 0);
 			minWordWidths[i] = Math.max(1, this.#getLongestWordWidth(headerText, maxUnbrokenWordWidth));
 		}
 		for (const row of token.rows) {
 			for (let i = 0; i < row.length; i++) {
 				const cellText = this.#renderInlineTokens(row[i].tokens || [], styleContext);
-				naturalWidths[i] = Math.max(naturalWidths[i] || 0, visibleWidth(cellText));
+				const cellLineWidths = this.#terminalLineWidths(cellText);
+				naturalWidths[i] = Math.max(naturalWidths[i] || 0, ...cellLineWidths);
 				minWordWidths[i] = Math.max(
 					minWordWidths[i] || 1,
 					this.#getLongestWordWidth(cellText, maxUnbrokenWordWidth),

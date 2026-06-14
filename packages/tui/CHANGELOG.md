@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed Markdown renderer rendering raw HTML tags (like `<br>`, `<li>`, `<ul>`, `<ol>`, and `<p>`) literally in the terminal by parsing and converting them to appropriate terminal formatting, preserving repeated HTML line breaks, nested HTML list indentation, ordered list numbering, paragraph-wrapped list item markers, paragraph separation, table sizing after HTML line breaks, implicit list item breaks, and ANSI styling across HTML line splits.
+
 ## [16.0.9] - 2026-06-18
 
 ### Fixed
