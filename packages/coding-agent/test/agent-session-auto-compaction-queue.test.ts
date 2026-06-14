@@ -292,10 +292,46 @@ describe("AgentSession auto-compaction queue resume", () => {
 		session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMsg] });
 
 		await withTimeout(reminderDone, 1000, "Todo reminder timed out");
-		await Promise.resolve();
+		for (let i = 0; i < 20; i++) {
+			await Promise.resolve();
+		}
 
 		expect(getRuntimeSignals()).toContain("todo:1/3");
 		expect(continueSpy).toHaveBeenCalledTimes(1);
 		await session.waitForIdle();
+	});
+
+	it("triggers pre-prompt compaction before intermediate agent.continue execution", async () => {
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue();
+
+		session.settings.override("compaction.thresholdTokens", 5);
+		session.settings.override("compaction.enabled", true);
+
+		session.agent.replaceMessages([
+			{ role: "user", content: "hello", timestamp: Date.now() },
+			{
+				role: "assistant",
+				content: [{ type: "text", text: "a ".repeat(50) }],
+				usage: {
+					input: 10,
+					output: 5,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 15,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "stop",
+				timestamp: Date.now(),
+				api: "anthropic-messages",
+				provider: "anthropic",
+				model: "claude-sonnet-4-5",
+			},
+		]);
+
+		await session.prompt("Next turn");
+
+		const signals = getRuntimeSignals();
+		expect(signals).toContain("compaction:start:threshold");
+		expect(promptSpy).toHaveBeenCalledTimes(1);
 	});
 });

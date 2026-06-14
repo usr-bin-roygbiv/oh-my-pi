@@ -2827,6 +2827,11 @@ export class AgentSession {
 						options?.onSkip?.();
 						return;
 					}
+					await this.#runPrePromptCompactionIfNeeded([]);
+					if (signal.aborted || this.#isDisposed) {
+						options?.onSkip?.();
+						return;
+					}
 					await this.agent.continue();
 				} catch (error) {
 					logger.warn("agent.continue failed after scheduling", {
