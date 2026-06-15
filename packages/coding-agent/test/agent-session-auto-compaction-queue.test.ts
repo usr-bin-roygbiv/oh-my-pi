@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
+import * as compactionModule from "@oh-my-pi/pi-agent-core/compaction";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -332,6 +333,146 @@ describe("AgentSession auto-compaction queue resume", () => {
 
 		const signals = getRuntimeSignals();
 		expect(signals).toContain("compaction:start:threshold");
+		expect(promptSpy).toHaveBeenCalledTimes(1);
+	});
+
+	it("includes the queued follow-up payload in pre-continue compaction estimates", async () => {
+		const userMsg = { role: "user" as const, content: "hello", timestamp: Date.now() - 2 };
+		const assistantMsg = {
+			role: "assistant" as const,
+			content: [{ type: "text" as const, text: "Done." }],
+			usage: {
+				input: 10,
+				output: 5,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 15,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop" as const,
+			timestamp: Date.now() - 1,
+			api: "anthropic-messages" as const,
+			provider: "anthropic" as const,
+			model: "claude-sonnet-4-5",
+		};
+		sessionManager.appendMessage(assistantMsg);
+		session.agent.replaceMessages([userMsg, assistantMsg]);
+
+		const contextWindow = session.model?.contextWindow ?? 200_000;
+		const baseline = session.getContextBreakdown({ contextWindow, pendingMessages: [] })?.usedTokens ?? 0;
+		session.settings.override("compaction.thresholdTokens", baseline + 10);
+		session.settings.override("compaction.enabled", true);
+		session.settings.override("contextPromotion.enabled", false);
+
+		const { promise: compactionDone, resolve: onCompactionDone } = Promise.withResolvers<void>();
+		session.subscribe(event => {
+			if (event.type === "auto_compaction_end") onCompactionDone();
+		});
+		const continueSpy = vi.spyOn(session.agent, "continue").mockImplementation(async () => {
+			session.agent.clearAllQueues();
+		});
+
+		await session.followUp("queued follow-up ".repeat(500));
+		await withTimeout(compactionDone, 1000, "Queued follow-up compaction timed out");
+		await session.waitForIdle();
+
+		expect(getRuntimeSignals()).toContain("compaction:start:threshold");
+		expect(continueSpy).toHaveBeenCalledTimes(1);
+	});
+
+	it("preserves queued follow-up through pre-continue handoff and resumes it", async () => {
+		const generateHandoffSpy = vi.spyOn(compactionModule, "generateHandoff").mockResolvedValue("## Goal\nContinue");
+		const userMsg = { role: "user" as const, content: "hello", timestamp: Date.now() - 2 };
+		const assistantMsg = {
+			role: "assistant" as const,
+			content: [{ type: "text" as const, text: "Done." }],
+			usage: {
+				input: 10,
+				output: 5,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 15,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop" as const,
+			timestamp: Date.now() - 1,
+			api: "anthropic-messages" as const,
+			provider: "anthropic" as const,
+			model: "claude-sonnet-4-5",
+		};
+		sessionManager.appendMessage(assistantMsg);
+		session.agent.replaceMessages([userMsg, assistantMsg]);
+
+		const contextWindow = session.model?.contextWindow ?? 200_000;
+		const baseline = session.getContextBreakdown({ contextWindow, pendingMessages: [] })?.usedTokens ?? 0;
+		session.settings.override("compaction.strategy", "handoff");
+		session.settings.override("compaction.thresholdTokens", baseline + 10);
+		session.settings.override("compaction.enabled", true);
+		session.settings.override("contextPromotion.enabled", false);
+
+		const { promise: continued, resolve: onContinue } = Promise.withResolvers<void>();
+		const continueSpy = vi.spyOn(session.agent, "continue").mockImplementation(async () => {
+			expect(session.agent.peekFollowUpQueue()).toHaveLength(1);
+			session.agent.clearAllQueues();
+			onContinue();
+		});
+
+		await session.followUp("queued follow-up ".repeat(500));
+		await withTimeout(continued, 1000, "Queued handoff follow-up was not resumed");
+		await session.waitForIdle();
+
+		expect(generateHandoffSpy).toHaveBeenCalledTimes(1);
+		expect(continueSpy).toHaveBeenCalledTimes(1);
+		expect(session.agent.hasQueuedMessages()).toBe(false);
+	});
+
+	it("preserves transient messages during pre-prompt compaction", async () => {
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue();
+
+		session.settings.override("compaction.thresholdTokens", 5);
+		session.settings.override("compaction.enabled", true);
+
+		const userMsg = { role: "user" as const, content: "hello", timestamp: Date.now() };
+		const assistantMsg = {
+			role: "assistant" as const,
+			content: [{ type: "text" as const, text: "a ".repeat(50) }],
+			usage: {
+				input: 10,
+				output: 5,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 15,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop" as const,
+			timestamp: Date.now(),
+			api: "anthropic-messages" as const,
+			provider: "anthropic" as const,
+			model: "claude-sonnet-4-5",
+		};
+
+		sessionManager.appendMessage(assistantMsg);
+
+		const transientMsg = {
+			role: "developer" as const,
+			content: [{ type: "text" as const, text: "Transient reminder" }],
+			attribution: "agent" as const,
+			timestamp: Date.now(),
+		};
+		session.agent.replaceMessages([userMsg, assistantMsg, transientMsg]);
+
+		await session.prompt("Next turn");
+
+		const signals = getRuntimeSignals();
+		expect(signals).toContain("compaction:start:threshold");
+
+		const finalMessages = session.agent.state.messages;
+		const transientIndex = finalMessages.findIndex(
+			m => m.role === "developer" && m.content[0]?.text === "Transient reminder",
+		);
+		expect(transientIndex).toBeGreaterThan(-1);
+		expect(finalMessages[finalMessages.length - 1].role).toBe("developer");
+		expect(finalMessages[finalMessages.length - 1].content[0]?.text).toBe("Transient reminder");
 		expect(promptSpy).toHaveBeenCalledTimes(1);
 	});
 });

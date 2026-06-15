@@ -2827,7 +2827,7 @@ export class AgentSession {
 						options?.onSkip?.();
 						return;
 					}
-					await this.#runPrePromptCompactionIfNeeded([]);
+					await this.#runPrePromptCompactionIfNeeded(this.#pendingContinueMessagesForNextContinue());
 					if (signal.aborted || this.#isDisposed) {
 						options?.onSkip?.();
 						return;
@@ -3307,7 +3307,9 @@ export class AgentSession {
 					this.#markTtsrInjected(details.rules);
 				}
 				try {
+					await this.#runPrePromptCompactionIfNeeded(this.#pendingContinueMessagesForNextContinue());
 					await this.agent.continue();
+					this.#resolveTtsrResume();
 				} catch {
 					this.#resolveTtsrResume();
 				}
@@ -7728,6 +7730,8 @@ export class AgentSession {
 		}
 
 		this.#skipPostTurnMaintenanceAssistantTimestamp = undefined;
+		const queuedSteeringMessages = [...this.agent.peekSteeringQueue()];
+		const queuedFollowUpMessages = [...this.agent.peekFollowUpQueue()];
 
 		this.#handoffAbortController = new AbortController();
 		const handoffAbortController = this.#handoffAbortController;
@@ -7803,7 +7807,10 @@ export class AgentSession {
 			const preservedSteering = this.agent.peekSteeringQueue().slice();
 			const preservedFollowUp = this.agent.peekFollowUpQueue().slice();
 			this.agent.reset();
-			this.agent.replaceQueues(preservedSteering, preservedFollowUp);
+			this.agent.replaceQueues(
+				[...preservedSteering, ...queuedSteeringMessages],
+				[...preservedFollowUp, ...queuedFollowUpMessages],
+			);
 			this.#freshProviderSessionId = undefined;
 			this.#syncAgentSessionId();
 			this.#rekeyHindsightMemoryForCurrentSessionId();
@@ -7854,6 +7861,38 @@ export class AgentSession {
 			sourceSignal?.removeEventListener("abort", onSourceAbort);
 			this.#handoffAbortController = undefined;
 		}
+	}
+
+	#queuedBatchForMode(queue: readonly AgentMessage[], mode: "all" | "one-at-a-time"): AgentMessage[] {
+		if (mode === "one-at-a-time") {
+			const first = queue[0];
+			return first ? [first] : [];
+		}
+		return queue.slice();
+	}
+
+	#pendingContinueMessagesForNextContinue(): AgentMessage[] {
+		const messages = this.agent.state.messages;
+		if (messages.length === 0) return [];
+
+		const steering = this.#queuedBatchForMode(this.agent.peekSteeringQueue(), this.agent.getSteeringMode());
+		const last = messages[messages.length - 1];
+		if (last?.role !== "assistant") return steering;
+		if (steering.length > 0) return steering;
+
+		return this.#queuedBatchForMode(this.agent.peekFollowUpQueue(), this.agent.getFollowUpMode());
+	}
+
+	#captureTransientAgentMessages(): AgentMessage[] {
+		const persistedCount = this.buildDisplaySessionContext().messages.length;
+		return this.agent.state.messages.slice(persistedCount);
+	}
+
+	#replaceAgentMessagesFromSession(transientMessages: readonly AgentMessage[] = []): void {
+		const sessionContext = this.buildDisplaySessionContext();
+		this.agent.replaceMessages(
+			transientMessages.length > 0 ? [...sessionContext.messages, ...transientMessages] : sessionContext.messages,
+		);
 	}
 
 	#estimatePrePromptContextTokens(messages: AgentMessage[], contextWindow: number): number {
@@ -9210,6 +9249,16 @@ export class AgentSession {
 						aborted: false,
 						willRetry: false,
 					});
+					const canContinueQueuedMessages =
+						!autoCompactionSignal.aborted && reason !== "idle" && this.agent.hasQueuedMessages();
+					if (canContinueQueuedMessages) {
+						this.#scheduleAgentContinue({
+							delayMs: 100,
+							generation,
+							shouldContinue: () => this.agent.hasQueuedMessages(),
+						});
+						return COMPACTION_CHECK_CONTINUATION;
+					}
 					const continuationScheduled = !autoCompactionSignal.aborted && reason !== "idle" && shouldAutoContinue;
 					if (continuationScheduled) {
 						this.#scheduleAutoContinuePrompt(generation);
@@ -9244,6 +9293,7 @@ export class AgentSession {
 			}
 
 			const pathEntries = this.sessionManager.getBranch();
+			const transientMessages = this.#captureTransientAgentMessages();
 
 			const preparation = prepareCompaction(pathEntries, compactionSettings);
 			if (!preparation) {
@@ -9495,8 +9545,7 @@ export class AgentSession {
 				preserveData,
 			);
 			const newEntries = this.sessionManager.getEntries();
-			const sessionContext = this.buildDisplaySessionContext();
-			this.agent.replaceMessages(sessionContext.messages);
+			this.#replaceAgentMessagesFromSession(transientMessages);
 			// Compaction discarded the conversation history that carried the approved
 			// plan reference. Clear the sent-flag so #buildPlanReferenceMessage re-reads
 			// the plan from disk and re-injects it on the next turn (issue #1246).
