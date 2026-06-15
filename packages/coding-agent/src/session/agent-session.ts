@@ -1060,6 +1060,16 @@ function toRestoredQueuedMessage(message: AgentMessage): RestoredQueuedMessage {
 	return { text: queueChipText(message), images: queuedImageContent(message) };
 }
 
+function appendPreservedQueues<T>(preserved: readonly T[], queued: readonly T[]): T[] {
+	const merged = preserved.slice();
+	for (const item of queued) {
+		if (!merged.includes(item)) {
+			merged.push(item);
+		}
+	}
+	return merged;
+}
+
 export class AgentSession {
 	readonly agent: Agent;
 	readonly sessionManager: SessionManager;
@@ -1094,6 +1104,7 @@ export class AgentSession {
 	#pendingNextTurnMessages: CustomMessage[] = [];
 	#scheduledHiddenNextTurnGeneration: number | undefined = undefined;
 	#queuedMessageDrainScheduled = false;
+	#suppressNextQueuedMessageDrain = false;
 	/** Latched true when the user deliberately interrupts (USER_INTERRUPT_LABEL);
 	 *  suppresses advisor concern/blocker auto-resume until the user next resumes.
 	 *  Advisor advice is still recorded into the transcript, just not auto-run. */
@@ -1371,7 +1382,11 @@ export class AgentSession {
 				this.#preserveAdvisorCard(card);
 			}
 		}
-		this.#scheduleQueuedMessageDrain();
+		if (this.#suppressNextQueuedMessageDrain) {
+			this.#suppressNextQueuedMessageDrain = false;
+		} else {
+			this.#scheduleQueuedMessageDrain();
+		}
 		this.#resumeStrandedIrcAsides();
 	}
 
@@ -1718,7 +1733,6 @@ export class AgentSession {
 			this.#pendingNextTurnMessages = this.#pendingNextTurnMessages.filter(m => !isAdvisorCard(m));
 		}
 	}
-
 	#buildAdvisorRuntime(seedToCurrent = false): boolean {
 		if (this.#isDisposed) return false;
 		if (this.#advisorRuntime) return true;
@@ -2799,8 +2813,11 @@ export class AgentSession {
 	}
 
 	#scheduleAgentContinue(options?: {
+		deliverQueuedMessages?: boolean;
 		delayMs?: number;
 		generation?: number;
+		preserveRetryContext?: boolean;
+		skipPrePromptCompaction?: boolean;
 		shouldContinue?: () => boolean;
 		onSkip?: () => void;
 		onError?: () => void;
@@ -2827,9 +2844,26 @@ export class AgentSession {
 						options?.onSkip?.();
 						return;
 					}
-					await this.#runPrePromptCompactionIfNeeded(this.#pendingContinueMessagesForNextContinue());
-					if (signal.aborted || this.#isDisposed) {
-						options?.onSkip?.();
+					if (options?.deliverQueuedMessages !== true && options?.skipPrePromptCompaction !== true) {
+						const compactionResult = await this.#runPrePromptCompactionIfNeeded(
+							this.#pendingContinueMessagesForQueuedWork(),
+							{ preserveRetryContext: options?.preserveRetryContext === true, resumeQueuedMessages: true },
+						);
+						if (signal.aborted || this.#isDisposed) {
+							options?.onSkip?.();
+							return;
+						}
+						if (compactionResult.continuationScheduled) {
+							return;
+						}
+					}
+					if (options?.deliverQueuedMessages === true) {
+						const queuedDelivery = this.#takeQueuedMessagesForDelivery();
+						if (!queuedDelivery) {
+							options?.onSkip?.();
+							return;
+						}
+						await this.#promptQueuedMessageBatch(queuedDelivery);
 						return;
 					}
 					await this.agent.continue();
@@ -3082,6 +3116,23 @@ export class AgentSession {
 		return -1;
 	}
 
+	#branchBeforeTtsrDiscardedAssistant(targetAssistant: AssistantMessage): void {
+		const branchEntry = this.sessionManager
+			.getBranch()
+			.findLast(
+				(entry): entry is SessionMessageEntry =>
+					entry.type === "message" &&
+					entry.message.role === "assistant" &&
+					this.#isSameAssistantMessage(entry.message as AssistantMessage, targetAssistant),
+			);
+		if (!branchEntry) return;
+		if (branchEntry.parentId) {
+			this.sessionManager.branch(branchEntry.parentId);
+		} else {
+			this.sessionManager.resetLeaf();
+		}
+	}
+
 	#shouldInterruptForTtsrMatch(matches: Rule[], matchContext: TtsrMatchContext): boolean {
 		const globalMode = this.#ttsrManager?.getSettings().interruptMode ?? "always";
 		for (const rule of matches) {
@@ -3281,14 +3332,18 @@ export class AgentSession {
 				this.#perToolTtsrInjections.clear();
 				const ttsrSettings = this.#ttsrManager?.getSettings();
 				if (ttsrSettings?.contextMode === "discard") {
-					// Remove the partial/aborted assistant turn from agent state
+					const targetAssistant = this.agent.state.messages[targetAssistantIndex] as AssistantMessage;
+					// Remove the partial/aborted assistant turn from agent state and from the
+					// active session branch before any pre-continue compaction can summarize it.
 					this.agent.replaceMessages(this.agent.state.messages.slice(0, targetAssistantIndex));
+					this.#branchBeforeTtsrDiscardedAssistant(targetAssistant);
 				}
 				// Inject TTSR rules as system reminder before retry
 				const injection = this.#getTtsrInjectionContent();
+				let retryInjectionMessage: CustomMessage | undefined;
 				if (injection) {
 					const details = { rules: injection.rules.map(rule => rule.name) };
-					this.agent.appendMessage({
+					retryInjectionMessage = {
 						role: "custom",
 						customType: "ttsr-injection",
 						content: injection.content,
@@ -3296,7 +3351,8 @@ export class AgentSession {
 						details,
 						attribution: "agent",
 						timestamp: Date.now(),
-					});
+					};
+					this.agent.appendMessage(retryInjectionMessage);
 					this.sessionManager.appendCustomMessageEntry(
 						"ttsr-injection",
 						injection.content,
@@ -3307,8 +3363,27 @@ export class AgentSession {
 					this.#markTtsrInjected(details.rules);
 				}
 				try {
-					await this.#runPrePromptCompactionIfNeeded(this.#pendingContinueMessagesForNextContinue());
-					await this.agent.continue();
+					const compactionResult = await this.#runPrePromptCompactionIfNeeded(
+						this.#pendingContinueMessagesForNextContinue(),
+						{
+							forceRetryMaintenance: true,
+							preserveRetryContext: ttsrSettings?.contextMode === "discard",
+						},
+					);
+					if (retryInjectionMessage) {
+						const hasRetryInjection = this.agent.state.messages.some(
+							message =>
+								message.role === "custom" &&
+								message.customType === "ttsr-injection" &&
+								message.content === retryInjectionMessage.content,
+						);
+						if (!hasRetryInjection) {
+							this.agent.appendMessage(retryInjectionMessage);
+						}
+					}
+					if (!compactionResult.continuationScheduled) {
+						await this.agent.continue();
+					}
 					this.#resolveTtsrResume();
 				} catch {
 					this.#resolveTtsrResume();
@@ -7732,7 +7807,6 @@ export class AgentSession {
 		this.#skipPostTurnMaintenanceAssistantTimestamp = undefined;
 		const queuedSteeringMessages = [...this.agent.peekSteeringQueue()];
 		const queuedFollowUpMessages = [...this.agent.peekFollowUpQueue()];
-
 		this.#handoffAbortController = new AbortController();
 		const handoffAbortController = this.#handoffAbortController;
 		const handoffSignal = handoffAbortController.signal;
@@ -7808,8 +7882,8 @@ export class AgentSession {
 			const preservedFollowUp = this.agent.peekFollowUpQueue().slice();
 			this.agent.reset();
 			this.agent.replaceQueues(
-				[...preservedSteering, ...queuedSteeringMessages],
-				[...preservedFollowUp, ...queuedFollowUpMessages],
+				appendPreservedQueues(preservedSteering, queuedSteeringMessages),
+				appendPreservedQueues(preservedFollowUp, queuedFollowUpMessages),
 			);
 			this.#freshProviderSessionId = undefined;
 			this.#syncAgentSessionId();
@@ -7883,6 +7957,60 @@ export class AgentSession {
 		return this.#queuedBatchForMode(this.agent.peekFollowUpQueue(), this.agent.getFollowUpMode());
 	}
 
+	#pendingContinueMessagesForQueuedWork(): AgentMessage[] {
+		return [
+			...this.#queuedBatchForMode(this.agent.peekSteeringQueue(), this.agent.getSteeringMode()),
+			...this.#queuedBatchForMode(this.agent.peekFollowUpQueue(), this.agent.getFollowUpMode()),
+		];
+	}
+
+	#takeQueuedMessagesForDelivery(): { messages: AgentMessage[]; skipInitialSteeringPoll: boolean } | undefined {
+		const steering = [...this.agent.peekSteeringQueue()];
+		const followUp = [...this.agent.peekFollowUpQueue()];
+		if (steering.length > 0) {
+			if (this.agent.getSteeringMode() === "one-at-a-time") {
+				this.agent.replaceQueues(steering.slice(1), followUp);
+				return { messages: [steering[0]!], skipInitialSteeringPoll: true };
+			}
+			this.agent.replaceQueues([], followUp);
+			return { messages: steering, skipInitialSteeringPoll: true };
+		}
+		if (followUp.length === 0) {
+			return undefined;
+		}
+		if (this.agent.getFollowUpMode() === "one-at-a-time") {
+			this.agent.replaceQueues([], followUp.slice(1));
+			return { messages: [followUp[0]!], skipInitialSteeringPoll: false };
+		}
+		this.agent.replaceQueues([], []);
+		return { messages: followUp, skipInitialSteeringPoll: false };
+	}
+
+	async #promptQueuedMessageBatch(delivery: {
+		messages: AgentMessage[];
+		skipInitialSteeringPoll: boolean;
+	}): Promise<void> {
+		const originalSteering = [...this.agent.peekSteeringQueue()];
+		const originalFollowUp = [...this.agent.peekFollowUpQueue()];
+		const shouldParkQueuedMessages = delivery.skipInitialSteeringPoll || originalFollowUp.length > 0;
+		if (shouldParkQueuedMessages) {
+			this.agent.replaceQueues(delivery.skipInitialSteeringPoll ? [] : originalSteering, []);
+		}
+		try {
+			await this.agent.prompt(delivery.messages);
+		} finally {
+			if (shouldParkQueuedMessages) {
+				if (delivery.skipInitialSteeringPoll && originalSteering.length > 0) {
+					this.#suppressNextQueuedMessageDrain = true;
+				}
+				this.agent.replaceQueues(
+					appendPreservedQueues(originalSteering, this.agent.peekSteeringQueue()),
+					appendPreservedQueues(originalFollowUp, this.agent.peekFollowUpQueue()),
+				);
+			}
+		}
+	}
+
 	#captureTransientAgentMessages(): AgentMessage[] {
 		const persistedCount = this.buildDisplaySessionContext().messages.length;
 		return this.agent.state.messages.slice(persistedCount);
@@ -7903,14 +8031,36 @@ export class AgentSession {
 		);
 	}
 
-	async #runPrePromptCompactionIfNeeded(messages: AgentMessage[]): Promise<void> {
+	#retryContextRemovedTrailingAssistant(): boolean {
+		const lastBranchEntry = this.sessionManager.getBranch().at(-1);
+		if (lastBranchEntry?.type !== "message" || lastBranchEntry.message.role !== "assistant") return false;
+
+		const branchAssistant = lastBranchEntry.message as AssistantMessage;
+		if (branchAssistant.stopReason !== "error" && branchAssistant.stopReason !== "aborted") return false;
+
+		const activeMessages = this.agent.state.messages;
+		for (let index = activeMessages.length - 1; index >= 0; index--) {
+			const message = activeMessages[index];
+			if (message.role !== "assistant") continue;
+			return !this.#isSameAssistantMessage(message as AssistantMessage, branchAssistant);
+		}
+		return true;
+	}
+
+	async #runPrePromptCompactionIfNeeded(
+		messages: AgentMessage[],
+		options: { preserveRetryContext?: boolean; forceRetryMaintenance?: boolean; resumeQueuedMessages?: boolean } = {},
+	): Promise<CompactionCheckResult> {
 		const model = this.model;
-		if (!model) return;
+		if (!model) return COMPACTION_CHECK_NONE;
 		const contextWindow = model.contextWindow ?? 0;
-		if (contextWindow <= 0) return;
+		if (contextWindow <= 0) return COMPACTION_CHECK_NONE;
 		const compactionSettings = this.settings.getGroup("compaction");
 		const contextTokens = this.#estimatePrePromptContextTokens(messages, contextWindow);
-		if (!shouldCompact(contextTokens, contextWindow, compactionSettings)) return;
+		if (!shouldCompact(contextTokens, contextWindow, compactionSettings)) return COMPACTION_CHECK_NONE;
+		const willRetry =
+			options.forceRetryMaintenance === true ||
+			(options.preserveRetryContext === true && this.#retryContextRemovedTrailingAssistant());
 
 		// Auto-promote first: switching to a larger-context model avoids compacting
 		// the history at all. The post-turn threshold path already promotes before
@@ -7922,7 +8072,7 @@ export class AgentSession {
 				contextWindow,
 				model: `${model.provider}/${model.id}`,
 			});
-			return;
+			return COMPACTION_CHECK_NONE;
 		}
 
 		logger.debug("Pre-prompt context maintenance triggered by pending prompt size", {
@@ -7930,7 +8080,11 @@ export class AgentSession {
 			contextWindow,
 			model: `${model.provider}/${model.id}`,
 		});
-		await this.#runAutoCompaction("threshold", false, false, false, { autoContinue: false });
+		return await this.#runAutoCompaction("threshold", willRetry, false, false, {
+			autoContinue: false,
+			resumeQueuedMessages: false,
+			resumeQueuedMessagesAfterHandoff: options.resumeQueuedMessages === true,
+		});
 	}
 
 	/**
@@ -9143,13 +9297,19 @@ export class AgentSession {
 		willRetry: boolean,
 		deferred = false,
 		allowDefer = true,
-		options: { autoContinue?: boolean; triggerContextTokens?: number } = {},
+		options: {
+			autoContinue?: boolean;
+			triggerContextTokens?: number;
+			resumeQueuedMessages?: boolean;
+			resumeQueuedMessagesAfterHandoff?: boolean;
+		} = {},
 	): Promise<CompactionCheckResult> {
 		const compactionSettings = this.settings.getGroup("compaction");
 		if (compactionSettings.strategy === "off") return COMPACTION_CHECK_NONE;
 		if (reason !== "idle" && !compactionSettings.enabled) return COMPACTION_CHECK_NONE;
 		const generation = this.#promptGeneration;
 		const shouldAutoContinue = options.autoContinue !== false && compactionSettings.autoContinue !== false;
+		const shouldResumeQueuedMessages = options.resumeQueuedMessages !== false;
 		// Shake runs inline (cheap, no remote LLM). On overflow recovery, if shake
 		// reclaims nothing we fall through to the summary-compaction body below so
 		// the oversized input still gets resolved.
@@ -9159,6 +9319,7 @@ export class AgentSession {
 				willRetry,
 				generation,
 				shouldAutoContinue,
+				shouldResumeQueuedMessages,
 				options.triggerContextTokens,
 			);
 			if (outcome !== "fallback") return outcome;
@@ -9167,6 +9328,7 @@ export class AgentSession {
 		// paths the caller wants resolved before scheduling the next turn. "idle" is
 		// triggered by the idle loop and does its own scheduling.
 		if (
+			!willRetry &&
 			!deferred &&
 			allowDefer &&
 			reason !== "overflow" &&
@@ -9191,7 +9353,7 @@ export class AgentSession {
 		// safe for every reason (it makes no LLM call at all) but requires a vision
 		// model to be worth anything — fall back to context-full otherwise.
 		let action: "context-full" | "handoff" | "snapcompact" =
-			compactionSettings.strategy === "handoff" && reason !== "overflow" ? "handoff" : "context-full";
+			!willRetry && compactionSettings.strategy === "handoff" && reason !== "overflow" ? "handoff" : "context-full";
 		if (compactionSettings.strategy === "snapcompact") {
 			if (this.model?.input.includes("image")) {
 				action = "snapcompact";
@@ -9218,7 +9380,7 @@ export class AgentSession {
 			// a message typed as the compaction loader appears must land in the compaction
 			// queue, not the core steering queue (which handoff's agent.reset() would wipe).
 			await this.#emitSessionEvent({ type: "auto_compaction_start", reason, action });
-			if (compactionSettings.strategy === "handoff" && reason !== "overflow") {
+			if (action === "handoff") {
 				const handoffFocus = AUTO_HANDOFF_THRESHOLD_FOCUS;
 				const handoffResult = await this.handoff(handoffFocus, {
 					autoTriggered: true,
@@ -9250,12 +9412,23 @@ export class AgentSession {
 						willRetry: false,
 					});
 					const canContinueQueuedMessages =
-						!autoCompactionSignal.aborted && reason !== "idle" && this.agent.hasQueuedMessages();
+						(shouldResumeQueuedMessages || options.resumeQueuedMessagesAfterHandoff === true) &&
+						!autoCompactionSignal.aborted &&
+						reason !== "idle" &&
+						this.agent.hasQueuedMessages();
 					if (canContinueQueuedMessages) {
+						// The delayed explicit queued-delivery turn now owns the queue. Do not let
+						// this handoff preflight's settle path schedule a normal drain first; in
+						// one-at-a-time mode that would race ahead and consume the next steer too.
+						this.#suppressNextQueuedMessageDrain = true;
 						this.#scheduleAgentContinue({
 							delayMs: 100,
 							generation,
+							deliverQueuedMessages: true,
 							shouldContinue: () => this.agent.hasQueuedMessages(),
+							onSkip: () => {
+								this.#suppressNextQueuedMessageDrain = false;
+							},
 						});
 						return COMPACTION_CHECK_CONTINUATION;
 					}
@@ -9279,7 +9452,8 @@ export class AgentSession {
 				return COMPACTION_CHECK_NONE;
 			}
 
-			const availableModels = this.#modelRegistry.getAvailable();
+			const activeModel = this.model;
+			const availableModels = activeModel && willRetry ? [activeModel] : this.#modelRegistry.getAvailable();
 			if (availableModels.length === 0) {
 				await this.#emitSessionEvent({
 					type: "auto_compaction_end",
@@ -9305,7 +9479,7 @@ export class AgentSession {
 					willRetry: false,
 					skipped: true,
 				});
-				if (!willRetry && this.agent.hasQueuedMessages()) {
+				if (shouldResumeQueuedMessages && !willRetry && this.agent.hasQueuedMessages()) {
 					this.#scheduleAgentContinue({
 						delayMs: 100,
 						generation,
@@ -9600,9 +9774,9 @@ export class AgentSession {
 					}
 				}
 
-				this.#scheduleAgentContinue({ delayMs: 100, generation });
+				this.#scheduleAgentContinue({ delayMs: 100, generation, skipPrePromptCompaction: true });
 				continuationScheduled = true;
-			} else if (this.agent.hasQueuedMessages()) {
+			} else if (shouldResumeQueuedMessages && this.agent.hasQueuedMessages()) {
 				// Auto-compaction can complete while follow-up/steering/custom messages are waiting.
 				// Kick the loop so queued messages are actually delivered.
 				this.#scheduleAgentContinue({
@@ -9661,6 +9835,7 @@ export class AgentSession {
 		willRetry: boolean,
 		generation: number,
 		autoContinue: boolean,
+		resumeQueuedMessages: boolean,
 		triggerContextTokens?: number,
 	): Promise<CompactionCheckResult | "fallback"> {
 		const action = "shake";
@@ -9758,9 +9933,9 @@ export class AgentSession {
 						(reason === "incomplete" && lastAssistant.stopReason === "length");
 					if (shouldDrop) this.agent.replaceMessages(messages.slice(0, -1));
 				}
-				this.#scheduleAgentContinue({ delayMs: 100, generation });
+				this.#scheduleAgentContinue({ delayMs: 100, generation, skipPrePromptCompaction: true });
 				continuationScheduled = true;
-			} else if (this.agent.hasQueuedMessages()) {
+			} else if (resumeQueuedMessages && this.agent.hasQueuedMessages()) {
 				this.#scheduleAgentContinue({
 					delayMs: 100,
 					generation,
@@ -10416,7 +10591,7 @@ export class AgentSession {
 		}
 
 		// Retry via continue() outside the agent_end event callback chain.
-		this.#scheduleAgentContinue({ delayMs: 1, generation });
+		this.#scheduleAgentContinue({ delayMs: 1, generation, preserveRetryContext: true });
 
 		return true;
 	}
@@ -10486,7 +10661,7 @@ export class AgentSession {
 		this.#retryAttempt = 0;
 
 		// Re-attempt the turn
-		this.#scheduleAgentContinue({ delayMs: 1 });
+		this.#scheduleAgentContinue({ delayMs: 1, preserveRetryContext: true });
 
 		return true;
 	}
