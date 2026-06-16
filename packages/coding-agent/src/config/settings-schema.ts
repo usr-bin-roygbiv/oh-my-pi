@@ -1394,7 +1394,7 @@ export const SETTINGS_SCHEMA = {
 	"error.notify": {
 		type: "enum",
 		values: ["on", "off"] as const,
-		default: "on",
+		default: "off",
 		ui: {
 			tab: "interaction",
 			group: "Notifications",
