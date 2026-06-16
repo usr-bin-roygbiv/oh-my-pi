@@ -104,3 +104,47 @@ describe("EventController.sendCompletionNotification — abort guard", () => {
 		expect(spy).toHaveBeenCalledTimes(0);
 	});
 });
+
+describe("EventController.sendErrorNotification", () => {
+	it("fires an error notification when stopReason === 'error'", () => {
+		const spy = vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
+		settings.override("error.notify", "on");
+		const controller = new EventController(makeContext(makeAssistantMessage("error")));
+		controller.sendErrorNotification();
+		expect(spy).toHaveBeenCalledTimes(1);
+		expect(spy).toHaveBeenCalledWith(
+			expect.objectContaining({ body: "Stopped with error", type: "error", title: "test-session" }),
+		);
+	});
+
+	it("honors error.notify=off without changing completion notifications", () => {
+		const spy = vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
+		settings.override("error.notify", "off");
+		settings.override("completion.notify", "on");
+
+		const errorController = new EventController(makeContext(makeAssistantMessage("error")));
+		errorController.sendErrorNotification();
+		expect(spy).toHaveBeenCalledTimes(0);
+
+		const completionController = new EventController(makeContext(makeAssistantMessage("stop")));
+		completionController.sendCompletionNotification();
+		expect(spy).toHaveBeenCalledTimes(1);
+		expect(spy).toHaveBeenCalledWith(expect.objectContaining({ body: "Complete", type: "completion" }));
+	});
+
+	it("skips user-aborted turns", () => {
+		const spy = vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
+		settings.override("error.notify", "on");
+		const controller = new EventController(makeContext(makeAssistantMessage("aborted")));
+		controller.sendErrorNotification();
+		expect(spy).toHaveBeenCalledTimes(0);
+	});
+
+	it("skips normal completion turns", () => {
+		const spy = vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
+		settings.override("error.notify", "on");
+		const controller = new EventController(makeContext(makeAssistantMessage("stop")));
+		controller.sendErrorNotification();
+		expect(spy).toHaveBeenCalledTimes(0);
+	});
+});

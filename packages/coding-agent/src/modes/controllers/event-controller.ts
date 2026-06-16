@@ -890,6 +890,7 @@ export class EventController {
 		this.#lastAssistantComponent = undefined;
 		this.ctx.ui.requestRender();
 		this.#scheduleIdleCompaction();
+		this.sendErrorNotification();
 		this.sendCompletionNotification();
 	}
 
@@ -1112,6 +1113,22 @@ export class EventController {
 			.reverse()
 			.find((m): m is AssistantMessage => m.role === "assistant" && m.stopReason !== "aborted");
 		return lastAssistant?.usage ? calculatePromptTokens(lastAssistant.usage) : 0;
+	}
+
+	sendErrorNotification(): void {
+		const notify = settings.get("error.notify");
+		if (notify === "off") return;
+
+		const last = this.ctx.viewSession.getLastAssistantMessage?.();
+		if (last?.stopReason !== "error") return;
+
+		const sessionName = this.ctx.sessionManager.getSessionName();
+		TERMINAL.sendNotification({
+			title: sessionName || "Oh My Pi",
+			body: "Stopped with error",
+			type: "error",
+			actions: "focus",
+		});
 	}
 
 	sendCompletionNotification(): void {

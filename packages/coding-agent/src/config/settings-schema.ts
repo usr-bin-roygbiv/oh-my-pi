@@ -1391,6 +1391,18 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"error.notify": {
+		type: "enum",
+		values: ["on", "off"] as const,
+		default: "on",
+		ui: {
+			tab: "interaction",
+			group: "Notifications",
+			label: "Error Notification",
+			description: "Notify when the agent stops with an error",
+		},
+	},
+
 	"ask.timeout": {
 		type: "number",
 		default: 0,
