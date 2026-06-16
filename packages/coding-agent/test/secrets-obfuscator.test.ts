@@ -257,6 +257,25 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 		expect(renamed.deobfuscate(persistedBravo)).toBe("SecRet");
 	});
 
+	it("keeps a mixed-case placeholder stable when a same-normalized secret is added earlier", () => {
+		// Session 1: only SecRet is configured; persist its mixed-case token.
+		const before = new SecretObfuscator([{ type: "plain", content: "SecRet" }]);
+		const persisted = before.obfuscate("SecRet");
+		expect(persisted).toMatch(/^#[A-Z0-9]{4}:M#$/);
+
+		// Session 2: SeCret (same normalized value, also :M) is added EARLIER.
+		const after = new SecretObfuscator([
+			{ type: "plain", content: "SeCret" },
+			{ type: "plain", content: "SecRet" },
+		]);
+
+		// SecRet's token must be value-stable, not bumped to a fallback, so the
+		// persisted placeholder still round-trips to SecRet rather than SeCret.
+		expect(after.obfuscate("SecRet")).toBe(persisted);
+		expect(after.deobfuscate(persisted)).toBe("SecRet");
+		expect(after.obfuscate("SeCret")).not.toBe(persisted);
+	});
+
 	it("withholds pending placeholders while streaming provider text", () => {
 		expect(stripPendingSecretPlaceholderSuffix("before #")).toBe("before ");
 		expect(stripPendingSecretPlaceholderSuffix("before #AB12:")).toBe("before ");

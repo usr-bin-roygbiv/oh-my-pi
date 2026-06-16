@@ -113,8 +113,7 @@ function inferCaseHint(secret: string): PlaceholderCaseHint | undefined {
 	return "M";
 }
 
-function buildPlaceholder(secret: string, base: string, friendlyName?: string): string {
-	const hint = inferCaseHint(secret);
+function buildPlaceholder(hint: PlaceholderCaseHint | undefined, base: string, friendlyName?: string): string {
 	const prefix = friendlyName ? `${friendlyName}_` : "";
 	return hint ? `#${prefix}${base}:${hint}#` : `#${prefix}${base}#`;
 }
@@ -164,8 +163,8 @@ export class SecretObfuscator {
 	/** Reverse lookup for deobfuscation: placeholder → secret */
 	#deobfuscateMap = new Map<string, string>();
 
-	/** Case-folded secret → preferred placeholder base hash. */
-	#placeholderBaseByNormalized = new Map<string, string>();
+	/** Placeholder base-key (exact value for :M, case-folded otherwise) → base hash. */
+	#placeholderBaseByKey = new Map<string, string>();
 
 	/** Placeholder base hash → owner key, used to avoid ambiguous placeholders. */
 	#placeholderBaseOwners = new Map<string, string>();
@@ -305,18 +304,24 @@ export class SecretObfuscator {
 	}
 
 	#createPlaceholder(secret: string, friendlyName?: string): string {
-		const normalized = normalizePlaceholderSecret(secret);
-		const preferredBase = this.#resolvePreferredPlaceholderBase(normalized);
+		const hint = inferCaseHint(secret);
+		// `:M` does not encode the exact case pattern, so two distinct mixed-case
+		// values can share a case-folded base + hint. Key those on the exact value
+		// so each token stays stable per value regardless of config/env ordering.
+		// U/L/C/none reconstruct casing from the hint, so they safely share the
+		// case-folded base across casing variants.
+		const baseKey = hint === "M" ? secret : normalizePlaceholderSecret(secret);
 		const sanitizedFriendlyName = friendlyName ? sanitizeSecretFriendlyName(friendlyName) : undefined;
-		const preferredPlaceholder = buildPlaceholder(secret, preferredBase, sanitizedFriendlyName);
+		const preferredBase = this.#resolvePreferredPlaceholderBase(baseKey);
+		const preferredPlaceholder = buildPlaceholder(hint, preferredBase, sanitizedFriendlyName);
 		if (!this.#placeholderConflicts(preferredPlaceholder, secret)) {
 			this.#registerDeobfuscationAlias(preferredPlaceholder, secret);
 			return preferredPlaceholder;
 		}
 
 		for (let attempt = 1; ; attempt++) {
-			const fallbackBase = this.#reserveFallbackPlaceholderBase(normalized, attempt);
-			const placeholder = buildPlaceholder(secret, fallbackBase, sanitizedFriendlyName);
+			const fallbackBase = this.#reserveFallbackPlaceholderBase(baseKey, attempt);
+			const placeholder = buildPlaceholder(hint, fallbackBase, sanitizedFriendlyName);
 			if (!this.#placeholderConflicts(placeholder, secret)) {
 				this.#registerDeobfuscationAlias(placeholder, secret);
 				return placeholder;
@@ -324,24 +329,24 @@ export class SecretObfuscator {
 		}
 	}
 
-	#resolvePreferredPlaceholderBase(normalized: string): string {
-		const existing = this.#placeholderBaseByNormalized.get(normalized);
+	#resolvePreferredPlaceholderBase(baseKey: string): string {
+		const existing = this.#placeholderBaseByKey.get(baseKey);
 		if (existing !== undefined) return existing;
 
 		for (let attempt = 0; ; attempt++) {
-			const base = attempt === 0 ? buildHashBase(normalized) : buildHashBase(`${normalized}\0${attempt}`);
+			const base = attempt === 0 ? buildHashBase(baseKey) : buildHashBase(`${baseKey}\0${attempt}`);
 			const owner = this.#placeholderBaseOwners.get(base);
-			if (owner !== undefined && owner !== normalized) continue;
-			this.#placeholderBaseOwners.set(base, normalized);
-			this.#placeholderBaseByNormalized.set(normalized, base);
+			if (owner !== undefined && owner !== baseKey) continue;
+			this.#placeholderBaseOwners.set(base, baseKey);
+			this.#placeholderBaseByKey.set(baseKey, base);
 			return base;
 		}
 	}
 
-	#reserveFallbackPlaceholderBase(normalized: string, startAttempt: number): string {
+	#reserveFallbackPlaceholderBase(baseKey: string, startAttempt: number): string {
 		for (let attempt = startAttempt; ; attempt++) {
-			const owner = `${normalized}\0collision\0${attempt}`;
-			const base = buildHashBase(`${normalized}\0collision\0${attempt}`);
+			const owner = `${baseKey}\0collision\0${attempt}`;
+			const base = buildHashBase(`${baseKey}\0collision\0${attempt}`);
 			if (this.#placeholderBaseOwners.has(base)) continue;
 			this.#placeholderBaseOwners.set(base, owner);
 			return base;
