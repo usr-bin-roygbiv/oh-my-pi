@@ -8,7 +8,7 @@ import type { Rule } from "@oh-my-pi/pi-coding-agent/capability/rule";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
-import { SecretObfuscator } from "@oh-my-pi/pi-coding-agent/secrets";
+import { getSecretPlaceholderKey, SecretObfuscator } from "@oh-my-pi/pi-coding-agent/secrets";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { getSessionsDir, Snowflake } from "@oh-my-pi/pi-utils";
@@ -201,7 +201,10 @@ describe("createAgentSession session storage isolation", () => {
 			const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 			if (!model) throw new Error("Expected anthropic model");
 
-			const obfuscator = new SecretObfuscator([{ type: "plain", content: "sdk-secret-token-123456" }]);
+			const obfuscator = new SecretObfuscator(
+				[{ type: "plain", content: "sdk-secret-token-123456" }],
+				await getSecretPlaceholderKey(),
+			);
 			const initialManager = SessionManager.create(cwd, path.join(agentDir, "sessions"));
 			initialManager.appendMessage({
 				role: "assistant",

@@ -298,6 +298,26 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 		expect(before.obfuscate("secret658")).not.toBe(persisted);
 	});
 
+	it("derives placeholders from a keyed digest, not a public content hash", () => {
+		// A provider that sees the placeholder and knows the algorithm must not be
+		// able to dictionary low-entropy secrets: the base is keyed by a private
+		// per-install secret, so the same secret yields different tokens per key.
+		const secret = "hunter2-password";
+		const keyA = new SecretObfuscator([{ type: "plain", content: secret }], "install-key-a");
+		const keyB = new SecretObfuscator([{ type: "plain", content: secret }], "install-key-b");
+
+		const tokenA = keyA.obfuscate(secret);
+		const tokenB = keyB.obfuscate(secret);
+
+		expect(tokenA).not.toBe(secret);
+		expect(tokenA).not.toBe(tokenB);
+
+		// Same key + same secret is stable across instances and round-trips.
+		const keyAgain = new SecretObfuscator([{ type: "plain", content: secret }], "install-key-a");
+		expect(keyAgain.obfuscate(secret)).toBe(tokenA);
+		expect(keyA.deobfuscate(tokenA)).toBe(secret);
+	});
+
 	it("withholds pending placeholders while streaming provider text", () => {
 		expect(stripPendingSecretPlaceholderSuffix("before #")).toBe("before ");
 		expect(stripPendingSecretPlaceholderSuffix("before #AB12:")).toBe("before ");

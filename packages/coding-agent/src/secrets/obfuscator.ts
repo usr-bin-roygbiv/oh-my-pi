@@ -1,3 +1,4 @@
+import * as crypto from "node:crypto";
 import type { Context, Message, Tool } from "@oh-my-pi/pi-ai";
 import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import type { SessionContext } from "../session/session-context";
@@ -42,18 +43,27 @@ function generateDeterministicReplacement(secret: string): string {
 // ═══════════════════════════════════════════════════════════════════════════
 
 const HASH_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-// Base length is sized for ~62 bits of entropy (a 64-bit hash rendered as 12
-// base36 chars) so unrelated secrets do not collide on a shared base. A base
-// collision would let a persisted placeholder deobfuscate to the wrong secret
-// when the configured secret set or its ordering changes across sessions.
+// Base length is sized for ~62 bits of entropy (64 bits of a keyed digest
+// rendered as 12 base36 chars) so unrelated secrets do not collide on a shared
+// base. A collision would let a persisted placeholder deobfuscate to the wrong
+// secret when the configured secret set or its ordering changes across sessions.
 const HASH_LEN = 12;
-const HASH_SEED_HI = 0x5345_4352;
-const HASH_SEED_LO = 0x4f4d_5049;
 // Pre-friendly-name sessions persisted a 4-char, index-derived token; reproduce
-// that exact legacy format so old session text still deobfuscates.
+// that exact legacy format so old session text still deobfuscates. The legacy
+// token is keyed on the entry index, not the secret value, so it leaks nothing.
 const LEGACY_HASH_LEN = 4;
 const LEGACY_HASH_SEED = 0x5345_4352;
 const MAX_FRIENDLY_NAME_LEN = 32;
+
+// Per-process fallback key used when a caller does not supply a persisted
+// per-install key. It is random (never shipped in source), so model-visible
+// placeholders cannot be reversed by dictionary-hashing candidate secrets; it
+// only forgoes cross-session token stability, which the persisted key provides.
+let ephemeralPlaceholderKey: string | undefined;
+function defaultPlaceholderKey(): string {
+	ephemeralPlaceholderKey ??= crypto.randomBytes(32).toString("base64url");
+	return ephemeralPlaceholderKey;
+}
 
 type PlaceholderCaseHint = "U" | "L" | "C" | "M";
 
@@ -70,10 +80,14 @@ function normalizePlaceholderSecret(secret: string): string {
 	return secret.toLowerCase();
 }
 
-function buildHashBase(value: string): string {
-	const hi = BigInt(Bun.hash.xxHash32(value, HASH_SEED_HI) >>> 0);
-	const lo = BigInt(Bun.hash.xxHash32(value, HASH_SEED_LO) >>> 0);
-	let v = (hi << 32n) | lo;
+// Derive the model-visible base from a KEYED digest of the secret. xxHash is
+// fast and unkeyed, so a fixed-seed content hash of a low-entropy secret could
+// be dictionaried from the transcript; HMAC-SHA256 under a private per-install
+// key cannot, since the attacker lacks the key.
+function buildHashBase(key: string, value: string): string {
+	const digest = new Bun.CryptoHasher("sha256", key).update(value).digest();
+	let v = 0n;
+	for (let i = 0; i < 8; i++) v = (v << 8n) | BigInt(digest[i]);
 	const radix = BigInt(HASH_CHARS.length);
 	let tag = "";
 	for (let i = 0; i < HASH_LEN; i++) {
@@ -187,7 +201,11 @@ export class SecretObfuscator {
 	/** Whether any secrets were configured */
 	#hasAny: boolean;
 
-	constructor(entries: SecretEntry[]) {
+	/** Private per-install (or per-process) key for the keyed placeholder digest. */
+	readonly #key: string;
+
+	constructor(entries: SecretEntry[], key: string = defaultPlaceholderKey()) {
+		this.#key = key;
 		let index = 0;
 		for (const entry of entries) {
 			const mode = entry.mode ?? "obfuscate";
@@ -346,7 +364,8 @@ export class SecretObfuscator {
 		if (existing !== undefined) return existing;
 
 		for (let attempt = 0; ; attempt++) {
-			const base = attempt === 0 ? buildHashBase(baseKey) : buildHashBase(`${baseKey}\0${attempt}`);
+			const base =
+				attempt === 0 ? buildHashBase(this.#key, baseKey) : buildHashBase(this.#key, `${baseKey}\0${attempt}`);
 			const owner = this.#placeholderBaseOwners.get(base);
 			if (owner !== undefined && owner !== baseKey) continue;
 			this.#placeholderBaseOwners.set(base, baseKey);
@@ -358,7 +377,7 @@ export class SecretObfuscator {
 	#reserveFallbackPlaceholderBase(baseKey: string, startAttempt: number): string {
 		for (let attempt = startAttempt; ; attempt++) {
 			const owner = `${baseKey}\0collision\0${attempt}`;
-			const base = buildHashBase(`${baseKey}\0collision\0${attempt}`);
+			const base = buildHashBase(this.#key, `${baseKey}\0collision\0${attempt}`);
 			if (this.#placeholderBaseOwners.has(base)) continue;
 			this.#placeholderBaseOwners.set(base, owner);
 			return base;

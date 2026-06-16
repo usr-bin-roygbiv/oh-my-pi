@@ -1,8 +1,47 @@
+import * as crypto from "node:crypto";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { isEnoent, logger } from "@oh-my-pi/pi-utils";
+import { getConfigRootDir, isEnoent, logger } from "@oh-my-pi/pi-utils";
 import { YAML } from "bun";
 import { type SecretEntry, sanitizeSecretFriendlyName } from "./obfuscator";
 import { compileSecretRegex } from "./regex";
+
+let cachedPlaceholderKey: string | undefined;
+
+/**
+ * Per-install secret key for the placeholder digest. Persisted under the config
+ * root and never sent to a provider, so model-visible placeholders cannot be
+ * reversed by dictionary-hashing candidate secrets. Stable across sessions so
+ * persisted transcripts deobfuscate consistently.
+ */
+export async function getSecretPlaceholderKey(): Promise<string> {
+	if (cachedPlaceholderKey !== undefined) return cachedPlaceholderKey;
+	const keyPath = path.join(getConfigRootDir(), "secret-placeholder.key");
+	try {
+		const existing = (await Bun.file(keyPath).text()).trim();
+		if (existing.length > 0) {
+			cachedPlaceholderKey = existing;
+			return existing;
+		}
+	} catch (err) {
+		if (!isEnoent(err)) throw err;
+	}
+	const generated = crypto.randomBytes(32).toString("base64url");
+	await fs.mkdir(getConfigRootDir(), { recursive: true });
+	try {
+		await fs.writeFile(keyPath, generated, { flag: "wx", mode: 0o600 });
+		cachedPlaceholderKey = generated;
+		return generated;
+	} catch (err) {
+		// Another process created the key first; adopt the persisted value.
+		if ((err as NodeJS.ErrnoException).code === "EEXIST") {
+			const existing = (await Bun.file(keyPath).text()).trim();
+			cachedPlaceholderKey = existing;
+			return existing;
+		}
+		throw err;
+	}
+}
 
 type RawSecretEntry = Omit<SecretEntry, "friendlyName"> & { friendlyName?: unknown };
 

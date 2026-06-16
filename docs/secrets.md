@@ -80,7 +80,7 @@ Each entry in the array has these fields:
 
 This produces placeholders shaped like `#GITHUBTOKEN_AB12:L#`. The friendly name is sanitized to uppercase letters and digits, capped at 32 characters, and omitted if it sanitizes to an empty value. Invalid optional `friendlyName` metadata does not disable the secret entry; the secret still obfuscates with an unlabeled placeholder.
 
-The hash base is derived from the case-folded secret value, so casing variants share a hash with a case hint suffix:
+The hash base is an HMAC of the secret under a private per-install key (stored at `~/.omp/secret-placeholder.key`, never sent to a model), so a transcript reader cannot dictionary the placeholder back to the secret. For non-mixed casing the key is the case-folded value, so casing variants share a base distinguished by a case hint suffix:
 
 | Hint | Meaning                                      |
 | ---- | -------------------------------------------- |

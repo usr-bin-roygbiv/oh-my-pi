@@ -109,6 +109,7 @@ import { AgentRegistry, MAIN_AGENT_ID } from "./registry/agent-registry";
 import {
 	collectEnvSecrets,
 	deobfuscateSessionContext,
+	getSecretPlaceholderKey,
 	loadSecrets,
 	obfuscateMessages,
 	obfuscateProviderContext,
@@ -1206,7 +1207,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const envEntries = collectEnvSecrets();
 		const allEntries = [...envEntries, ...fileEntries];
 		if (allEntries.length > 0) {
-			obfuscator = new SecretObfuscator(allEntries);
+			obfuscator = new SecretObfuscator(allEntries, await getSecretPlaceholderKey());
 		}
 	}
 	const secretsEnabled = obfuscator?.hasSecrets() === true;
