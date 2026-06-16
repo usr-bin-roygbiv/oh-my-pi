@@ -209,6 +209,12 @@ export class SecretObfuscator {
 
 	constructor(entries: SecretEntry[], key: string = defaultPlaceholderKey()) {
 		this.#key = key;
+		// The keyed-hash key makes obfuscate-mode placeholder bases un-dictionaryable,
+		// but it can be persisted in a user-readable file (`secret-placeholder.key`).
+		// A prompt-injected tool read (read/bash) could otherwise surface it to the
+		// provider verbatim and undo that protection, so redact the key itself from
+		// obfuscated (provider-visible) output as a one-way secret.
+		this.#replaceMappings.set(key, generateDeterministicReplacement(key));
 		let index = 0;
 		for (const entry of entries) {
 			const mode = entry.mode ?? "obfuscate";

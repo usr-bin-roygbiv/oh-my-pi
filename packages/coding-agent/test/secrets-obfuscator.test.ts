@@ -338,6 +338,18 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 		expect(keyA.deobfuscate(tokenA)).toBe(secret);
 	});
 
+	it("redacts its own keyed-hash key from obfuscated output", () => {
+		// The key can be read from a user-readable config file by a prompt-injected
+		// tool; if it reached the provider verbatim, the keyed placeholder bases
+		// could be dictionaried, so the obfuscator must never emit its own key.
+		const key = "install-key-that-must-never-leak-1234567890";
+		const obfuscator = new SecretObfuscator([{ type: "plain", content: "real-secret" }], key);
+		const obfuscated = obfuscator.obfuscate(`cat secret-placeholder.key => ${key} (and real-secret)`);
+
+		expect(obfuscated).not.toContain(key);
+		expect(obfuscated).not.toContain("real-secret");
+	});
+
 	it("withholds pending placeholders while streaming provider text", () => {
 		expect(stripPendingSecretPlaceholderSuffix("before #")).toBe("before ");
 		expect(stripPendingSecretPlaceholderSuffix("before #AB12:")).toBe("before ");
