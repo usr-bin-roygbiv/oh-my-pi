@@ -6896,19 +6896,10 @@ export class AgentSession {
 	}
 
 	async #getScopedModelsWithApiKey(): Promise<Array<{ model: Model; thinkingLevel?: ThinkingLevel }>> {
-		const apiKeysByProvider = new Map<string, string | undefined>();
 		const result: Array<{ model: Model; thinkingLevel?: ThinkingLevel }> = [];
 
 		for (const scoped of this.#scopedModels) {
-			const provider = scoped.model.provider;
-			let apiKey: string | undefined;
-			if (apiKeysByProvider.has(provider)) {
-				apiKey = apiKeysByProvider.get(provider);
-			} else {
-				apiKey = await this.#modelRegistry.getApiKeyForProvider(provider, this.sessionId);
-				apiKeysByProvider.set(provider, apiKey);
-			}
-
+			const apiKey = await this.#modelRegistry.getApiKey(scoped.model, this.sessionId);
 			if (apiKey) {
 				result.push(scoped);
 			}

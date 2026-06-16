@@ -16,6 +16,7 @@ export type ProviderValidationMode = "models-config" | "runtime-register";
 export interface ProviderValidationModel {
 	id: string;
 	api?: Api;
+	baseUrl?: string;
 	contextWindow?: number;
 	supportsTools?: boolean;
 	maxTokens?: number;
@@ -62,13 +63,15 @@ export function validateProviderConfiguration(
 			}
 		}
 	} else {
-		if (!config.baseUrl) {
+		const allModelsHaveBaseUrl = mode === "models-config" && models.every(modelDef => modelDef.baseUrl !== undefined);
+		const hasBaseUrlOnlyProxy = mode === "models-config" && (config.baseUrl !== undefined || allModelsHaveBaseUrl);
+		if (!config.baseUrl && !allModelsHaveBaseUrl) {
 			throw new Error(`Provider ${providerName}: "baseUrl" is required when defining custom models.`);
 		}
 		const requiresAuth =
 			mode === "runtime-register"
 				? !config.apiKey && !config.oauthConfigured
-				: !config.apiKey && (config.auth ?? "apiKey") !== "none";
+				: !config.apiKey && (config.auth ?? "apiKey") !== "none" && !hasBaseUrlOnlyProxy;
 		if (requiresAuth) {
 			throw new Error(
 				mode === "runtime-register"

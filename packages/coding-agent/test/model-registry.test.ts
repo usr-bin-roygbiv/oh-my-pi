@@ -3,10 +3,17 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } fr
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { Effort, type FetchImpl, type Model, type OpenAICompat, type ThinkingConfig } from "@oh-my-pi/pi-ai";
+import {
+	Effort,
+	type FetchImpl,
+	type Model,
+	type OpenAICompat,
+	resolveApiKeyOnce,
+	type ThinkingConfig,
+} from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { writeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
-import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { isAuthenticated, kNoAuth, ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { Snowflake } from "@oh-my-pi/pi-utils";
@@ -540,6 +547,175 @@ describe("ModelRegistry", () => {
 			// Should have multiple built-in models, not just one
 			expect(anthropicModels.length).toBeGreaterThan(1);
 			expect(anthropicModels.some(m => m.id.includes("claude"))).toBe(true);
+		});
+
+		test("baseUrl override makes provider models available without hosted provider auth", async () => {
+			writeRawModelsJson({
+				anthropic: overrideConfig("https://my-proxy.example.com/v1"),
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const availableAnthropic = registry.getAvailable().filter(m => m.provider === "anthropic");
+
+			expect(availableAnthropic.length).toBeGreaterThan(0);
+			expect(availableAnthropic.every(m => m.baseUrl === "https://my-proxy.example.com/v1")).toBe(true);
+			await expect(registry.getApiKey(availableAnthropic[0])).resolves.toBe(kNoAuth);
+			const providerKey = await registry.getApiKeyForProvider("anthropic");
+			expect(providerKey).toBeUndefined();
+			expect(isAuthenticated(providerKey)).toBe(false);
+			await expect(
+				registry.getApiKeyForProvider("anthropic", undefined, {
+					baseUrl: availableAnthropic[0].baseUrl,
+					modelId: availableAnthropic[0].id,
+				}),
+			).resolves.toBeUndefined();
+			await expect(resolveApiKeyOnce(registry.resolver(availableAnthropic[0]))).resolves.toBe(kNoAuth);
+			await expect(resolveApiKeyOnce(registry.resolver("anthropic"))).resolves.toBeUndefined();
+		});
+
+		test("provider-level baseUrl-only custom models are available without provider auth", async () => {
+			const modelsYmlPath = path.join(tempDir, "models.yml");
+			fs.writeFileSync(
+				modelsYmlPath,
+				`providers:
+  provider-proxy:
+    baseUrl: https://provider-proxy.example.com/v1
+    api: openai-completions
+    models:
+      - id: proxied-model
+        reasoning: false
+        input: [text]
+        cost:
+          input: 0
+          output: 0
+          cacheRead: 0
+          cacheWrite: 0
+        contextWindow: 128000
+        maxTokens: 16384
+`,
+			);
+
+			const registry = new ModelRegistry(authStorage, modelsYmlPath);
+			const proxied = registry.find("provider-proxy", "proxied-model");
+
+			expect(registry.getError()).toBeUndefined();
+			expect(proxied?.baseUrl).toBe("https://provider-proxy.example.com/v1");
+			if (!proxied) throw new Error("Expected provider-level proxy model to load");
+			expect(registry.getAvailable()).toContain(proxied);
+			expect(registry.hasConfiguredAuth(proxied)).toBe(true);
+			await expect(registry.getApiKey(proxied)).resolves.toBe(kNoAuth);
+			const providerKey = await registry.getApiKeyForProvider("provider-proxy");
+			expect(providerKey).toBeUndefined();
+			expect(isAuthenticated(providerKey)).toBe(false);
+			await expect(
+				registry.getApiKeyForProvider("provider-proxy", undefined, {
+					baseUrl: proxied.baseUrl,
+					modelId: proxied.id,
+				}),
+			).resolves.toBeUndefined();
+			await expect(resolveApiKeyOnce(registry.resolver(proxied))).resolves.toBe(kNoAuth);
+			await expect(resolveApiKeyOnce(registry.resolver("provider-proxy"))).resolves.toBeUndefined();
+		});
+
+		test("model-level baseUrl-only models are available without provider auth", async () => {
+			writeRawModelsJson({
+				"model-proxy": {
+					api: "openai-completions",
+					models: [
+						{
+							id: "proxied-model",
+							baseUrl: "https://model-proxy.example.com/v1",
+							reasoning: false,
+							input: ["text"],
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+							contextWindow: 128000,
+							maxTokens: 16384,
+						},
+					],
+				},
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const proxied = registry.find("model-proxy", "proxied-model");
+
+			expect(proxied?.baseUrl).toBe("https://model-proxy.example.com/v1");
+			if (!proxied) throw new Error("Expected model-level proxy model to load");
+			expect(registry.getAvailable()).toContain(proxied);
+			expect(registry.hasConfiguredAuth(proxied)).toBe(true);
+			await expect(registry.getApiKey(proxied)).resolves.toBe(kNoAuth);
+			const providerKey = await registry.getApiKeyForProvider("model-proxy");
+			expect(providerKey).toBeUndefined();
+			expect(isAuthenticated(providerKey)).toBe(false);
+			await expect(
+				registry.getApiKeyForProvider("model-proxy", undefined, {
+					baseUrl: proxied.baseUrl,
+					modelId: proxied.id,
+				}),
+			).resolves.toBeUndefined();
+			await expect(resolveApiKeyOnce(registry.resolver(proxied))).resolves.toBe(kNoAuth);
+			await expect(resolveApiKeyOnce(registry.resolver("model-proxy"))).resolves.toBeUndefined();
+		});
+
+		test("model-level baseUrl-only OpenRouter models keep no-auth for routed suffixes", async () => {
+			writeRawModelsJson({
+				openrouter: {
+					api: "openai-completions",
+					models: [
+						{
+							id: "z-ai/glm-4.7",
+							baseUrl: "https://openrouter-proxy.example.com/v1",
+							reasoning: false,
+							input: ["text"],
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+							contextWindow: 128000,
+							maxTokens: 16384,
+						},
+					],
+				},
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const routed = registry.find("openrouter", "z-ai/glm-4.7:nitro");
+
+			expect(routed?.baseUrl).toBe("https://openrouter-proxy.example.com/v1");
+			if (!routed) throw new Error("Expected routed OpenRouter proxy model to resolve");
+			expect(registry.hasConfiguredAuth(routed)).toBe(true);
+			await expect(registry.getApiKey(routed)).resolves.toBe(kNoAuth);
+		});
+
+		test("auth none provider-level probes keep no-auth sentinel", async () => {
+			writeRawModelsJson({
+				"auth-none-proxy": {
+					baseUrl: "https://auth-none-proxy.example.com/v1",
+					api: "openai-completions",
+					auth: "none",
+					models: [
+						{
+							id: "proxied-model",
+							reasoning: false,
+							input: ["text"],
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+							contextWindow: 128000,
+							maxTokens: 16384,
+						},
+					],
+				},
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const proxied = registry.find("auth-none-proxy", "proxied-model");
+
+			expect(proxied).toBeDefined();
+			if (!proxied) throw new Error("Expected auth:none proxy model to load");
+			await expect(registry.getApiKey(proxied)).resolves.toBe(kNoAuth);
+			await expect(registry.getApiKeyForProvider("auth-none-proxy")).resolves.toBe(kNoAuth);
+			await expect(resolveApiKeyOnce(registry.resolver("auth-none-proxy"))).resolves.toBe(kNoAuth);
+		});
+
+		test("bundled provider baseUrl does not make models available without auth", () => {
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+			expect(registry.getAvailable().some(m => m.provider === "aimlapi")).toBe(false);
 		});
 
 		test("overriding baseUrl changes URL on all built-in models", () => {
@@ -1577,6 +1753,7 @@ describe("ModelRegistry", () => {
 	describe("disabled provider filtering", () => {
 		test("getAvailable and getDiscoverableProviders exclude disabled providers from settings", async () => {
 			writeRawModelsJson({
+				anthropic: overrideConfig("https://my-proxy.example.com/v1"),
 				ollama: {
 					baseUrl: "http://127.0.0.1:11434/v1",
 					api: "openai-completions",
@@ -1595,14 +1772,16 @@ describe("ModelRegistry", () => {
 			await Settings.init({
 				inMemory: true,
 				overrides: {
-					disabledProviders: ["github-copilot", "ollama"],
+					disabledProviders: ["github-copilot", "ollama", "anthropic"],
 				},
 			});
 
 			const registry = new ModelRegistry(authStorage, modelsJsonPath);
 
 			expect(registry.getAvailable().some(model => model.provider === "github-copilot")).toBe(false);
+			expect(registry.getAvailable().some(model => model.provider === "anthropic")).toBe(false);
 			expect(registry.getDiscoverableProviders()).not.toContain("ollama");
+			expect(registry.getAvailable().some(model => model.provider === "ollama")).toBe(false);
 		});
 
 		test("refresh skips discovery probes for disabled local providers", async () => {

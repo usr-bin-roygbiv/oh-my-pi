@@ -1,4 +1,5 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, spyOn } from "bun:test";
+import * as fs from "node:fs";
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import { type Api, Effort, type Model } from "@oh-my-pi/pi-ai";
@@ -49,7 +50,14 @@ describe("AgentSession model switch auth pre-flight", () => {
 		return model;
 	}
 
-	function makeSession(initialModel: Model<Api>, roles?: Record<string, string>): AgentSession {
+	function makeSession(
+		initialModel: Model<Api>,
+		roles?: Record<string, string>,
+		options?: {
+			modelRegistry?: ModelRegistry;
+			scopedModels?: Array<{ model: Model<Api>; thinkingLevel?: undefined }>;
+		},
+	): AgentSession {
 		const settings = Settings.isolated();
 		if (roles) {
 			for (const role in roles) settings.setModelRole(role, roles[role]);
@@ -67,7 +75,8 @@ describe("AgentSession model switch auth pre-flight", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
-			modelRegistry: registry,
+			modelRegistry: options?.modelRegistry ?? registry,
+			scopedModels: options?.scopedModels,
 		});
 		return session;
 	}
@@ -119,6 +128,59 @@ describe("AgentSession model switch auth pre-flight", () => {
 
 		expect(s.model?.id).toBe(to.id);
 		expect(getApiKeySpy).not.toHaveBeenCalled();
+	});
+
+	it("cycles scoped baseUrl-only proxy models with model-scoped auth", async () => {
+		const localDir = TempDir.createSync("@pi-scoped-model-proxy-");
+		const localAuthStorage = await AuthStorage.create(path.join(localDir.path(), "auth.db"));
+		try {
+			const modelsYmlPath = path.join(localDir.path(), "models.yml");
+			fs.writeFileSync(
+				modelsYmlPath,
+				`providers:
+  scoped-proxy:
+    baseUrl: https://scoped-proxy.example.com/v1
+    api: openai-completions
+    models:
+      - id: proxied-one
+        reasoning: false
+        input: [text]
+        cost:
+          input: 0
+          output: 0
+          cacheRead: 0
+          cacheWrite: 0
+        contextWindow: 128000
+        maxTokens: 16384
+      - id: proxied-two
+        reasoning: false
+        input: [text]
+        cost:
+          input: 0
+          output: 0
+          cacheRead: 0
+          cacheWrite: 0
+        contextWindow: 128000
+        maxTokens: 16384
+`,
+			);
+			const localRegistry = new ModelRegistry(localAuthStorage, modelsYmlPath);
+			const first = localRegistry.find("scoped-proxy", "proxied-one");
+			const second = localRegistry.find("scoped-proxy", "proxied-two");
+			if (!first || !second) throw new Error("Expected scoped proxy models");
+			const s = makeSession(first, undefined, {
+				modelRegistry: localRegistry,
+				scopedModels: [{ model: first }, { model: second }],
+			});
+
+			const result = await s.cycleModel();
+
+			expect(result?.model.id).toBe("proxied-two");
+			expect(s.model?.id).toBe("proxied-two");
+		} finally {
+			localAuthStorage.close();
+			localDir.removeSync();
+		}
 	});
 
 	it("rejects the switch synchronously when no credential is configured, without calling the resolver", async () => {

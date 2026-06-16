@@ -208,6 +208,21 @@ function mergeByModelKey<T extends { provider: string; id: string }>(
 	return merged;
 }
 
+function modelBaseUrlOverrideKey(provider: string, id: string, baseUrl: string): string {
+	return `${provider}\u0000${id}\u0000${baseUrl}`;
+}
+
+function openRouterRoutedBaseModelId(modelId: string): string | undefined {
+	const colonIdx = modelId.lastIndexOf(":");
+	if (colonIdx === -1) return undefined;
+	const suffix = modelId
+		.slice(colonIdx + 1)
+		.trim()
+		.toLowerCase();
+	if (!suffix || suffix === "max") return undefined;
+	return modelId.slice(0, colonIdx);
+}
+
 interface BuiltInDiscoveryResult {
 	models: Model<Api>[];
 	authoritativeProviders: Set<string>;
@@ -241,6 +256,7 @@ interface CustomModelsResult {
 	models?: CustomModelOverlay[];
 	overrides?: Map<string, ProviderOverride>;
 	modelOverrides?: Map<string, Map<string, ModelOverride>>;
+	modelBaseUrlOverrides?: Set<string>;
 	keylessProviders?: Set<string>;
 	discoverableProviders?: DiscoveryProviderConfig[];
 	configuredProviders?: Set<string>;
@@ -632,6 +648,8 @@ export class ModelRegistry {
 	#canonicalIndexDirty: boolean = true;
 	#customProviderApiKeys: Map<string, string> = new Map();
 	#keylessProviders: Set<string> = new Set();
+	#baseUrlOverrideProviderUrls: Map<string, string> = new Map();
+	#modelBaseUrlOverrideKeys: Set<string> = new Set();
 	#discoverableProviders: DiscoveryProviderConfig[] = [];
 	#customModelOverlays: CustomModelOverlay[] = [];
 	#providerOverrides: Map<string, ProviderOverride> = new Map();
@@ -790,7 +808,8 @@ export class ModelRegistry {
 		this.#modelsConfigFile.invalidate();
 		this.#customProviderApiKeys.clear();
 		this.#keylessProviders.clear();
-		this.#discoverableProviders = [];
+		this.#baseUrlOverrideProviderUrls.clear();
+		this.#modelBaseUrlOverrideKeys.clear();
 		// Drop config-sourced apiKeys from AuthStorage before reload; entries
 		// removed from models.yml must actually disappear from the resolver, not
 		// linger from the previous parse. The post-load setters below repopulate.
@@ -822,6 +841,7 @@ export class ModelRegistry {
 			overrides = new Map(),
 			modelOverrides = new Map(),
 			keylessProviders = new Set(),
+			modelBaseUrlOverrides = new Set(),
 			discoverableProviders = [],
 			configuredProviders = new Set(),
 			equivalence,
@@ -829,6 +849,12 @@ export class ModelRegistry {
 		} = this.#loadCustomModels();
 		this.#configError = configError;
 		this.#keylessProviders = keylessProviders;
+		this.#baseUrlOverrideProviderUrls = new Map(
+			[...overrides].flatMap(([provider, override]) =>
+				override.baseUrl === undefined ? [] : [[provider, override.baseUrl]],
+			),
+		);
+		this.#modelBaseUrlOverrideKeys = modelBaseUrlOverrides;
 		this.#discoverableProviders = discoverableProviders;
 		this.#customModelOverlays = customModels;
 		this.#providerOverrides = overrides;
@@ -1093,6 +1119,7 @@ export class ModelRegistry {
 				models: [],
 				overrides: new Map(),
 				modelOverrides: new Map(),
+				modelBaseUrlOverrides: new Set(),
 				keylessProviders: new Set(),
 				discoverableProviders: [],
 				configuredProviders: new Set(),
@@ -1104,6 +1131,7 @@ export class ModelRegistry {
 				models: [],
 				overrides: new Map(),
 				modelOverrides: new Map(),
+				modelBaseUrlOverrides: new Set(),
 				keylessProviders: new Set(),
 				discoverableProviders: [],
 				configuredProviders: new Set(),
@@ -1183,8 +1211,10 @@ export class ModelRegistry {
 			}
 		}
 
+		const parsedModels = this.#parseModels(value);
 		return {
-			models: this.#parseModels(value),
+			models: parsedModels.models,
+			modelBaseUrlOverrides: parsedModels.modelBaseUrlOverrides,
 			overrides,
 			modelOverrides: allModelOverrides,
 			keylessProviders,
@@ -1621,8 +1651,9 @@ export class ModelRegistry {
 		}
 	}
 
-	#parseModels(config: ModelsConfig): CustomModelOverlay[] {
+	#parseModels(config: ModelsConfig): { models: CustomModelOverlay[]; modelBaseUrlOverrides: Set<string> } {
 		const models: CustomModelOverlay[] = [];
+		const modelBaseUrlOverrides = new Set<string>();
 
 		for (const [providerName, providerConfig] of Object.entries(config.providers ?? {})) {
 			const modelDefs = providerConfig.models ?? [];
@@ -1648,9 +1679,12 @@ export class ModelRegistry {
 				);
 				if (!model) continue;
 				models.push(model);
+				if (modelDef.baseUrl !== undefined) {
+					modelBaseUrlOverrides.add(modelBaseUrlOverrideKey(providerName, modelDef.id, model.baseUrl));
+				}
 			}
 		}
-		return models;
+		return { models, modelBaseUrlOverrides };
 	}
 
 	/**
@@ -1671,14 +1705,14 @@ export class ModelRegistry {
 		const disabledProviders = getDisabledProviderIdsFromSettings();
 		const byProvider = new Map<string, boolean>();
 		return model => {
+			if (disabledProviders.has(model.provider)) return false;
 			let available = byProvider.get(model.provider);
 			if (available === undefined) {
-				available =
-					!disabledProviders.has(model.provider) &&
-					(this.#keylessProviders.has(model.provider) || this.authStorage.hasAuth(model.provider));
+				available = this.#keylessProviders.has(model.provider) || this.authStorage.hasAuth(model.provider);
 				byProvider.set(model.provider, available);
 			}
-			return available;
+			if (available) return true;
+			return this.#hasNoAuthBaseUrlForModel(model);
 		};
 	}
 
@@ -1819,6 +1853,7 @@ export class ModelRegistry {
 		const keyConfig = this.#customProviderApiKeys.get(model.provider);
 		return (
 			isCommandConfigValue(keyConfig) ||
+			this.#hasNoAuthBaseUrlForModel(model) ||
 			this.#keylessProviders.has(model.provider) ||
 			this.authStorage.hasAuth(model.provider)
 		);
@@ -1849,16 +1884,49 @@ export class ModelRegistry {
 		return this.#models.find(m => m.provider === provider && m.baseUrl)?.baseUrl;
 	}
 
+	#hasNoAuthBaseUrlForModel(model: ApiKeyResolverModel): boolean {
+		if (model.baseUrl === undefined) return false;
+		const runtimeBaseUrl = this.#runtimeProviderOverrides.get(model.provider)?.baseUrl;
+		if (runtimeBaseUrl !== undefined && model.baseUrl === runtimeBaseUrl) return true;
+		const providerBaseUrl = this.#baseUrlOverrideProviderUrls.get(model.provider);
+		if (providerBaseUrl !== undefined && model.baseUrl === providerBaseUrl) return true;
+		if (this.#modelBaseUrlOverrideKeys.has(modelBaseUrlOverrideKey(model.provider, model.id, model.baseUrl))) {
+			return true;
+		}
+		if (model.provider !== "openrouter") return false;
+		const baseId = openRouterRoutedBaseModelId(model.id);
+		return (
+			baseId !== undefined &&
+			this.#modelBaseUrlOverrideKeys.has(modelBaseUrlOverrideKey(model.provider, baseId, model.baseUrl))
+		);
+	}
+
 	/**
 	 * Get API key for a model.
 	 */
-	async getApiKey(model: Model<Api>, sessionId?: string): Promise<string | undefined> {
+	async #getApiKeyForModel(
+		model: ApiKeyResolverModel,
+		sessionId?: string,
+		options?: { forceRefresh?: boolean; signal?: AbortSignal },
+	): Promise<string | undefined> {
 		const commandKey = this.#resolveCommandBackedApiKey(model.provider);
 		if (commandKey.configured) return commandKey.value;
-		if (this.#keylessProviders.has(model.provider) && !this.authStorage.hasAuth(model.provider)) {
+		if (
+			(this.#hasNoAuthBaseUrlForModel(model) || this.#keylessProviders.has(model.provider)) &&
+			!this.authStorage.hasAuth(model.provider)
+		) {
 			return kNoAuth;
 		}
-		return this.authStorage.getApiKey(model.provider, sessionId, { baseUrl: model.baseUrl, modelId: model.id });
+		return this.authStorage.getApiKey(model.provider, sessionId, {
+			baseUrl: model.baseUrl,
+			modelId: model.id,
+			forceRefresh: options?.forceRefresh,
+			signal: options?.signal,
+		});
+	}
+
+	async getApiKey(model: Model<Api>, sessionId?: string): Promise<string | undefined> {
+		return this.#getApiKeyForModel(model, sessionId);
 	}
 
 	/**
@@ -1875,6 +1943,9 @@ export class ModelRegistry {
 	): Promise<string | undefined> {
 		const commandKey = this.#resolveCommandBackedApiKey(provider);
 		if (commandKey.configured) return commandKey.value;
+		// Provider-wide probes feed hosted-provider fallbacks; only explicit
+		// auth: none providers get the sentinel here. BaseUrl-only proxies are
+		// model-scoped and must not look like hosted credentials.
 		if (this.#keylessProviders.has(provider) && !this.authStorage.hasAuth(provider)) {
 			return kNoAuth;
 		}
@@ -1900,11 +1971,19 @@ export class ModelRegistry {
 		if (typeof target === "string") {
 			return createApiKeyResolver(this, target, options);
 		}
-		return createApiKeyResolver(this, target.provider, {
-			...options,
-			baseUrl: target.baseUrl,
-			modelId: target.id,
-		});
+		return async ({ lastChance, error, signal }) => {
+			if (error !== undefined && lastChance) {
+				await this.authStorage.rotateSessionCredential(target.provider, options?.sessionId, {
+					error,
+					modelId: target.id,
+					signal,
+				});
+			}
+			return this.#getApiKeyForModel(target, options?.sessionId, {
+				forceRefresh: error !== undefined && !lastChance ? true : undefined,
+				signal,
+			});
+		};
 	}
 
 	async #peekApiKeyForProvider(provider: string): Promise<string | undefined> {
