@@ -220,6 +220,43 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 		expect(removedName.deobfuscate(oldName)).toBe("renamed-secret");
 	});
 
+	it("keeps friendly-name-independent aliases unique for same-base same-hint secrets", () => {
+		const obfuscator = new SecretObfuscator([
+			{ type: "plain", content: "SeCret", friendlyName: "alpha" },
+			{ type: "plain", content: "SecRet", friendlyName: "bravo" },
+		]);
+		const obfuscated = obfuscator.obfuscate("SeCret SecRet");
+		const [tokenA, tokenB] = obfuscated.split(" ");
+		if (!tokenA || !tokenB) throw new Error("expected two friendly placeholders");
+
+		expect(tokenA).toMatch(/^#ALPHA_[A-Z0-9]{4}:M#$/);
+		expect(tokenB).toMatch(/^#BRAVO_[A-Z0-9]{4}:M#$/);
+		expect(obfuscator.deobfuscate(obfuscated)).toBe("SeCret SecRet");
+
+		const stripPrefix = (token: string) => token.replace(/^#[A-Z0-9]+_/, "#");
+		const aliasA = stripPrefix(tokenA);
+		const aliasB = stripPrefix(tokenB);
+		expect(aliasA).not.toBe(aliasB);
+		expect(obfuscator.deobfuscate(aliasA)).toBe("SeCret");
+		expect(obfuscator.deobfuscate(aliasB)).toBe("SecRet");
+	});
+
+	it("resolves a persisted friendly placeholder to the right same-base secret after a rename", () => {
+		const original = new SecretObfuscator([
+			{ type: "plain", content: "SeCret", friendlyName: "alpha" },
+			{ type: "plain", content: "SecRet", friendlyName: "bravo" },
+		]);
+		const persistedBravo = original.obfuscate("SeCret SecRet").split(" ")[1];
+		if (!persistedBravo) throw new Error("expected a bravo placeholder");
+
+		// bravo renamed to charlie while both same-base secrets still exist.
+		const renamed = new SecretObfuscator([
+			{ type: "plain", content: "SeCret", friendlyName: "alpha" },
+			{ type: "plain", content: "SecRet", friendlyName: "charlie" },
+		]);
+		expect(renamed.deobfuscate(persistedBravo)).toBe("SecRet");
+	});
+
 	it("withholds pending placeholders while streaming provider text", () => {
 		expect(stripPendingSecretPlaceholderSuffix("before #")).toBe("before ");
 		expect(stripPendingSecretPlaceholderSuffix("before #AB12:")).toBe("before ");

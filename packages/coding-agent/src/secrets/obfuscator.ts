@@ -309,7 +309,7 @@ export class SecretObfuscator {
 		const preferredBase = this.#resolvePreferredPlaceholderBase(normalized);
 		const sanitizedFriendlyName = friendlyName ? sanitizeSecretFriendlyName(friendlyName) : undefined;
 		const preferredPlaceholder = buildPlaceholder(secret, preferredBase, sanitizedFriendlyName);
-		if (!this.#placeholderCollides(preferredPlaceholder, secret)) {
+		if (!this.#placeholderConflicts(preferredPlaceholder, secret)) {
 			this.#registerDeobfuscationAlias(preferredPlaceholder, secret);
 			return preferredPlaceholder;
 		}
@@ -317,7 +317,7 @@ export class SecretObfuscator {
 		for (let attempt = 1; ; attempt++) {
 			const fallbackBase = this.#reserveFallbackPlaceholderBase(normalized, attempt);
 			const placeholder = buildPlaceholder(secret, fallbackBase, sanitizedFriendlyName);
-			if (!this.#placeholderCollides(placeholder, secret)) {
+			if (!this.#placeholderConflicts(placeholder, secret)) {
 				this.#registerDeobfuscationAlias(placeholder, secret);
 				return placeholder;
 			}
@@ -351,6 +351,16 @@ export class SecretObfuscator {
 	#placeholderCollides(placeholder: string, secret: string): boolean {
 		const existing = this.#deobfuscateMap.get(placeholder);
 		return existing !== undefined && existing !== secret;
+	}
+
+	// A friendly placeholder is only safe if BOTH its full token and its
+	// friendly-name-independent alias are free (or already ours). Otherwise a
+	// later prefix-stripping deobfuscation of a renamed/removed friendly name
+	// would resolve the shared alias to the wrong same-base/same-hint secret.
+	#placeholderConflicts(placeholder: string, secret: string): boolean {
+		if (this.#placeholderCollides(placeholder, secret)) return true;
+		const unprefixed = placeholderWithoutFriendlyName(placeholder);
+		return unprefixed !== undefined && this.#placeholderCollides(unprefixed, secret);
 	}
 
 	#registerDeobfuscationAlias(placeholder: string, secret: string): void {
