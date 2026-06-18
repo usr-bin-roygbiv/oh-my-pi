@@ -336,7 +336,7 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 		expect(obfuscator.deobfuscate(obfuscated)).toBe("api_key=#XRRS#");
 	});
 
-	it("ignores replace-mode regex matches that overlap known placeholders", () => {
+	it("redacts replace-mode regex spans around generated placeholders", () => {
 		const obfuscator = new SecretObfuscator([
 			{ type: "plain", content: "secret" },
 			{ type: "regex", mode: "replace", content: "[A-Z0-9]{8,}", replacement: "REDACTED" },
@@ -344,8 +344,24 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 
 		const obfuscated = obfuscator.obfuscate("secretX");
 
-		expect(obfuscated).toMatch(/^#[A-Z0-9]+:L#X$/);
-		expect(obfuscator.deobfuscate(obfuscated)).toBe("secretX");
+		expect(obfuscated).toMatch(/^#[A-Z0-9]+:L#REDACTED$/);
+		expect(obfuscated).not.toContain("secretX");
+		expect(obfuscator.deobfuscate(obfuscated)).toBe("secretREDACTED");
+	});
+
+	it("redacts replace-mode regex prefixes and suffixes around generated placeholders", () => {
+		const obfuscator = new SecretObfuscator([
+			{ type: "plain", content: "abc" },
+			{ type: "regex", mode: "replace", content: "api_key=\\S+", replacement: "REDACTED" },
+		]);
+
+		const obfuscated = obfuscator.obfuscate("api_key=abcXYZ");
+
+		expect(obfuscated).toMatch(/^REDACTED#[A-Z0-9]+:L#REDACTED$/);
+		expect(obfuscated).not.toContain("api_key=");
+		expect(obfuscated).not.toContain("XYZ");
+		expect(obfuscated).not.toContain("abc");
+		expect(obfuscator.deobfuscate(obfuscated)).toBe("REDACTEDabcREDACTED");
 	});
 
 	it("ignores regex matches that fall entirely inside known placeholders", () => {

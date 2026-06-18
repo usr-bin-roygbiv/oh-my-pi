@@ -282,8 +282,21 @@ export class SecretObfuscator {
 
 			for (const match of matches) {
 				if (entry.mode === "replace") {
-					const replacement = entry.replacement ?? generateDeterministicReplacement(match.value);
-					result = replaceRange(result, match.start, match.end, replacement);
+					if (match.preserveGeneratedPlaceholders) {
+						result = replaceRange(
+							result,
+							match.start,
+							match.end,
+							redactOutsideGeneratedPlaceholders(
+								result.slice(match.start, match.end),
+								chunk => entry.replacement ?? generateDeterministicReplacement(chunk),
+								placeholder => this.#isGeneratedPlaceholder(placeholder),
+							),
+						);
+					} else {
+						const replacement = entry.replacement ?? generateDeterministicReplacement(match.value);
+						result = replaceRange(result, match.start, match.end, replacement);
+					}
 				} else {
 					// obfuscate mode — get or create stable index
 					let index = this.#findObfuscateIndex(match.canonicalValue);
@@ -467,12 +480,25 @@ export class SecretObfuscator {
 		text: string,
 		regex: RegExp,
 		mode: "obfuscate" | "replace",
-	): Array<{ start: number; end: number; value: string; canonicalValue: string; recursive: boolean }> {
+	): Array<{
+		start: number;
+		end: number;
+		value: string;
+		canonicalValue: string;
+		recursive: boolean;
+		preserveGeneratedPlaceholders: boolean;
+	}> {
 		const knownPlaceholderRanges = this.#knownPlaceholderRanges(text);
 		const scanText = maskKnownPlaceholders(text, placeholder => this.#isGeneratedPlaceholder(placeholder));
 		regex.lastIndex = 0;
-		const matches: Array<{ start: number; end: number; value: string; canonicalValue: string; recursive: boolean }> =
-			[];
+		const matches: Array<{
+			start: number;
+			end: number;
+			value: string;
+			canonicalValue: string;
+			recursive: boolean;
+			preserveGeneratedPlaceholders: boolean;
+		}> = [];
 		for (;;) {
 			const match = regex.exec(scanText);
 			if (match === null) break;
@@ -482,8 +508,8 @@ export class SecretObfuscator {
 			}
 			const start = match.index;
 			const end = match.index + match[0].length;
-			const overlapsPlaceholder = knownPlaceholderRanges.some(range => start < range.end && end > range.start);
-			if (mode === "replace" && overlapsPlaceholder) {
+			const overlappingRanges = knownPlaceholderRanges.filter(range => start < range.end && end > range.start);
+			if (mode === "replace" && overlappingRanges.some(range => start >= range.start && end <= range.end)) {
 				continue;
 			}
 			const value = text.slice(start, end);
@@ -500,6 +526,7 @@ export class SecretObfuscator {
 				value,
 				canonicalValue: canonical.text,
 				recursive: canonical.recursive,
+				preserveGeneratedPlaceholders: mode === "replace" && overlappingRanges.length > 0,
 			});
 		}
 		return matches.reverse();
@@ -592,6 +619,19 @@ function maskKnownPlaceholders(text: string, shouldMaskPlaceholder: (placeholder
 		shouldMaskPlaceholder,
 		chunk => chunk,
 		placeholder => "P".repeat(placeholder.length),
+	);
+}
+
+function redactOutsideGeneratedPlaceholders(
+	text: string,
+	replacementForChunk: (chunk: string) => string,
+	shouldPreservePlaceholder: (placeholder: string) => boolean,
+): string {
+	return transformOutsidePlaceholders(
+		text,
+		shouldPreservePlaceholder,
+		chunk => (chunk.length === 0 ? "" : replacementForChunk(chunk)),
+		placeholder => placeholder,
 	);
 }
 
