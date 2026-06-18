@@ -120,6 +120,7 @@ export class GoalRuntime {
 	#wallClock: GoalWallClockSnapshot;
 	#budgetReportedFor: string | undefined;
 	#accountingTail: Promise<void> = Promise.resolve();
+	#usagePersistenceDirty = false;
 
 	constructor(host: GoalRuntimeHost) {
 		this.#host = host;
@@ -178,8 +179,8 @@ export class GoalRuntime {
 		}
 	}
 
-	#markActiveAccounting(goal: Goal): void {
-		if (this.#wallClock.activeGoalId !== goal.id) {
+	#markActiveAccounting(goal: Goal, resetWallClock = false): void {
+		if (resetWallClock || this.#wallClock.activeGoalId !== goal.id) {
 			this.#wallClock = { lastAccountedAt: this.#now(), activeGoalId: goal.id };
 		}
 		if (this.#turnSnapshot) {
@@ -193,6 +194,12 @@ export class GoalRuntime {
 		if (this.#turnSnapshot) {
 			this.#turnSnapshot.activeGoalId = undefined;
 		}
+	}
+
+	clearAccounting(): void {
+		this.#turnSnapshot = undefined;
+		this.#clearActiveAccounting();
+		this.#budgetReportedFor = undefined;
 	}
 
 	onTurnStart(turnId: string, baselineUsage: GoalTokenUsage): void {
@@ -235,7 +242,7 @@ export class GoalRuntime {
 			return;
 		}
 		await this.#withAccounting(async () => {
-			await this.#flushUsageLocked("suppressed");
+			await this.#flushUsageLocked("suppressed", undefined, options?.reason === "internal");
 			this.#turnSnapshot = undefined;
 			if (options?.reason !== "interrupted") return;
 			const cloned = this.#getStateClone();
@@ -249,9 +256,14 @@ export class GoalRuntime {
 		});
 	}
 
-	async onThreadResumed(): Promise<GoalModeState | undefined> {
+	async onThreadResumed(options?: { preserveActiveGoal?: boolean }): Promise<GoalModeState | undefined> {
 		const state = this.#getStateClone();
 		if (!state) return undefined;
+		if (options?.preserveActiveGoal && state.enabled && state.goal.status === "active") {
+			this.#markActiveAccounting(state.goal, true);
+			await this.#commitState(state, { emit: true });
+			return state;
+		}
 		if (state.goal.status === "active") {
 			state.enabled = false;
 			state.goal.status = "paused";
@@ -301,6 +313,7 @@ export class GoalRuntime {
 	async #flushUsageLocked(
 		steering: GoalBudgetSteering,
 		currentUsage: GoalTokenUsage = this.#host.getCurrentUsage(),
+		persistWallClock = false,
 	): Promise<void> {
 		const state = this.#getStateClone();
 		if (!state?.enabled || !isAccountingStatus(state.goal)) return;
@@ -333,11 +346,15 @@ export class GoalRuntime {
 		if (this.#wallClock.activeGoalId === state.goal.id && wallSeconds > 0) {
 			this.#wallClock.lastAccountedAt += wallSeconds * 1000;
 		}
-
 		// Persisting wall-clock-only accounting on every tool event bloats /goal sessions with full
-		// objective snapshots. Keep the in-memory/UI state fresh, but persist only token/budget changes.
-		const shouldPersistUsage = tokenDelta > 0 || flippedToBudgetLimited;
+		// objective snapshots. Keep normal tool flushes in memory/UI only, but make wall-clock
+		// usage durable before lifecycle paths rebuild history or leave the active runtime.
+		const shouldPersistUsage = tokenDelta > 0 || flippedToBudgetLimited || (persistWallClock && wallSeconds > 0);
+		this.#usagePersistenceDirty = !shouldPersistUsage;
 		await this.#commitState(state, { persist: shouldPersistUsage ? "goal" : undefined });
+		if (shouldPersistUsage) {
+			this.#usagePersistenceDirty = false;
+		}
 
 		if (state.goal.status !== "budget-limited") {
 			this.#budgetReportedFor = undefined;
@@ -352,6 +369,17 @@ export class GoalRuntime {
 		currentUsage: GoalTokenUsage = this.#host.getCurrentUsage(),
 	): Promise<void> {
 		await this.#withAccounting(() => this.#flushUsageLocked(steering, currentUsage));
+	}
+
+	async persistUsageBeforeHistoryRewrite(): Promise<void> {
+		await this.#withAccounting(async () => {
+			await this.#flushUsageLocked("suppressed", undefined, true);
+			if (!this.#usagePersistenceDirty) return;
+			const state = this.#getStateClone();
+			if (!state?.enabled || !isAccountingStatus(state.goal)) return;
+			await this.#commitState(state, { persist: "goal", emit: false });
+			this.#usagePersistenceDirty = false;
+		});
 	}
 
 	#createGoalState(objective: string, tokenBudget: number | undefined): GoalModeState {

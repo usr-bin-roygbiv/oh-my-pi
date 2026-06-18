@@ -7272,6 +7272,7 @@ export class AgentSession {
 		if (removed === 0) {
 			return { removed: 0 };
 		}
+		await this.#goalRuntime.persistUsageBeforeHistoryRewrite();
 		await this.sessionManager.rewriteEntries();
 		const sessionContext = this.buildDisplaySessionContext();
 		this.agent.replaceMessages(sessionContext.messages);
@@ -7304,6 +7305,7 @@ export class AgentSession {
 		if (regions.length === 0) {
 			return { mode, toolResultsDropped: 0, blocksDropped: 0, tokensFreed: 0 };
 		}
+		await this.#goalRuntime.persistUsageBeforeHistoryRewrite();
 
 		const artifactId = await this.#saveShakeArtifact(regions);
 		const replacements = regions.map((region, index) => this.#shakeElidePlaceholder(region, index, artifactId));
@@ -7375,7 +7377,8 @@ export class AgentSession {
 			throw new Error("Compaction already in progress");
 		}
 		this.#disconnectFromAgent();
-		await this.abort();
+		await this.abort({ goalReason: "internal" });
+		await this.#goalRuntime.persistUsageBeforeHistoryRewrite();
 		const compactionAbortController = new AbortController();
 		this.#compactionAbortController = compactionAbortController;
 
@@ -7721,6 +7724,7 @@ export class AgentSession {
 			}
 
 			// Start a new session
+			await this.#goalRuntime.persistUsageBeforeHistoryRewrite();
 			const previousSessionFile = this.sessionFile;
 			await this.sessionManager.flush();
 			this.#cancelOwnAsyncJobs();
@@ -9155,6 +9159,7 @@ export class AgentSession {
 				return COMPACTION_CHECK_NONE;
 			}
 
+			await this.#goalRuntime.persistUsageBeforeHistoryRewrite();
 			const pathEntries = this.sessionManager.getBranch();
 
 			const preparation = prepareCompaction(pathEntries, compactionSettings);
@@ -10960,7 +10965,7 @@ export class AgentSession {
 		}
 
 		this.#disconnectFromAgent();
-		await this.abort();
+		await this.abort({ goalReason: "internal" });
 
 		// Flush pending writes before switching so restore snapshots reflect committed state.
 		await this.sessionManager.flush();
