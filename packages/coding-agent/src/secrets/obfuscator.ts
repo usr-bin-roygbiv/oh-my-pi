@@ -302,16 +302,23 @@ export class SecretObfuscator {
 			for (const match of matches) {
 				if (entry.mode === "replace") {
 					if (match.preserveGeneratedPlaceholders) {
-						result = replaceRange(
-							result,
-							match.start,
-							match.end,
-							redactOutsideGeneratedPlaceholders(
-								result.slice(match.start, match.end),
-								chunk => entry.replacement ?? generateDeterministicReplacement(chunk),
-								placeholder => this.#isGeneratedPlaceholder(placeholder),
-							),
-						);
+						const span = result.slice(match.start, match.end);
+						// A custom replacement is a single redaction marker for the whole
+						// match, so emit it once around the preserved placeholder rather
+						// than per surrounding chunk (which duplicates it, e.g.
+						// `api_key=***#…#api_key=***`). Without one, each surrounding chunk
+						// gets its own length-matched deterministic scramble.
+						const redacted =
+							entry.replacement !== undefined
+								? redactWithFixedReplacementOutsidePlaceholders(span, entry.replacement, placeholder =>
+										this.#isGeneratedPlaceholder(placeholder),
+									)
+								: redactOutsideGeneratedPlaceholders(
+										span,
+										chunk => generateDeterministicReplacement(chunk),
+										placeholder => this.#isGeneratedPlaceholder(placeholder),
+									);
+						result = replaceRange(result, match.start, match.end, redacted);
 					} else {
 						const replacement = entry.replacement ?? generateDeterministicReplacement(match.value);
 						result = replaceRange(result, match.start, match.end, replacement);
@@ -775,6 +782,30 @@ function redactOutsideGeneratedPlaceholders(
 		text,
 		shouldPreservePlaceholder,
 		chunk => (chunk.length === 0 ? "" : replacementForChunk(chunk)),
+		placeholder => placeholder,
+	);
+}
+
+// Apply a fixed custom replacement ONCE across a matched span while preserving
+// any inner generated placeholders. The replacement is the user's single
+// redaction marker for the whole match, so reusing it per surrounding chunk
+// would duplicate it around the placeholder; emit it for the first non-empty
+// surrounding chunk only and drop the rest (they are redacted into the one
+// marker). The reversible placeholder stays intact in its relative position.
+function redactWithFixedReplacementOutsidePlaceholders(
+	text: string,
+	replacement: string,
+	shouldPreservePlaceholder: (placeholder: string) => boolean,
+): string {
+	let emitted = false;
+	return transformOutsidePlaceholders(
+		text,
+		shouldPreservePlaceholder,
+		chunk => {
+			if (chunk.length === 0 || emitted) return "";
+			emitted = true;
+			return replacement;
+		},
 		placeholder => placeholder,
 	);
 }

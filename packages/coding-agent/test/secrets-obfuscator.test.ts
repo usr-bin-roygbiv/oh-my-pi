@@ -377,7 +377,7 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 		expect(obfuscator.deobfuscate(obfuscated)).toBe("SECRETREDACTED");
 	});
 
-	it("redacts replace-mode regex prefixes and suffixes around generated placeholders", () => {
+	it("emits a custom replacement once around a generated placeholder", () => {
 		const obfuscator = new SecretObfuscator([
 			{ type: "plain", content: "abc" },
 			{ type: "regex", mode: "replace", content: "api_key=\\S+", replacement: "REDACTED" },
@@ -385,11 +385,14 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 
 		const obfuscated = obfuscator.obfuscate("api_key=abcXYZ");
 
-		expect(obfuscated).toMatch(/^REDACTED#[A-Z0-9]+:L#REDACTED$/);
+		// A custom replacement is a single redaction marker for the whole match, so
+		// it must not be duplicated on both sides of the preserved placeholder.
+		expect(obfuscated).toMatch(/^REDACTED#[A-Z0-9]+:L#$/);
+		expect(obfuscated.match(/REDACTED/g)).toHaveLength(1);
 		expect(obfuscated).not.toContain("api_key=");
 		expect(obfuscated).not.toContain("XYZ");
 		expect(obfuscated).not.toContain("abc");
-		expect(obfuscator.deobfuscate(obfuscated)).toBe("REDACTEDabcREDACTED");
+		expect(obfuscator.deobfuscate(obfuscated)).toBe("REDACTEDabc");
 	});
 
 	it("ignores regex matches that fall entirely inside known placeholders", () => {
