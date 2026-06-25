@@ -11,6 +11,22 @@
 - Fixed reversible secret placeholders sharing a case-folded hash base across ASCII case variants, which let a prompt-injected model synthesize a never-provider-visible sibling secret's keyed token by swapping the case hint (`#…:L#` → `#…:U#`) in a tool-call argument. Placeholder bases are now keyed on the exact secret value, so each casing variant gets an independent base and a synthesized sibling token deobfuscates to nothing on live provider/tool-call paths ([#2465](https://github.com/can1357/oh-my-pi/issues/2465)).
 - Fixed an auto-collected environment secret that is also declared as a plain `mode: "replace"` entry with the same content still forcing creation of the persisted `secret-placeholder.key`. Replace mappings run before obfuscate mappings, so the value is one-way replaced and the obfuscate entry never emits a reversible placeholder; the key-need check now ignores such replace-shadowed obfuscate entries, so an effectively replace-only secret set no longer requires (or writes) the key file and no longer fails startup when the agent config dir is unwritable ([#2465](https://github.com/can1357/oh-my-pi/issues/2465)).
 
+### Added
+
+- Added --list flag to view stored OAuth accounts for a provider
+- Added --account flag to select a specific OAuth account by index for token retrieval
+- Added mouse support for navigation, selection, and toggling in the extensions dashboard
+
+### Changed
+
+- Enabled fullscreen alternate-screen mode for the extensions dashboard
+- Improved tab navigation to mute empty enabled providers while keeping disabled ones selectable
+- `/extensions` (the Extension Control Center) now opens as a fullscreen window on the terminal's alternate screen, matching `/settings`: it borrows the alt buffer for its lifetime (the transcript is untouched underneath) and uses the same modern chrome — a titled rounded frame, the shared `TabBar` for provider switching, and a divider/footer layout. The dashboard is now mouse-aware: the wheel scrolls the list (and the detail inspector, which gained its own scroll viewport), hovering highlights tabs and rows, and clicking selects a row or — when it is already selected — toggles it; clicking a provider tab switches to it. Empty enabled providers are unselectable while disabled providers stay selectable so their master switch can re-enable them.
+
+### Fixed
+
+- Fixed `omp install` of legacy pi extensions failing with `Cannot find module '/$bunfs/root/packages/coding-agent/src/extensibility/typebox.js'` on every released `omp-<platform>-<arch>` binary. Commit `dc5c93462f` removed worker entrypoints from `scripts/ci-release-build-binaries.ts`; the inline comment then claimed the legacy-shim and package-barrel entrypoints (`typebox.ts`, `legacy-pi-{ai,coding-agent}-shim.ts`, `packages/{agent,natives,tui,utils}/...`) were "still" passed to `bun build --compile`, but they had never been re-added. The release binaries shipped without those files in bunfs, so `legacy-pi-compat.ts` redirected `typebox` imports to a bunfs path that didn't exist. The two build scripts (release CI + local dev) now share `scripts/binary-entrypoints.ts` so the lists cannot drift apart, and `__resolveTypeBoxShimPath` mirrors `__validateLegacyPiPackageRootOverrides` (#2168) by dropping the override when the shim file is missing so future regressions fall through to native `node_modules` resolution instead of emitting a dead bunfs URL ([#3414](https://github.com/can1357/oh-my-pi/issues/3414)).
+
 ## [16.1.17] - 2026-06-24
 
 ### Fixed
