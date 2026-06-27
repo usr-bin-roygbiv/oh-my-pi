@@ -308,7 +308,111 @@ export function setTerminalTitle(title: string): void {
 }
 
 export function setSessionTerminalTitle(sessionName: string | undefined, cwd?: string): void {
-	setTerminalTitle(formatSessionTerminalTitle(sessionName, cwd));
+	terminalTitleRuntime.base = formatSessionTerminalTitle(sessionName, cwd);
+	emitTerminalTitle();
+}
+
+export type TerminalTitleState = "idle" | "working" | "attention";
+
+/** Braille spinner frames for the `working` state. Self-contained (not the theme's
+ *  symbol set) to avoid a utils→modes import cycle; OSC titles render in tab/window
+ *  bars that handle Unicode. */
+const TITLE_SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"] as const;
+const TITLE_SPINNER_INTERVAL_MS = 80;
+const TITLE_IDLE_GLYPH = "●";
+const TITLE_ATTENTION_GLYPH = "[!]";
+
+const terminalTitleRuntime: {
+	base: string;
+	state: TerminalTitleState;
+	frame: number;
+	enabled: boolean;
+	timer: ReturnType<typeof setInterval> | undefined;
+	lastEmitted: string | undefined;
+} = {
+	base: DEFAULT_TERMINAL_TITLE,
+	state: "idle",
+	frame: 0,
+	enabled: true,
+	timer: undefined,
+	lastEmitted: undefined,
+};
+
+/**
+ * Compose the run-state prefix with the base title. Pure (no I/O) so the
+ * state→glyph contract is unit-testable: `working` shows an animated spinner
+ * frame, `idle` a steady dot, `attention` a bracketed bang; when disabled it
+ * renders the bare title (the pre-state behavior).
+ */
+export function buildTerminalTitleWithState(
+	base: string,
+	state: TerminalTitleState,
+	frame: number,
+	enabled: boolean,
+): string {
+	if (!enabled) return base;
+	switch (state) {
+		case "working":
+			return `${TITLE_SPINNER_FRAMES[frame % TITLE_SPINNER_FRAMES.length]} ${base}`;
+		case "attention":
+			return `${TITLE_ATTENTION_GLYPH} ${base}`;
+		case "idle":
+			return `${TITLE_IDLE_GLYPH} ${base}`;
+	}
+}
+
+function emitTerminalTitle(): void {
+	const next = buildTerminalTitleWithState(
+		terminalTitleRuntime.base,
+		terminalTitleRuntime.state,
+		terminalTitleRuntime.frame,
+		terminalTitleRuntime.enabled,
+	);
+	if (next === terminalTitleRuntime.lastEmitted) return;
+	terminalTitleRuntime.lastEmitted = next;
+	setTerminalTitle(next);
+}
+
+function stopTerminalTitleSpinner(): void {
+	if (terminalTitleRuntime.timer) {
+		clearInterval(terminalTitleRuntime.timer);
+		terminalTitleRuntime.timer = undefined;
+	}
+}
+
+function startTerminalTitleSpinner(): void {
+	if (terminalTitleRuntime.timer || !process.stdout.isTTY) return;
+	terminalTitleRuntime.timer = setInterval(() => {
+		terminalTitleRuntime.frame = (terminalTitleRuntime.frame + 1) % TITLE_SPINNER_FRAMES.length;
+		emitTerminalTitle();
+	}, TITLE_SPINNER_INTERVAL_MS);
+	// Never keep the event loop alive for a cosmetic animation.
+	terminalTitleRuntime.timer.unref?.();
+}
+
+/**
+ * Reflect the agent run state in the terminal title: `working` animates a
+ * spinner, `idle` shows a steady dot, `attention` flags that the agent is
+ * blocked on the user. Gated off by `tui.titleState`.
+ */
+export function setTerminalTitleState(state: TerminalTitleState): void {
+	terminalTitleRuntime.state = state;
+	if (state === "working" && terminalTitleRuntime.enabled) startTerminalTitleSpinner();
+	else stopTerminalTitleSpinner();
+	emitTerminalTitle();
+}
+
+/** Enable/disable the run-state prefix (driven by the `tui.titleState` setting). */
+export function setTerminalTitleStateEnabled(enabled: boolean): void {
+	terminalTitleRuntime.enabled = enabled;
+	if (enabled && terminalTitleRuntime.state === "working") startTerminalTitleSpinner();
+	else stopTerminalTitleSpinner();
+	emitTerminalTitle();
+}
+
+/** Stop the spinner timer; call on session/UI teardown. */
+export function disposeTerminalTitleState(): void {
+	stopTerminalTitleSpinner();
 }
 
 /**

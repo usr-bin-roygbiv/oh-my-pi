@@ -845,6 +845,18 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"tui.titleState": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "appearance",
+			group: "Display",
+			label: "Terminal Title Run State",
+			description:
+				"Prefix the terminal title with the agent run state — an animated spinner while working, a dot when idle",
+		},
+	},
+
 	"tui.hyperlinks": {
 		type: "enum",
 		values: ["off", "auto", "always"] as const,
