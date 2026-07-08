@@ -2017,6 +2017,12 @@ function stripUnsafeFriendlyPrefixesFromAssistantContent(
 			changed = true;
 			return { ...block, text };
 		}
+		if (block.type === "thinking") {
+			const thinking = strip(block.thinking);
+			if (thinking === block.thinking) return block;
+			changed = true;
+			return { ...block, thinking };
+		}
 		if (block.type === "toolCall") {
 			const args = mapJsonStrings(block.arguments as JsonValue, strip) as Record<string, unknown>;
 			const intent = block.intent === undefined ? undefined : strip(block.intent);
