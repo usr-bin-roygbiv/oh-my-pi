@@ -394,7 +394,12 @@ function applyEntry(phases: TodoPhase[], entry: TodoOpEntryValue, errors: string
 				errors.push("block requires a task or phase target");
 				return phases;
 			}
-			const reason = entry.reason?.trim() || undefined;
+			// Collapse whitespace runs (incl. newlines) to single spaces: a blocker
+			// note rides on one Markdown checklist line (as a trailing HTML comment)
+			// and one HUD/summary line, so an embedded newline from a multi-line
+			// external error or user question would corrupt the round-trip parse and
+			// the rendered line. Normalizing here keeps every consumer one-line-safe.
+			const reason = entry.reason?.replace(/\s+/g, " ").trim() || undefined;
 			for (const task of getTaskTargets(phases, entry, errors)) {
 				// Only actionable open work can be blocked: blocking a phase must not
 				// reopen completed/abandoned tasks or erase finished progress. An

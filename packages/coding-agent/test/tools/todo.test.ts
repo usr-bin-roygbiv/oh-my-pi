@@ -307,6 +307,33 @@ describe("TodoTool operations", () => {
 		expect(parsedA?.blocker).toBe("x");
 	});
 
+	it("normalizes a multi-line blocker reason so the markdown round-trip survives", async () => {
+		const tool = new TodoTool(createSession());
+		await tool.execute("call-1", { op: "init", list: [{ phase: "Work", items: ["a"] }] });
+		// A blocker reason lifted from a multi-line external error or user question.
+		const blocked = await tool.execute("call-2", {
+			op: "block",
+			task: "a",
+			reason: "waiting on user:\nline two\n\tindented three",
+		});
+		const phases = blocked.details?.phases ?? [];
+		const stored = phases[0]?.tasks.find(task => task.content === "a");
+		// Normalized at the source: whitespace runs (incl. newlines) collapse to
+		// single spaces, so every one-line consumer stays intact.
+		expect(stored?.blocker).toBe("waiting on user: line two indented three");
+
+		// Without normalization the embedded newline splits the HTML comment across
+		// two markdown lines: line one is an unclosed `<!-- blocker: …` and line two
+		// parses as unrecognized syntax, losing the reason and adding an error.
+		const md = phasesToMarkdown(phases);
+		expect(md.split("\n").filter(line => line.includes("- [!]"))).toHaveLength(1);
+		const { phases: parsed, errors } = markdownToPhases(md);
+		expect(errors).toEqual([]);
+		const parsedA = parsed[0]?.tasks.find(task => task.content === "a");
+		expect(parsedA?.status).toBe("blocked");
+		expect(parsedA?.blocker).toBe("waiting on user: line two indented three");
+	});
+
 	it("creates a phase when append targets a missing phase", async () => {
 		const tool = new TodoTool(createSession());
 		await tool.execute("call-1", { op: "init", list: [{ phase: "Work", items: ["First"] }] });
