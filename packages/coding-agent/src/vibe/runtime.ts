@@ -69,6 +69,8 @@ const TRACE_LINE_MAX = 120;
 const DEFAULT_WAIT_TIMEOUT_MS = 30_000;
 /** Response text cap inside a delivered turn result; full output stays at agent://<id>. */
 const RESPONSE_PREVIEW_MAX = 6000;
+/** Grace period for abort-aware turns before teardown detaches a stuck provider/tool call. */
+const CANCELLED_TURN_SETTLE_GRACE_MS = 250;
 
 const VIBE_LIFECYCLE_CUSTOM_TYPE = "vibe-session-lifecycle";
 const VIBE_LIFECYCLE_VERSION = 1;
@@ -350,6 +352,24 @@ function mergeTrace(turn: VibeTurn, progress: AgentProgress): void {
 
 /** Thrown from a turn job body so the job manager marks the job failed while carrying the formatted result. */
 export class VibeTurnError extends Error {}
+
+async function awaitCancelledTurnJobs(jobs: ReadonlySet<AsyncJob>): Promise<void> {
+	if (jobs.size === 0) return;
+	const settled = Promise.allSettled([...jobs].map(job => job.promise)).then(() => true);
+	const timeout = Promise.withResolvers<false>();
+	const timer = setTimeout(() => timeout.resolve(false), CANCELLED_TURN_SETTLE_GRACE_MS);
+	timer.unref();
+	try {
+		if (!(await Promise.race([settled, timeout.promise]))) {
+			logger.warn("vibe: detached cancelled turn that did not settle within teardown grace period", {
+				jobCount: jobs.size,
+				graceMs: CANCELLED_TURN_SETTLE_GRACE_MS,
+			});
+		}
+	} finally {
+		clearTimeout(timer);
+	}
+}
 
 /**
  * Process-global registry of vibe worker sessions, scoped by both owner agent
@@ -1043,7 +1063,7 @@ export class VibeSessionRegistry {
 				});
 			}
 		}
-		await Promise.allSettled(teardown.flatMap(entry => (entry.job ? [entry.job.promise] : [])));
+		await awaitCancelledTurnJobs(new Set(teardown.flatMap(entry => (entry.job ? [entry.job] : []))));
 		return records.length;
 	}
 
@@ -1154,7 +1174,7 @@ export class VibeSessionRegistry {
 				});
 			}
 		}
-		await Promise.allSettled([...settlingJobs].map(job => job.promise));
+		await awaitCancelledTurnJobs(settlingJobs);
 		const terminalRef = registered ?? this.#registeredAgent(record) ?? null;
 		if (record.childSessionFile) {
 			try {

@@ -803,6 +803,61 @@ describe("vibe session registry", () => {
 		expect(turnJob.resultText).toContain('turn="2"');
 	});
 
+	it("bounds parent-session suspension when a cancelled turn ignores abort and settles late", async () => {
+		const gate = deferred();
+		const started = deferred();
+		const disposed = deferred();
+		const fake = createFakeWorkerSession({ onDispose: disposed.resolve });
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
+			AgentRegistry.global().register({
+				id: options.id,
+				displayName: options.id,
+				kind: "sub",
+				parentId: "Main",
+				session: fake.session,
+				status: "running",
+			});
+			started.resolve();
+			await gate.promise;
+			return makeResult(options.id);
+		});
+
+		const manager = createManager();
+		const session = createSession({ manager });
+		const registry = VibeSessionRegistry.global();
+		const { jobId } = await registry.spawn(session, {
+			cli: "fast",
+			name: "IgnoresSuspendAbort",
+			prompt: "Keep working through a parent-session switch.",
+		});
+		await started.promise;
+
+		vi.useFakeTimers();
+		try {
+			const suspension = registry.suspendScope(registry.ownerScope(session), manager);
+			await disposed.promise;
+			await flushMicrotasks();
+			expect(vi.getTimerCount()).toBeGreaterThan(0);
+			vi.advanceTimersByTime(250);
+
+			expect(await suspension).toBe(1);
+			expect(manager.getJob(jobId)!.status).toBe("cancelled");
+			expect(fake.isDisposed()).toBe(true);
+			expect(AgentRegistry.global().get("IgnoresSuspendAbort")).toBeUndefined();
+			expect(registry.listIds(session)).toEqual([]);
+
+			gate.resolve();
+			await manager.getJob(jobId)!.promise;
+			expect(manager.getJob(jobId)!.status).toBe("cancelled");
+			expect(fake.isDisposed()).toBe(true);
+			expect(AgentRegistry.global().get("IgnoresSuspendAbort")).toBeUndefined();
+			expect(registry.listIds(session)).toEqual([]);
+		} finally {
+			gate.resolve();
+			vi.useRealTimers();
+		}
+	});
+
 	it("restores an interrupted turn as idle without replay and continues only after send", async () => {
 		installPersistedSpawnMock();
 		const parentManager = await createPersistedParent();
@@ -1835,9 +1890,11 @@ describe("vibe session registry", () => {
 		await manager.getJob("Fast-t2")!.promise;
 	});
 
-	it("kill cancels the in-flight turn and releases the worker session", async () => {
+	it("bounds kill teardown when a cancelled turn ignores abort and settles late", async () => {
 		const gate = deferred();
-		const fake = createFakeWorkerSession();
+		const started = deferred();
+		const disposed = deferred();
+		const fake = createFakeWorkerSession({ onDispose: disposed.resolve });
 		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
 			AgentRegistry.global().register({
 				id: options.id,
@@ -1847,6 +1904,7 @@ describe("vibe session registry", () => {
 				session: fake.session,
 				status: "running",
 			});
+			started.resolve();
 			await gate.promise;
 			return makeResult(options.id);
 		});
@@ -1854,19 +1912,44 @@ describe("vibe session registry", () => {
 		const manager = createManager();
 		const session = createSession({ manager });
 		const registry = VibeSessionRegistry.global();
-		const { jobId } = await registry.spawn(session, { cli: "fast", name: "Doomed", prompt: "Never mind." });
-		await pollUntil(() => AgentRegistry.global().get("Doomed") !== undefined);
+		const { jobId } = await registry.spawn(session, {
+			cli: "fast",
+			name: "IgnoresKillAbort",
+			prompt: "Keep working through explicit termination.",
+		});
+		await started.promise;
 
-		const killPromise = registry.kill(session, "Doomed");
-		await pollUntil(() => manager.getJob(jobId)?.status === "cancelled");
-		gate.resolve();
-		const outcome = await killPromise;
-		expect(outcome.cancelledTurn).toBe(true);
-		expect(manager.getJob(jobId)!.status).toBe("cancelled");
-		expect(fake.isDisposed()).toBe(true);
-		expect(AgentRegistry.global().get("Doomed")).toBeUndefined();
-		expect(registry.screens(session)[0]?.state).toBe("dead");
-		await expect(registry.send(session, { session: "Doomed", message: "hello?" })).rejects.toThrow("dead");
+		vi.useFakeTimers();
+		try {
+			const kill = registry.kill(session, "IgnoresKillAbort");
+			await disposed.promise;
+			await flushMicrotasks();
+			expect(vi.getTimerCount()).toBeGreaterThan(0);
+			vi.advanceTimersByTime(250);
+
+			const outcome = await kill;
+			expect(outcome.cancelledTurn).toBe(true);
+			expect(manager.getJob(jobId)!.status).toBe("cancelled");
+			expect(fake.isDisposed()).toBe(true);
+			expect(AgentRegistry.global().get("IgnoresKillAbort")).toBeUndefined();
+			expect(registry.screens(session)[0]?.state).toBe("dead");
+			await expect(registry.send(session, { session: "IgnoresKillAbort", message: "hello?" })).rejects.toThrow(
+				"dead",
+			);
+
+			gate.resolve();
+			await manager.getJob(jobId)!.promise;
+			expect(manager.getJob(jobId)!.status).toBe("cancelled");
+			expect(fake.isDisposed()).toBe(true);
+			expect(AgentRegistry.global().get("IgnoresKillAbort")).toBeUndefined();
+			expect(registry.screens(session)[0]?.state).toBe("dead");
+			await expect(registry.send(session, { session: "IgnoresKillAbort", message: "still there?" })).rejects.toThrow(
+				"dead",
+			);
+		} finally {
+			gate.resolve();
+			vi.useRealTimers();
+		}
 	});
 
 	it("keeps a persisted in-flight kill terminal when the old executor finalizes late", async () => {
