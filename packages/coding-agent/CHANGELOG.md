@@ -2,14 +2,6 @@
 
 ## [Unreleased]
 
-### Added
-
-- Added `error.notify` so failed model turns can emit distinct terminal/desktop notifications without changing completion notifications ([#2691](https://github.com/can1357/oh-my-pi/issues/2691)).
-
-### Fixed
-
-- Fixed `error.notify` raising a "Stopped with error" toast for a retryable provider error while an auto-retry was still pending; the toast now only fires once the retry saga actually settles (recovers silently, or exhausts retries).
-
 ### Breaking Changes
 
 - Merged the `irc`, `job`, and `launch` tools into a single `hub` tool (`loadMode: "essential"`). Messaging keeps its op names (`send`/`inbox`/`list`); job control maps `{poll}` → `op:"wait"` + `ids`, `{cancel}` → `op:"cancel"` + `ids`, and `{list:true}` → `op:"jobs"`; process supervision keeps `start`/`logs`/`stop`/`restart`/`describe` with the broker's `list` renamed to `op:"ps"`, and `send`/`wait` route to a process when they carry `name`. The unified `wait` races watched background jobs against incoming peer messages and returns on the first event, replacing the old `irc wait` / `job poll` split. TUI and collab-web rendering are unchanged per op family. SDK: `IrcTool`, `JobTool`, `LaunchTool`, `IrcDetails`, and `JobToolDetails` are removed; use `HubTool`, `CoordinationDetails`, `LaunchToolDetails`, and `hubToolRenderer` from `tools/hub` (`isIrcEnabled`, `isWaitingPollDetails`, and `createIrcMessageCard` moved there). The default `model.toolCallLoopGuard.exemptTools` is now `["hub"]`.
@@ -22,6 +14,8 @@
 - Added the `edit.enforceSeenLines` setting (default off) to gate the hashline seen-line guard. When off, hashline tags validate on content hash alone and any anchor into the tagged content applies; when on, edits anchored on lines a prior `read`/`grep` never displayed are rejected.
 - Added per-agent prewalk for subagents: a `prewalk` frontmatter field (`true` = hand off to the default prewalk target, a string = custom target model pattern) and a `task.agentPrewalk` settings override toggled per agent from the `/agents` dashboard with `P`. The bundled generic `task` agent ships with prewalk enabled by default (skipped when the target resolves to the subagent's own starting model, and never armed for plan-mode spawns). Prewalk-armed subagents keep the normally parent-owned `todo` tool so the plan-nudge → todo → hand-off flow works, and the prewalk todo gate now keys on the active tool set instead of the registry so a deactivated todo tool can no longer stall the switch.
 - Added `xd://` virtual tool devices (setting `tools.xdev`, default on): built-ins declaring `loadMode: "discoverable"` (browser, debug, lsp, ast_grep/ast_edit, github, web_search, ...) are unmounted from the request's tools array entirely and driven through the tools the model already has: `read xd://` lists mounted devices, `read xd://<tool>` returns docs + JSON schema, and `write xd://<tool>` with a JSON args object as content executes the tool. Args validate against the mounted tool's real schema (returned on mismatch), and the tools array (and prompt-cache prefix) never changes shape when devices mount or unmount mid-session. `todo`, `ask`, and `grep` stay top-level for their harness integrations; `/tools` lists mounted devices; and `xd://` writes render with the mounted tool's own TUI renderer — streamed call previews draw nothing until the path is provably not an `xd://` device, then forward the incrementally decoded JSON content as live inner args. Explicit `--tools read,...,xdev` lists opt lean sets into the same mounting; `tools.discoveryMode: "all"` takes precedence when active. Full docs + JSON schema for every mounted device are inlined into the system prompt's `xd://` section, so no discovery `read` is required before first use; `read xd://<tool>` remains available for on-demand re-fetch.
+
+- Added `error.notify` so failed model turns can emit distinct terminal/desktop notifications without changing completion notifications ([#2691](https://github.com/can1357/oh-my-pi/issues/2691)).
 
 ### Changed
 
@@ -48,6 +42,8 @@
 - Fixed prewalk repeatedly continuing after a bash-only task such as `commit` had already completed ([#5551](https://github.com/can1357/oh-my-pi/issues/5551)).
 - Fixed the Bash tool hanging when in-process commands read process substitution operands such as `<(cmd)` ([#5557](https://github.com/can1357/oh-my-pi/issues/5557)).
 - Fixed `/share` and `/export` web views rendering inline Markdown inside list items as literal text ([#5567](https://github.com/can1357/oh-my-pi/issues/5567)).
+
+- Fixed `error.notify` raising a "Stopped with error" toast for a retryable provider error while an auto-retry was still pending; the toast now only fires once the retry saga actually settles (recovers silently, or exhausts retries).
 
 ## [16.5.2] - 2026-07-14
 
@@ -148,13 +144,6 @@
 
 ### Added
 
-- Added `--downshift` / `--downshift-into <model>` / `--no-downshift`: start on a strong model, then hand off to a fast/cheap one (default the `smol` role) at the first edit/write tool call *after* the todo list has been initialized. The starting model handles all planning and todo initialization, and begins implementation, before handing off; the fast model includes a verify checklist before finishing. Enable per-user with the `downshift.enabled` setting; force it mid-session with the new `/downshift` slash command, which arms the switch.
-- Added display setting to toggle between collapsing or keeping compacted history inline, now applied to live session displays
-- Added a compact session-only model picker (Alt+P) for quick model switching without changing roles
-- Added `@` search to the Alt+P / `/switch` picker: it lists configured Ctrl+P quick roles in matching segment colors and applies the selected role's model and thinking for the current session.
-- Redesigned Agent Hub entries as two-line cards: identity (status glyph, name, agent type, parent when nested) on the left, active model + reasoning level and age right-aligned, with the task description on its own line; dropped the redundant `sub · of Main` noise
-- Added a project-scoped `launch` tool for shared long-running services and debuggers, with readiness probes, bounded logs, PTY input, restart policies, and automatic teardown after the last omp instance exits. Gated behind the `launch.enabled` setting (default on); when disabled the tool is withdrawn and the bash prompt drops its "use launch" guidance.
-- Added `detached` `launch` starts for standalone services that survive every omp instance and broker shutdown, then reconnect to the next broker for logs and explicit stop.
 - Added a new `--prewalk` execution flow (with `--prewalk-into <model>` and `--no-prewalk` overrides) that starts tasks on a strong model for planning and todo initialization before handing off to a faster, cheaper model for implementation.
  - Added a status line annotation for the active prewalk phase (armed or active).
  - Added the `tui.scrollbackRebuild` setting to gate the erase-and-replay native scrollback rebuild mechanism (defaults to off).
@@ -174,18 +163,6 @@
 
 ### Fixed
 
-- Fixed `/tan` and `/fork` clones cold-missing the provider prompt cache: the per-turn supersede/useless-result prune rewrote the live context without persisting it, so file-based forks and resume rebuilt a divergent (un-pruned) prefix and re-wrote the entire cache
-- Fixed `/tan` pinning the clone's prompt-cache key to the parent's session id instead of the parent's effective cache key, dropping shard affinity when the parent was itself a fork or tan
-- Fixed inconsistent history rendering when toggling the display setting for compacted items
-- Fixed configured `retry.fallbackChains` never engaging on non-retryable provider errors (e.g. "Cloud Code Assist API returned an empty response"): a hard error on a model covered by a fallback chain now switches to the next candidate instead of failing the turn, while still never backoff-retrying the failing model itself
-- Fixed transcript rebuilds (compaction, `/compact`, and toggling history display) repainting content below stale scrollback when collapsing history; rebuilds now correctly clear the scrollback buffer when history is collapsed
-- Improved auto-compaction to automatically drop images and elide content when context is tight, and added persistent warning badges to the compaction divider when manual intervention is required
-- Fixed backgrounded Bash blocks continuing to repaint with live and final job output; they now freeze with a compact job notice while completion is delivered separately
-- Fixed the downshift plan nudge silently ending the run with no code written when the model answered with a text-only reply (no tool call): the agent loop treats a tool-call-free turn as a natural stop and never prompts again, which the nudge's own "write the plan in your next reply" instruction makes common. The nudge now explicitly tells the model this is a checkpoint, not a final answer, and the session forces one more turn whenever a post-nudge reply lands with zero tool calls
-- Fixed launch tool rendering stacking a stale pending header over a bare `✓ Launch` line and raw text: the tool now uses a merged registry renderer with one per-op status header (op, target, `state · pid · uptime` meta), stripped log cursor suffixes, capped collapsed log/list previews, and a launch tool glyph
-- Fixed confusing launch start/wait results when readiness timed out with the log pattern already matched (readiness needs log AND port): the result printed a contradictory `Ready: <match>` next to `Readiness timed out` without naming the failing condition. Daemon snapshots now carry the unmet conditions (`readyPending`), and start/wait results state exactly what never happened (e.g. `port 3100 on 127.0.0.1 never accepted connections`); the TUI shows a `waiting on port` badge on starting daemons
-- Fixed the in-process `stat` builtin mangling BSD-style invocations like `stat -f "%Sm %N" file` (macOS muscle memory): GNU `-f` means `--file-system`, so the format string was treated as a file operand — printing filesystem info for the real operands and erroring with `cannot read file system information for '%Sm %N'`. A `-f` whose format value contains `%` is now detected as BSD syntax and translated to the GNU equivalent (`%Sm`→`%y`, `%N`→`%n`, `%z`→`%s`, epoch/`S`-form times, owner/group/permission and `H`/`L` sub-field directives, `-L`/`-n`/`-q`/`-F` flag clusters, with `%n`/`%t` as literal newline/tab); directives with no GNU counterpart fail with a clear `unsupported BSD format directive` error
-- Fixed the remaining GNU-flavored shell builtins that broke under macOS/BSD muscle memory, using the same unambiguous-detection approach as the `stat` fix (only invocations that are invalid or nonsensical under GNU semantics are reinterpreted; unsupported BSD forms fail loudly instead of producing wrong output): `date -r <epoch>` formats the epoch when no such file exists (GNU `-r FILE` mtime preserved), signed `date -v±N<unit>` adjustments translate to `-d` relative dates and `-j` is accepted (`-j -f` strptime parse mode and field-set `-v` error clearly); `sed -i '' 's/…/…/' file` drops the BSD empty backup-suffix token instead of treating it as the script; `mktemp -t prefix` without X's creates `$TMPDIR/prefix.XXXXXXXXXX` (the GNU `too few X's` error path); `tail -r` reverses input by delegating to `tac` (with `-n`/`-c`/`-f` combinations erroring clearly); `find -E` maps to `-regextype posix-extended` ahead of the expression; `base64 -D` decodes as an alias of `-d`; and `ln -sfh` works via a `-h` alias of `--no-dereference` (clap's `-h` help short is dropped to match real GNU/BSD ln; `--help` unchanged)
 - Fixed terminal scrollback duplication issues with expanded streaming edit previews (Ctrl+O) by using a viewport-sized tail window.
 - Fixed custom model role resolution and alias parsing, ensuring canonical role selectors (`@role`) and thinking suffixes resolve correctly across all configuration surfaces.
 - Fixed quadratic growth in JSON logs by eliding redundant message snapshots and payloads.
@@ -745,8 +722,8 @@
 
 ### Added
 
-- Added `providers.anthropic.serverSideFallback` (default off; UI in the "Model → Retry & Fallback" group). When enabled, Claude Fable 5 / Mythos 5 requests carry `fallbacks: [{ model: "claude-opus-4-8" }]` via Anthropic's server-side-fallback beta chain so classifier-blocked turns are retried on Opus 4.8 without breaking the current call. Opt-in only — leaving it off preserves the pre-fallback behavior. ([#4177](https://github.com/can1357/oh-my-pi/issues/4177))
-- Added `task.softRequestBudgetNotice` (default off) to opt into the subagent soft-budget wrap-up steering notice while keeping the 1.5x graceful abort guard active.
+- Added `providers.anthropic.serverSideFallback` configuration option to opt into Anthropic's server-side-fallback beta chain, allowing Claude requests to automatically retry on alternative models when blocked by classifiers.
+- Added `task.softRequestBudgetNotice` configuration option to enable subagent soft-budget wrap-up steering notices while keeping the graceful abort guard active.
 
 ### Changed
 
