@@ -272,6 +272,24 @@ describe("EventController — error toast gated while auto-retry is pending", ()
 		expect(spy).toHaveBeenCalledWith(expect.objectContaining({ body: "Stopped with error", type: "error" }));
 	});
 
+	it("keeps retry suppression when the next attempt starts before a deferred failed agent_end settles", async () => {
+		const spy = vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
+		settings.override("error.notify", "on");
+		const controller = new EventController(makeTurnEndContext());
+
+		await controller.handleEvent({
+			type: "auto_retry_start",
+			attempt: 1,
+			maxAttempts: 3,
+			delayMs: 100,
+			errorMessage: "overloaded",
+		} as Extract<AgentSessionEvent, { type: "auto_retry_start" }>);
+		await controller.handleEvent({ type: "agent_start" } as Extract<AgentSessionEvent, { type: "agent_start" }>);
+		await controller.handleEvent(makeAgentEndEvent([makeAssistantMessage("error")]));
+
+		expect(spy).not.toHaveBeenCalled();
+	});
+
 	it("fires no error toast at all when the retry recovers", async () => {
 		const spy = vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
 		settings.override("error.notify", "on");
@@ -326,30 +344,6 @@ describe("EventController — error toast gated while auto-retry is pending", ()
 			attempt: 2,
 			finalError: "still overloaded",
 		} as Extract<AgentSessionEvent, { type: "auto_retry_end" }>);
-		await controller.handleEvent(makeAgentEndEvent([makeAssistantMessage("error")]));
-		expect(spy).toHaveBeenCalledTimes(1);
-		expect(spy).toHaveBeenCalledWith(expect.objectContaining({ body: "Stopped with error", type: "error" }));
-	});
-
-	it("clears the pending flag defensively on the next agent_start, so a stuck saga cannot suppress a later turn", async () => {
-		const spy = vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
-		settings.override("error.notify", "on");
-		settings.override("completion.notify", "off");
-		const controller = new EventController(makeTurnEndContext());
-
-		await controller.handleEvent({
-			type: "auto_retry_start",
-			attempt: 1,
-			maxAttempts: 3,
-			delayMs: 100,
-			errorMessage: "overloaded",
-		} as Extract<AgentSessionEvent, { type: "auto_retry_start" }>);
-		await controller.handleEvent(makeAgentEndEvent([makeAssistantMessage("error")]));
-		expect(spy).not.toHaveBeenCalled();
-
-		// No auto_retry_end ever arrives for this saga, but a fresh agent_start
-		// (the next real turn) must not stay latched into permanent suppression.
-		await controller.handleEvent({ type: "agent_start" } as Extract<AgentSessionEvent, { type: "agent_start" }>);
 		await controller.handleEvent(makeAgentEndEvent([makeAssistantMessage("error")]));
 		expect(spy).toHaveBeenCalledTimes(1);
 		expect(spy).toHaveBeenCalledWith(expect.objectContaining({ body: "Stopped with error", type: "error" }));

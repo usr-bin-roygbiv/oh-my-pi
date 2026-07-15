@@ -99,9 +99,7 @@ export class EventController {
 	// prompt is in flight (see `AgentSession#emitSessionEvent`), so the single
 	// `agent_end` that survives to reach this controller can be either a
 	// mid-retry blip or the final settle — only the retry lifecycle events
-	// (never deferred) can tell them apart. `#handleAgentStart` also clears
-	// this defensively so a saga that somehow never reaches `auto_retry_end`
-	// cannot suppress notifications for a later, unrelated turn.
+	// (never deferred) can tell them apart.
 	#retryPending = false;
 	#idleCompactionTimer?: NodeJS.Timeout;
 	#idleRecapTimer?: NodeJS.Timeout;
@@ -429,7 +427,6 @@ export class EventController {
 		this.#pinnedErrorComponent?.setErrorPinned(false);
 		this.#pinnedErrorComponent = undefined;
 		this.ctx.clearPinnedError();
-		this.#retryPending = false;
 		if (this.ctx.retryLoader) {
 			this.ctx.retryLoader.stop();
 			this.ctx.retryLoader = undefined;
