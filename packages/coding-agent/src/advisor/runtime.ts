@@ -378,11 +378,23 @@ export class AdvisorRuntime {
 		if (!md.trim()) return null;
 		if (obfuscator?.hasSecrets()) {
 			let discoveredNewRegexSecretValue = false;
-			for (const secretValue of obfuscator.collectRegexSecretValuesForObfuscation(md)) {
-				if (this.#advisorRegexSecretValues.has(secretValue)) continue;
-				this.#advisorRegexSecretValues.add(secretValue);
-				discoveredNewRegexSecretValue = true;
+			const addRegexValues = (text: string): void => {
+				for (const secretValue of obfuscator.collectRegexSecretValuesForObfuscation(text)) {
+					if (this.#advisorRegexSecretValues.has(secretValue)) continue;
+					this.#advisorRegexSecretValues.add(secretValue);
+					discoveredNewRegexSecretValue = true;
+				}
+			};
+			for (const message of delta) {
+				if (
+					message.role === "custom" &&
+					PRIMARY_CONTEXT_CUSTOM_TYPES.has(message.customType) &&
+					typeof message.content === "string"
+				) {
+					addRegexValues(message.content);
+				}
 			}
+			addRegexValues(md);
 			scrubAdvisorHistory(obfuscator, this.agent.state.messages, this.#advisorRegexSecretValues);
 			if (discoveredNewRegexSecretValue) {
 				this.#pending = this.#pending.map(delta => ({
