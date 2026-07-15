@@ -200,6 +200,8 @@ export class AdvisorRuntime {
 	 *  marker so the advisor isn't re-fed the full ~1k-token rules each turn.
 	 *  Cleared on every re-prime/seed and when a failed batch is dropped. */
 	#seenContext = new Map<string, string>();
+	/** Regex secret values observed in primary deltas and retained until advisor context resets. */
+	#advisorRegexSecretValues = new Set<string>();
 	#pending: PendingDelta[] = [];
 	#busy = false;
 	#backlog = 0;
@@ -287,6 +289,7 @@ export class AdvisorRuntime {
 		this.#backlog = 0;
 		this.#consecutiveFailures = 0;
 		this.#failureNotified = false;
+		this.#advisorRegexSecretValues.clear();
 		this.#wakeAllWaiters();
 		try {
 			this.agent.abort("advisor disposed");
@@ -299,6 +302,7 @@ export class AdvisorRuntime {
 		this.#consecutiveFailures = 0;
 		this.#failureNotified = false;
 		this.#seenContext.clear();
+		this.#advisorRegexSecretValues.clear();
 		if (clearBacklog) {
 			this.#backlog = 0;
 		}
@@ -337,6 +341,7 @@ export class AdvisorRuntime {
 		this.#consecutiveFailures = 0;
 		this.#failureNotified = false;
 		this.#seenContext.clear();
+		this.#advisorRegexSecretValues.clear();
 		this.#wakeAllWaiters();
 	}
 
@@ -345,6 +350,7 @@ export class AdvisorRuntime {
 		if (all.length < this.#lastCount) {
 			this.#lastCount = all.length;
 			this.#seenContext.clear();
+			this.#advisorRegexSecretValues.clear();
 			return null;
 		}
 		const delta = all
@@ -356,9 +362,11 @@ export class AdvisorRuntime {
 		const obfuscator = this.host.obfuscator;
 		let formattedDelta = delta;
 		if (obfuscator?.hasSecrets()) {
-			const sharedRegexSecretValues = collectAdvisorRegexSecretValues(obfuscator, delta);
-			scrubAdvisorHistory(obfuscator, this.agent.state.messages, sharedRegexSecretValues);
-			formattedDelta = obfuscateAdvisorMessages(obfuscator, delta, sharedRegexSecretValues);
+			for (const secretValue of collectAdvisorRegexSecretValues(obfuscator, delta)) {
+				this.#advisorRegexSecretValues.add(secretValue);
+			}
+			scrubAdvisorHistory(obfuscator, this.agent.state.messages, this.#advisorRegexSecretValues);
+			formattedDelta = obfuscateAdvisorMessages(obfuscator, delta, this.#advisorRegexSecretValues);
 		}
 		const md = formatSessionHistoryMarkdown(formattedDelta, {
 			includeThinking: true,

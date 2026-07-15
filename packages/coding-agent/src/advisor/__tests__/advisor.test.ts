@@ -1537,6 +1537,33 @@ describe("advisor", () => {
 			expect(restored).toContain("tok_abc123");
 		});
 
+		it("keeps replace-regex collisions across advisor deltas", async () => {
+			const obfuscator = new SecretObfuscator([
+				{ type: "plain", content: "OTHERSECRET", friendlyName: "TOKABC123" },
+				{ type: "regex", content: "tok_[a-z0-9]+", mode: "replace" },
+			]);
+			const promptInputs: string[] = [];
+			const agent = makeAgent(promptInputs);
+			const messages: AgentMessage[] = [{ role: "user", content: "first tok_abc123", timestamp: 1 } as AgentMessage];
+			const host: AdvisorRuntimeHost = {
+				snapshotMessages: () => messages,
+				enqueueAdvice: () => {},
+				obfuscator,
+			};
+			const runtime = new AdvisorRuntime(agent, host);
+
+			runtime.onTurnEnd();
+			await runtime.waitForCatchup(1000, 1);
+			messages.push({ role: "user", content: "then OTHERSECRET", timestamp: 2 } as AgentMessage);
+			runtime.onTurnEnd();
+			await runtime.waitForCatchup(1000, 1);
+
+			expect(promptInputs).toHaveLength(2);
+			expect(promptInputs[0]).not.toContain("tok_abc123");
+			expect(promptInputs[1]).not.toContain("OTHERSECRET");
+			expect(promptInputs[1]).not.toContain("TOKABC123_");
+		});
+
 		it("scrubs prior advisor prompts when a later replace regex collides with their friendly prefix", async () => {
 			const obfuscator = new SecretObfuscator([
 				{ type: "plain", content: "OTHERSECRET", friendlyName: "TOKABC123" },
