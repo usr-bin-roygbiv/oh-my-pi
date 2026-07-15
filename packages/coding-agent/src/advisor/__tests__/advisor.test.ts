@@ -1776,6 +1776,35 @@ describe("advisor", () => {
 			expect(restored).toContain("OTHERSECRET");
 			expect(restored).toContain("tok_abc123");
 		});
+		it("clears advisor thinking signatures when collision scrubbing rewrites their text", async () => {
+			const obfuscator = new SecretObfuscator([
+				{ type: "plain", content: "OTHERSECRET", friendlyName: "TOKABC123" },
+				{ type: "regex", content: "tok_[a-z0-9]+" },
+			]);
+			const promptInputs: string[] = [];
+			const agent = makeAgent(promptInputs);
+			const staleThinking = obfuscator.obfuscate("OTHERSECRET");
+			agent.state.messages.push({
+				role: "assistant",
+				content: [{ type: "thinking", thinking: staleThinking, thinkingSignature: "signed-thinking" }],
+				timestamp: 1,
+			} as unknown as AgentMessage);
+			const messages: AgentMessage[] = [{ role: "user", content: "later tok_abc123", timestamp: 2 } as AgentMessage];
+			const host: AdvisorRuntimeHost = {
+				snapshotMessages: () => messages,
+				enqueueAdvice: () => {},
+				obfuscator,
+			};
+			const runtime = new AdvisorRuntime(agent, host);
+
+			runtime.onTurnEnd();
+			await runtime.waitForCatchup(1000, 1);
+
+			const storedAssistant = agent.state.messages[0] as AssistantMessage;
+			const thinking = storedAssistant.content.find(block => block.type === "thinking");
+			expect(thinking?.thinking).not.toContain("TOKABC123_");
+			expect(thinking?.thinkingSignature).toBeUndefined();
+		});
 
 		it("skips raw image payload bytes when collecting regex-protected values, so image data cannot spuriously trigger friendly-prefix collision avoidance", async () => {
 			// Regression: collectAdvisorRegexSecretValues's generic tree walk only

@@ -692,7 +692,7 @@ function obfuscateAssistantMessage(
 			const thinking = obfuscator.obfuscate(block.thinking, sharedRegexSecretValues);
 			if (thinking === block.thinking) return block;
 			changed = true;
-			return { ...block, thinking };
+			return { ...block, thinking, thinkingSignature: undefined };
 		}
 		if (block.type === "toolCall") {
 			const args = obfuscateToolArguments(obfuscator, block.arguments, sharedRegexSecretValues);
