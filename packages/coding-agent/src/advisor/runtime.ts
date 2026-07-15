@@ -6,6 +6,9 @@ import { obfuscateToolArguments, type SecretObfuscator } from "../secrets/obfusc
 import {
 	formatExecutionSourcePreview,
 	formatSessionHistoryMarkdown,
+	formatToolCallIntentPreview,
+	formatToolCallPrimaryArg,
+	formatToolResultErrorPreview,
 	PRIMARY_CONTEXT_CUSTOM_TYPES,
 } from "../session/session-history-format";
 
@@ -831,7 +834,7 @@ function collectAdvisorRegexSecretValues(obfuscator: SecretObfuscator, messages:
 				addContent(message.content as TextualContent);
 				break;
 			case "toolResult": {
-				if (message.isError) add(firstAdvisorToolResultErrorLine(message.content as TextualContent));
+				if (message.isError) add(formatToolResultErrorPreview(message.content as TextualContent));
 				const diff = (message.details as { diff?: unknown } | undefined)?.diff;
 				if (typeof diff === "string") add(diff);
 				break;
@@ -847,7 +850,10 @@ function collectAdvisorRegexSecretValues(obfuscator: SecretObfuscator, messages:
 				for (const block of message.content) {
 					if (block.type === "text") add(block.text);
 					else if (block.type === "thinking") add(block.thinking);
-					else if (block.type === "toolCall") addJsonStrings(block.arguments);
+					else if (block.type === "toolCall") {
+						add(formatToolCallPrimaryArg(block.name, block.arguments));
+						add(formatToolCallIntentPreview(block.arguments));
+					}
 				}
 				break;
 			case "bashExecution":

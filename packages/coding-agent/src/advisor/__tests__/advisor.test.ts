@@ -1484,6 +1484,62 @@ describe("advisor", () => {
 			expect(promptInputs[0]).toContain("#TOKABC123_");
 			expect(promptInputs[0]).not.toContain("tok_abc123");
 		});
+		it("does not scan tool-call arguments hidden by the primary-argument preview", async () => {
+			const obfuscator = new SecretObfuscator([
+				{ type: "plain", content: "OTHERSECRET", friendlyName: "TOKABC123" },
+				{ type: "regex", content: "tok_[a-z0-9]+", mode: "replace" },
+			]);
+			const promptInputs: string[] = [];
+			const agent = makeAgent(promptInputs);
+			const messages: AgentMessage[] = [
+				{ role: "user", content: "remember OTHERSECRET", timestamp: 1 } as AgentMessage,
+				{
+					role: "assistant",
+					content: [
+						{ type: "toolCall", id: "c1", name: "write", arguments: { path: "a.ts", content: "tok_abc123" } },
+					],
+					timestamp: 2,
+				} as unknown as AgentMessage,
+			];
+			const runtime = new AdvisorRuntime(agent, {
+				snapshotMessages: () => messages,
+				enqueueAdvice: () => {},
+				obfuscator,
+			});
+			runtime.onTurnEnd();
+			await runtime.waitForCatchup(1000, 1);
+			expect(promptInputs[0]).toContain("#TOKABC123_");
+			expect(promptInputs[0]).not.toContain("tok_abc123");
+		});
+
+		it("does not scan failed tool-result text beyond its visible preview", async () => {
+			const obfuscator = new SecretObfuscator([
+				{ type: "plain", content: "OTHERSECRET", friendlyName: "TOKABC123" },
+				{ type: "regex", content: "tok_[a-z0-9]+", mode: "replace" },
+			]);
+			const promptInputs: string[] = [];
+			const agent = makeAgent(promptInputs);
+			const messages: AgentMessage[] = [
+				{ role: "user", content: "remember OTHERSECRET", timestamp: 1 } as AgentMessage,
+				{
+					role: "toolResult",
+					toolCallId: "c1",
+					toolName: "read",
+					content: `${"x".repeat(120)} tok_abc123`,
+					isError: true,
+					timestamp: 2,
+				} as unknown as AgentMessage,
+			];
+			const runtime = new AdvisorRuntime(agent, {
+				snapshotMessages: () => messages,
+				enqueueAdvice: () => {},
+				obfuscator,
+			});
+			runtime.onTurnEnd();
+			await runtime.waitForCatchup(1000, 1);
+			expect(promptInputs[0]).toContain("#TOKABC123_");
+			expect(promptInputs[0]).not.toContain("tok_abc123");
+		});
 
 		it("does not scan advisor-hidden execution output", async () => {
 			const obfuscator = new SecretObfuscator([
