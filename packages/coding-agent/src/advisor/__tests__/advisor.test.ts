@@ -1474,6 +1474,41 @@ describe("advisor", () => {
 			expect(obfuscate).not.toHaveBeenCalledWith("tok_abc123", expect.anything());
 		});
 
+		it("does not scan or redact advisor-hidden custom payloads", async () => {
+			const obfuscator = new SecretObfuscator([
+				{ type: "plain", content: "OTHERSECRET", friendlyName: "TOKABC123" },
+				{ type: "regex", content: "tok_[a-z0-9]+" },
+			]);
+			const promptInputs: string[] = [];
+			const agent = makeAgent(promptInputs);
+			const obfuscate = vi.spyOn(obfuscator, "obfuscate");
+			const messages: AgentMessage[] = [
+				{ role: "user", content: "remember OTHERSECRET for later", timestamp: 1 } as AgentMessage,
+				{
+					role: "custom",
+					customType: "extension-payload",
+					display: false,
+					content: "tok_abc123",
+					details: { payload: "tok_abc123" },
+					timestamp: 2,
+				} as unknown as AgentMessage,
+			];
+			const host: AdvisorRuntimeHost = {
+				snapshotMessages: () => messages,
+				enqueueAdvice: () => {},
+				obfuscator,
+			};
+			const runtime = new AdvisorRuntime(agent, host);
+
+			runtime.onTurnEnd();
+			await Promise.resolve();
+
+			expect(promptInputs).toHaveLength(1);
+			expect(promptInputs[0]).toContain("#TOKABC123_");
+			expect(promptInputs[0]).not.toContain("tok_abc123");
+			expect(obfuscate).not.toHaveBeenCalledWith("tok_abc123", expect.anything());
+		});
+
 		it("shares regex-protected values across the whole advisor delta so an earlier field's friendly prefix cannot leak a sibling field's secret", async () => {
 			// Regression: obfuscateAdvisorDelta must precompute regex-protected values
 			// (collectAdvisorRegexSecretValues) across every field of the WHOLE advisor

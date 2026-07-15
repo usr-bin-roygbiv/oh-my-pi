@@ -719,6 +719,7 @@ function obfuscateAdvisorMessage(
 			) as AgentMessage;
 		case "custom":
 		case "hookMessage": {
+			if (!formatSessionHistoryMarkdown([message], { expandPrimaryContext: true }).trim()) return message;
 			const msg = message as AgentMessage & {
 				content: TextualContent;
 				details?: Record<string, unknown>;
@@ -770,30 +771,16 @@ function collectAdvisorRegexSecretValues(obfuscator: SecretObfuscator, messages:
 	const values = new Set<string>();
 	const add = (value: string | undefined): void => {
 		if (value === undefined) return;
-		for (const secretValue of obfuscator.collectRegexSecretValuesForObfuscation(value)) {
-			values.add(secretValue);
-		}
+		for (const secretValue of obfuscator.collectRegexSecretValuesForObfuscation(value)) values.add(secretValue);
 	};
 	const addJsonStrings = (value: unknown): void => {
-		if (typeof value === "string") {
-			add(value);
-			return;
-		}
-		if (Array.isArray(value)) {
-			for (const item of value) addJsonStrings(item);
-			return;
-		}
-		if (value === null || typeof value !== "object") return;
-		for (const item of Object.values(value)) addJsonStrings(item);
+		if (typeof value === "string") return add(value);
+		if (Array.isArray(value)) return void value.forEach(addJsonStrings);
+		if (value !== null && typeof value === "object") Object.values(value).forEach(addJsonStrings);
 	};
 	const addContent = (content: TextualContent): void => {
-		if (typeof content === "string") {
-			add(content);
-			return;
-		}
-		for (const block of content) {
-			if (block.type === "text") add(block.text);
-		}
+		if (typeof content === "string") return add(content);
+		for (const block of content) if (block.type === "text") add(block.text);
 	};
 	for (const message of messages) {
 		switch (message.role) {
@@ -809,8 +796,10 @@ function collectAdvisorRegexSecretValues(obfuscator: SecretObfuscator, messages:
 			}
 			case "custom":
 			case "hookMessage":
-				addContent(message.content as TextualContent);
-				addJsonStrings(message.details);
+				if (formatSessionHistoryMarkdown([message], { expandPrimaryContext: true }).trim()) {
+					addContent(message.content as TextualContent);
+					addJsonStrings(message.details);
+				}
 				break;
 			case "assistant":
 				for (const block of message.content) {
@@ -830,11 +819,7 @@ function collectAdvisorRegexSecretValues(obfuscator: SecretObfuscator, messages:
 				add(message.summary);
 				break;
 			case "fileMention":
-				for (const file of message.files) {
-					add(file.path);
-				}
-				break;
-			default:
+				for (const file of message.files) add(file.path);
 				break;
 		}
 	}
