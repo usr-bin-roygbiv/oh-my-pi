@@ -296,7 +296,7 @@ function normalizeAnthropicTargetToolCallId<TApi extends Api>(
  * - Injects synthetic "aborted" tool results
  */
 const SENSITIVE_TOKEN_RE =
-	/\b(gh[opusr]_[a-zA-Z0-9_*]{36,}|github_pat_[a-zA-Z0-9_*]{36,}|glpat-[a-zA-Z0-9_*-]{20,}|sk-proj-[a-zA-Z0-9_*]{36,}|sk-ant-[a-zA-Z0-9_*]{36,}|sk-[a-zA-Z0-9_*]{48,})(?![a-zA-Z0-9_*])/g;
+	/\b(gh[opusr]_[a-zA-Z0-9_*]{8,}|github_pat_[a-zA-Z0-9_*]{8,}|glpat-[a-zA-Z0-9_*-]{8,}|sk-proj-[a-zA-Z0-9_*]{8,}|sk-ant-[a-zA-Z0-9_*]{8,}|sk-[a-zA-Z0-9_*]{8,})(?![a-zA-Z0-9_*])/g;
 
 export function redactSensitiveCredentials(text: string): string {
 	return text.replace(SENSITIVE_TOKEN_RE, (_match, token) => {
