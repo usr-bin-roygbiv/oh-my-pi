@@ -1,6 +1,6 @@
 import { $env } from "@oh-my-pi/pi-utils";
 import type { ResponseInput, ResponseInputItem } from "./providers/openai-responses-wire";
-import { redactSensitiveCredentials } from "./providers/transform-messages";
+import { redactSensitiveCredentials, redactSensitiveInObject } from "./providers/transform-messages";
 import type { CacheRetention, OpenAIResponsesHistoryPayload, ProviderPayload } from "./types";
 
 type OpenAIResponsesReplayItem = ResponseInput[number];
@@ -200,8 +200,14 @@ function sanitizeOpenAIResponsesHistoryItemForReplay(
 	supportsImageDetailOriginal: boolean,
 ): OpenAIResponsesReplayItem | undefined {
 	if (item.type === "item_reference") return undefined;
-	if (item.type === "image_generation_call") return sanitizeOpenAIResponsesImageGenerationCallForReplay(item);
-	if (item.type === "reasoning") return sanitizeOpenAIResponsesReasoningItemForReplay(item);
+	if (item.type === "image_generation_call") {
+		const res = redactSensitiveInObject(sanitizeOpenAIResponsesImageGenerationCallForReplay(item));
+		return res.result as OpenAIResponsesReplayItem | undefined;
+	}
+	if (item.type === "reasoning") {
+		const res = redactSensitiveInObject(sanitizeOpenAIResponsesReasoningItemForReplay(item));
+		return res.result as OpenAIResponsesReplayItem;
+	}
 
 	// providerPayload stores raw output items; replay strips item ids and keeps only normalized call_id.
 	const { id: _id, ...sanitizedItem } = item;
@@ -209,10 +215,10 @@ function sanitizeOpenAIResponsesHistoryItemForReplay(
 		sanitizedItem.call_id = normalizeReplayedResponsesHistoryCallId(item.call_id, normalizedCallIds);
 	}
 
-	return clampReplayItemImageDetail(
-		sanitizedItem,
-		supportsImageDetailOriginal,
-	) as unknown as OpenAIResponsesReplayItem;
+	const clamped = clampReplayItemImageDetail(sanitizedItem, supportsImageDetailOriginal);
+	const redacted = redactSensitiveInObject(clamped).result;
+
+	return redacted as unknown as OpenAIResponsesReplayItem;
 }
 
 function sanitizeOpenAIResponsesReasoningItemForReplay(item: Record<string, unknown>): OpenAIResponsesReplayItem {

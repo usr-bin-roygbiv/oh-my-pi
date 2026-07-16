@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import { transformMessages } from "@oh-my-pi/pi-ai/providers/transform-messages";
 import type { AssistantMessage, Message, Model, ToolCall, ToolResultMessage } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { sanitizeOpenAIResponsesHistoryItemsForReplay } from "../src/utils";
 
 function makeModel(): Model<"openai-responses"> {
 	return buildModel({
@@ -101,5 +102,67 @@ describe("transformMessages redact sensitive credentials", () => {
 			const commandArg = toolCall.arguments?.command;
 			expect(commandArg).toBe("echo [github_token_redacted]");
 		}
+	});
+
+	it("redacts case-insensitive tokens and tokens inside word characters (no word boundary)", () => {
+		const messages: Message[] = [
+			{
+				role: "user",
+				content: "Token: sK-kzllQDz3aTnloHEuUNeOlOHZALB641fYCyPUBKr45xJW0kxduAwLW4bSj",
+				timestamp: Date.now(),
+			},
+			{
+				role: "user",
+				content: "Embedded: prefixGhr_y3I2mEjpFKlK1Y7mZD_2mGFDzbtq_tE8E5AF8nzMnjQa1RrPutYK588suffix",
+				timestamp: Date.now(),
+			},
+		];
+
+		const transformed = transformMessages(messages, makeModel());
+		expect(transformed[0].content).toBe("Token: [openai_token_redacted]");
+		expect(transformed[1].content).toBe("Embedded: prefix[github_token_redacted]");
+	});
+
+	it("redacts credentials inside replayed native history items", () => {
+		const rawHistoryItems = [
+			{
+				type: "message",
+				role: "user",
+				content: "Secret is Gho_************************************",
+			},
+			{
+				type: "function_call",
+				call_id: "call_abc",
+				name: "bash",
+				arguments: {
+					command: "echo sK-kzllQDz3aTnloHEuUNeOlOHZALB641fYCyPUBKr45xJW0",
+				},
+			},
+			{
+				type: "function_call_output",
+				call_id: "call_abc",
+				output: "Error: glpat-******************** key blocked",
+			},
+		];
+
+		const sanitized = sanitizeOpenAIResponsesHistoryItemsForReplay(rawHistoryItems);
+		expect(sanitized.length).toBe(3);
+
+		// 1. User message content
+		const userMsg = sanitized[0] as any;
+		expect(userMsg.type).toBe("message");
+		expect(userMsg.content).toBe("Secret is [github_token_redacted]");
+
+		// 2. Tool call arguments
+		const toolCall = sanitized[1] as any;
+		expect(toolCall.type).toBe("function_call");
+		// Note: since it is converted back via adaptResponsesReplayItemsForModel,
+		// let us check what sanitized outputs look like before custom tool conversion
+		expect(toolCall.arguments).toEqual({ command: "echo [openai_token_redacted]" });
+
+		// 3. Tool output
+		const toolOutput = sanitized[2] as any;
+		expect(toolOutput.type).toBe("function_call_output");
+		expect(toolOutput.output).toBe("Error: [gitlab_token_redacted] key blocked");
 	});
 });

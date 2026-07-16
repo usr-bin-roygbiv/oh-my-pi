@@ -27,5 +27,17 @@
  * @property {EmbeddedAddonArchive=} archive
  */
 
-/** @type {EmbeddedAddon|null} */
-export const embeddedAddon = null;
+import archivePath from "../native/embedded-addons.darwin-arm64.tar.gz" with { type: "file" };
+
+export const embeddedAddon = {
+	platformTag: "darwin-arm64",
+	version: "17.0.1",
+	archive: {
+		format: "tar.gz",
+		filename: "embedded-addons.darwin-arm64.tar.gz",
+		filePath: archivePath,
+	},
+	files: [
+		{ variant: "default", filename: "pi_natives.darwin-arm64.node", size: 135664256 },
+	],
+};

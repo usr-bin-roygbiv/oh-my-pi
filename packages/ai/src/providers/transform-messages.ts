@@ -296,27 +296,28 @@ function normalizeAnthropicTargetToolCallId<TApi extends Api>(
  * - Injects synthetic "aborted" tool results
  */
 const SENSITIVE_TOKEN_RE =
-	/\b(gh[opusr]_[a-zA-Z0-9_*]{8,}|github_pat_[a-zA-Z0-9_*]{8,}|glpat-[a-zA-Z0-9_*-]{8,}|sk-proj-[a-zA-Z0-9_*]{8,}|sk-ant-[a-zA-Z0-9_*]{8,}|sk-[a-zA-Z0-9_*]{8,})(?![a-zA-Z0-9_*])/g;
+	/(gh[opusr]_[a-zA-Z0-9_*]{3,}|github_pat_[a-zA-Z0-9_*]{3,}|glpat-[a-zA-Z0-9_*-]{3,}|sk-proj-[a-zA-Z0-9_*]{3,}|sk-ant-[a-zA-Z0-9_*]{3,}|sk-[a-zA-Z0-9_*]*\*+[a-zA-Z0-9_*]*|sk-[a-zA-Z0-9_-]{20,})/gi;
 
 export function redactSensitiveCredentials(text: string): string {
-	return text.replace(SENSITIVE_TOKEN_RE, (_match, token) => {
-		if (token.startsWith("gh")) {
+	return text.replace(SENSITIVE_TOKEN_RE, match => {
+		const lower = match.toLowerCase();
+		if (lower.startsWith("gh")) {
 			return "[github_token_redacted]";
 		}
-		if (token.startsWith("gl")) {
+		if (lower.startsWith("gl")) {
 			return "[gitlab_token_redacted]";
 		}
-		if (token.startsWith("sk-ant-")) {
+		if (lower.startsWith("sk-ant-")) {
 			return "[anthropic_token_redacted]";
 		}
-		if (token.startsWith("sk")) {
+		if (lower.startsWith("sk")) {
 			return "[openai_token_redacted]";
 		}
 		return "[token_redacted]";
 	});
 }
 
-function redactSensitiveInObject(val: unknown): { result: unknown; changed: boolean } {
+export function redactSensitiveInObject(val: unknown): { result: unknown; changed: boolean } {
 	if (typeof val === "string") {
 		const redacted = redactSensitiveCredentials(val);
 		return { result: redacted, changed: redacted !== val };
