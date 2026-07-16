@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Redact already-masked and real sensitive tokens (e.g. `gho_***`) from outbound message prompts right before they reach the provider to prevent `invalid_prompt` security blocks.
 - Automatically invalidate and rotate OAuth credentials when an "invalidated oauth token" error occurs
 
 ## [17.0.1] - 2026-07-16
