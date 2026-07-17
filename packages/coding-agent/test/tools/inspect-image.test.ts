@@ -29,6 +29,19 @@ const visionModel: Model<"openai-responses"> = buildModel({
 	maxTokens: 4096,
 });
 
+const geminiModel: Model<"openai-responses"> = buildModel({
+	id: "gemini-3.5-flash",
+	name: "Gemini 3.5 Flash",
+	api: "openai-responses",
+	provider: "google-antigravity",
+	baseUrl: "https://generativelanguage.googleapis.com/v1",
+	reasoning: false,
+	input: ["text", "image"],
+	cost: { input: 0.15, output: 0.6, cacheRead: 0.01, cacheWrite: 0.15 },
+	contextWindow: 1000000,
+	maxTokens: 8192,
+});
+
 const textOnlyModel: Model<"openai-responses"> = {
 	...visionModel,
 	id: "gpt-4.1",
@@ -110,6 +123,35 @@ function createCompleteSimpleForbiddenStub(): CompleteSimpleStub {
 		throw new Error("completeSimple should not be called");
 	}) as typeof completeSimple;
 
+	return { calls, fn };
+}
+
+function createCompleteSimpleAuthFallbackStub(badModelId: string, successText: string): CompleteSimpleStub {
+	const calls: unknown[][] = [];
+	const fn = (async (...args: unknown[]) => {
+		calls.push(args);
+		const model = args[0] as { id?: string };
+		if (model?.id === badModelId) {
+			throw new Error('{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}');
+		}
+		return {
+			role: "assistant",
+			api: geminiModel.api,
+			provider: geminiModel.provider,
+			model: model?.id ?? "unknown",
+			usage: {
+				input: 1,
+				output: 1,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 2,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			},
+			stopReason: "stop",
+			timestamp: Date.now(),
+			content: [{ type: "text", text: successText }],
+		};
+	}) as typeof completeSimple;
 	return { calls, fn };
 }
 
@@ -256,7 +298,7 @@ describe("InspectImageTool", () => {
 		const tool = new InspectImageTool(createSession(testDir, textOnlyModel), stub.fn);
 
 		await expect(tool.execute("call-2", { path: imagePath, question: "What is visible?" })).rejects.toThrow(
-			/does not support image input/i,
+			/Unable to resolve.*image-capable/i,
 		);
 		expect(stub.calls).toHaveLength(0);
 	});
@@ -269,8 +311,49 @@ describe("InspectImageTool", () => {
 		const tool = new InspectImageTool(createSession(testDir, visionModel, ""), stub.fn);
 
 		await expect(tool.execute("call-3", { path: imagePath, question: "What is visible?" })).rejects.toThrow(
-			/No API key available/i,
+			/Unable to resolve.*credentials/i,
 		);
 		expect(stub.calls).toHaveLength(0);
+	});
+
+	it("falls back to next candidate when vision model fails authentication", async () => {
+		const imagePath = path.join(testDir, "screen.png");
+		fs.writeFileSync(imagePath, Buffer.from(TINY_PNG_BASE64, "base64"));
+
+		const stub = createCompleteSimpleAuthFallbackStub("gpt-4o", "Gemini fallback used");
+		const tool = new InspectImageTool(
+			createSession(testDir, visionModel, "test-key", Settings.isolated(), {
+				availableModels: [visionModel, geminiModel],
+			}),
+			stub.fn,
+		);
+
+		const result = await tool.execute("call-auth-fallback", { path: imagePath, question: "What is visible?" });
+
+		expect(result.details?.model).toBe("google-antigravity/gemini-3.5-flash");
+		expect(stub.calls).toHaveLength(2);
+		expect((stub.calls[0]?.[0] as { id?: string } | undefined)?.id).toBe("gpt-4o");
+		expect((stub.calls[1]?.[0] as { id?: string } | undefined)?.id).toBe("gemini-3.5-flash");
+	});
+
+	it("uses built-in Gemini vision chain when vision role is unconfigured", async () => {
+		const imagePath = path.join(testDir, "screen.png");
+		fs.writeFileSync(imagePath, Buffer.from(TINY_PNG_BASE64, "base64"));
+
+		const stub = createCompleteSimpleSuccessStub("Built-in Gemini vision chain used");
+		const tool = new InspectImageTool(
+			createSession(testDir, textOnlyModel, "test-key", Settings.isolated(), {
+				configureVisionRole: false,
+				availableModels: [textOnlyModel, geminiModel],
+				activeModel: textOnlyModel,
+			}),
+			stub.fn,
+		);
+
+		const result = await tool.execute("call-gemini-chain", { path: imagePath, question: "What is visible?" });
+
+		expect(result.details?.model).toBe("google-antigravity/gemini-3.5-flash");
+		expect(stub.calls).toHaveLength(1);
+		expect((stub.calls[0]?.[0] as { id?: string } | undefined)?.id).toBe("gemini-3.5-flash");
 	});
 });

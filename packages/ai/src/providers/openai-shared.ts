@@ -191,7 +191,7 @@ export function resolveOpenAIRequestSetup(
 		query = { "api-version": options.azureChatCompletions.apiVersion };
 	}
 
-	if (options.openAISessionId && model.provider === "openai") {
+	if (options.openAISessionId && (model.provider === "openai" || model.provider === "gpt-proxy")) {
 		headers.session_id ??= options.openAISessionId;
 		headers["x-client-request-id"] ??= options.openAISessionId;
 	}
@@ -1280,13 +1280,13 @@ export function buildResponsesInput<TApi extends Api>(options: BuildResponsesInp
 			const assistantMsg = msg as AssistantMessage;
 			const providerPayload =
 				options.nativeHistory?.replay &&
-				assistantMsg.api === options.model.api &&
-				assistantMsg.model === options.model.id
+					assistantMsg.api === options.model.api &&
+					assistantMsg.model === options.model.id
 					? getOpenAIResponsesHistoryPayload(
-							assistantMsg.providerPayload,
-							options.model.provider,
-							assistantMsg.provider,
-						)
+						assistantMsg.providerPayload,
+						options.model.provider,
+						assistantMsg.provider,
+					)
 					: undefined;
 			const historyItems = providerPayload?.items;
 			if (historyItems) {
@@ -1943,8 +1943,8 @@ export async function processResponsesStream<TApi extends Api>(
 					entry?.block.type === "thinking"
 						? entry.block
 						: (output.content.find(b => b.type === "thinking" && (b as ThinkingContent).itemId === item.id) as
-								| ThinkingContent
-								| undefined);
+							| ThinkingContent
+							| undefined);
 				if (reasoningBlock) {
 					reasoningBlock.thinking = thinking;
 					reasoningBlock.thinkingSignature = JSON.stringify(item);
@@ -2344,17 +2344,17 @@ export function populateResponsesUsageFromResponse(
 	output: AssistantMessage,
 	usage:
 		| {
-				input_tokens?: number | null;
-				output_tokens?: number | null;
-				total_tokens?: number | null;
-				prompt_cache_hit_tokens?: number | null;
-				prompt_cache_miss_tokens?: number | null;
-				input_tokens_details?: {
-					cached_tokens?: number | null;
-					cache_write_tokens?: number | null;
-				} | null;
-				output_tokens_details?: { reasoning_tokens?: number | null } | null;
-		  }
+			input_tokens?: number | null;
+			output_tokens?: number | null;
+			total_tokens?: number | null;
+			prompt_cache_hit_tokens?: number | null;
+			prompt_cache_miss_tokens?: number | null;
+			input_tokens_details?: {
+				cached_tokens?: number | null;
+				cache_write_tokens?: number | null;
+			} | null;
+			output_tokens_details?: { reasoning_tokens?: number | null } | null;
+		}
 		| null
 		| undefined,
 ): void {

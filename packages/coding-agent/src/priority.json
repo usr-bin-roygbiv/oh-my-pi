@@ -41,5 +41,17 @@
 		"google-gemini-cli/gemini-3.5-flash",
 		"gemini-3.5-flash",
 		"gemini-3-5-flash"
+	],
+	"vision": [
+		"google-antigravity/gemini-3.5-flash",
+		"gemini-3.5-flash",
+		"gemini-3-flash",
+		"google-gemini-cli/gemini-3.5-flash",
+		"google-gemini-cli/gemini-3-pro",
+		"gpt-5.5",
+		"gpt-5.4",
+		"gpt-4o",
+		"haiku-4-5",
+		"haiku"
 	]
 }

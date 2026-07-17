@@ -5,7 +5,13 @@ import { prompt } from "@oh-my-pi/pi-utils";
 import { type } from "arktype";
 import { extractTextContent } from "../commit/utils";
 
-import { expandRoleAlias, getModelMatchPreferences, resolveModelFromString } from "../config/model-resolver";
+import {
+	expandRoleAlias,
+	getModelMatchPreferences,
+	resolveConfiguredModelPatterns,
+	resolveModelFromString,
+} from "../config/model-resolver";
+import { isAuthenticated, kNoAuth } from "../config/model-registry";
 import inspectImageDescription from "../prompts/tools/inspect-image.md" with { type: "text" };
 import inspectImageSystemPromptTemplate from "../prompts/tools/inspect-image-system.md" with { type: "text" };
 import {
@@ -106,28 +112,60 @@ export class InspectImageTool implements AgentTool<typeof inspectImageSchema, In
 		};
 
 		const activeModelPattern = this.session.getActiveModelString?.() ?? this.session.getModelString?.();
-		const model =
-			resolvePattern("pi/vision") ??
-			resolvePattern("pi/default") ??
-			resolvePattern(activeModelPattern) ??
-			availableModels[0];
-		if (!model) {
-			throw new ToolError("Unable to resolve a model for inspect_image.");
+
+		// Build a deduplicated candidate list from multiple sources so a model
+		// with invalid credentials doesn't block the tool:
+		//   1. Configured vision role (modelRoles.vision)
+		//   2. Built-in vision priority chain from priority.json (Gemini-first)
+		//   3. Active session model
+		//   4. Configured default role
+		const seenPatterns = new Set<string>();
+		const candidatePatterns: string[] = [];
+		for (const pattern of [
+			...resolveConfiguredModelPatterns("pi/vision", this.session.settings),
+			...resolveConfiguredModelPatterns("pi/vision"),
+			activeModelPattern,
+			...resolveConfiguredModelPatterns("pi/default", this.session.settings),
+		]) {
+			if (pattern && !seenPatterns.has(pattern)) {
+				seenPatterns.add(pattern);
+				candidatePatterns.push(pattern);
+			}
 		}
 
-		if (!model.input.includes("image")) {
+		// Filter to image-capable models that have credentials
+		const seenModelIds = new Set<string>();
+		const viableCandidates: Model<Api>[] = [];
+		for (const pattern of candidatePatterns) {
+			const candidate = resolvePattern(pattern);
+			if (!candidate || !candidate.input.includes("image")) continue;
+			const id = `${candidate.provider}/${candidate.id}`;
+			if (seenModelIds.has(id)) continue;
+			const key = await modelRegistry.getApiKey(candidate);
+			if (key !== kNoAuth && !isAuthenticated(key)) continue;
+			seenModelIds.add(id);
+			viableCandidates.push(candidate);
+		}
+
+		// Last resort: scan all available image-capable authenticated models
+		for (const candidate of availableModels) {
+			const id = `${candidate.provider}/${candidate.id}`;
+			if (seenModelIds.has(id)) continue;
+			if (!candidate.input.includes("image")) continue;
+			const key = await modelRegistry.getApiKey(candidate);
+			if (key !== kNoAuth && !isAuthenticated(key)) continue;
+			seenModelIds.add(id);
+			viableCandidates.push(candidate);
+		}
+
+		if (viableCandidates.length === 0) {
 			throw new ToolError(
-				`Resolved model ${model.provider}/${model.id} does not support image input. Configure a vision-capable model for modelRoles.vision.`,
+				"Unable to resolve an image-capable model with credentials for inspect_image. " +
+					"Configure modelRoles.vision to a vision-capable model (e.g. a Gemini model) with working API credentials.",
 			);
 		}
 
-		const apiKey = await modelRegistry.getApiKey(model);
-		if (!apiKey) {
-			throw new ToolError(
-				`No API key available for ${model.provider}/${model.id}. Configure credentials for this provider or choose another vision-capable model.`,
-			);
-		}
-
+		// Load the image once for all candidates
 		let imageInput: LoadedImageInput | null;
 		try {
 			imageInput = await loadImageInput({
@@ -135,7 +173,7 @@ export class InspectImageTool implements AgentTool<typeof inspectImageSchema, In
 				cwd: this.session.cwd,
 				autoResize: this.session.settings.get("images.autoResize"),
 				maxBytes: MAX_IMAGE_INPUT_BYTES,
-				excludeWebP: webpExclusionForModel(model),
+				excludeWebP: webpExclusionForModel(viableCandidates[0]),
 			});
 		} catch (error) {
 			if (error instanceof ImageInputTooLargeError) {
@@ -149,48 +187,75 @@ export class InspectImageTool implements AgentTool<typeof inspectImageSchema, In
 		}
 
 		const telemetry = resolveTelemetry(this.session.getTelemetry?.(), this.session.getSessionId?.() ?? undefined);
-		const response = await instrumentedCompleteSimple(
-			model,
-			{
-				systemPrompt: [prompt.render(inspectImageSystemPromptTemplate)],
-				messages: [
+		const authErrorPattern = /401|403|auth|api.?key|forbidden|x-api-key|invalid.*key/i;
+		let lastError: string | undefined;
+
+		// Try each candidate; on auth failure, fall through to the next
+		for (const candidate of viableCandidates) {
+			try {
+				const response = await instrumentedCompleteSimple(
+					candidate,
 					{
-						role: "user",
-						content: [
-							{ type: "image", data: imageInput.data, mimeType: imageInput.mimeType },
-							{ type: "text", text: params.question },
+						systemPrompt: [prompt.render(inspectImageSystemPromptTemplate)],
+						messages: [
+							{
+								role: "user",
+								content: [
+									{ type: "image", data: imageInput.data, mimeType: imageInput.mimeType },
+									{ type: "text", text: params.question },
+								],
+								timestamp: Date.now(),
+							},
 						],
-						timestamp: Date.now(),
 					},
-				],
-			},
-			{
-				apiKey: modelRegistry.resolver(model, this.session.getSessionId?.() ?? undefined),
-				signal,
-			},
-			{ telemetry, oneshotKind: "inspect_image", completeImpl: this.completeImageRequest },
+					{
+						apiKey: modelRegistry.resolver(candidate, this.session.getSessionId?.() ?? undefined),
+						signal,
+					},
+					{ telemetry, oneshotKind: "inspect_image", completeImpl: this.completeImageRequest },
+				);
+
+				if (response.stopReason === "error") {
+					const msg = response.errorMessage ?? "";
+					if (authErrorPattern.test(msg)) {
+						lastError = msg;
+						continue;
+					}
+					throw new ToolError(msg || "inspect_image request failed.");
+				}
+				if (response.stopReason === "aborted") {
+					throw new ToolError("inspect_image request aborted.");
+				}
+
+				const text = extractTextContent(response);
+				if (!text) {
+					throw new ToolError("inspect_image model returned no text output.");
+				}
+
+				return {
+					content: [{ type: "text", text }],
+					details: {
+						model: `${candidate.provider}/${candidate.id}`,
+						imagePath: imageInput.resolvedPath,
+						mimeType: imageInput.mimeType,
+					},
+				};
+			} catch (err) {
+				if (err instanceof ToolError) throw err;
+				const msg = err instanceof Error ? err.message : String(err);
+				if (authErrorPattern.test(msg)) {
+					lastError = msg;
+					continue;
+				}
+				throw err;
+			}
+		}
+
+		throw new ToolError(
+			`All ${viableCandidates.length} image-capable model(s) failed. ` +
+				(lastError ? `Last error: ${lastError}. ` : "") +
+				"Configure modelRoles.vision to a vision-capable model with working API credentials.",
 		);
-
-		if (response.stopReason === "error") {
-			throw new ToolError(response.errorMessage ?? "inspect_image request failed.");
-		}
-		if (response.stopReason === "aborted") {
-			throw new ToolError("inspect_image request aborted.");
-		}
-
-		const text = extractTextContent(response);
-		if (!text) {
-			throw new ToolError("inspect_image model returned no text output.");
-		}
-
-		return {
-			content: [{ type: "text", text }],
-			details: {
-				model: `${model.provider}/${model.id}`,
-				imagePath: imageInput.resolvedPath,
-				mimeType: imageInput.mimeType,
-			},
-		};
 	}
 }
 
