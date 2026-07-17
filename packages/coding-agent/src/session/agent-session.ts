@@ -30,6 +30,7 @@ import {
 	type AgentMessage,
 	type AgentState,
 	type AgentTool,
+	type AgentToolCall,
 	type AgentToolResult,
 	type AgentTurnEndContext,
 	AppendOnlyContextManager,
@@ -104,6 +105,7 @@ import type {
 	TextContent,
 	ToolCall,
 	ToolChoice,
+	ToolResultMessage,
 	Usage,
 	UsageReport,
 } from "@oh-my-pi/pi-ai";
@@ -317,6 +319,7 @@ import {
 } from "../thinking";
 import { formatTitleConversationContext, type TitleConversationTurn } from "../tiny/message-preproc";
 import { shutdownTinyTitleClient } from "../tiny/title-client";
+import { type AskToolDetails, type AskToolInput, recoverAskQuestions } from "../tools/ask";
 import { assertEditableFile } from "../tools/auto-generated-guard";
 import { releaseTabsForOwner } from "../tools/browser/tab-supervisor";
 import { isMCPToolName, normalizeToolNames } from "../tools/builtin-names";
@@ -16673,7 +16676,18 @@ export class AgentSession {
 	 */
 	async navigateTree(
 		targetId: string,
-		options: { summarize?: boolean; customInstructions?: string } = {},
+		options: {
+			summarize?: boolean;
+			customInstructions?: string;
+			/**
+			 * Completes an in-progress `ask` re-answer (issue #5642): the caller
+			 * already received `reopenAsk` from a prior call on the same
+			 * `targetId`, re-opened the picker, and is handing back the fresh
+			 * answer. Branches a new toolResult sibling instead of landing on
+			 * the original one.
+			 */
+			reanswerAskResult?: AgentToolResult<AskToolDetails>;
+		} = {},
 	): Promise<{
 		editorText?: string;
 		cancelled: boolean;
@@ -16681,6 +16695,14 @@ export class AgentSession {
 		summaryEntry?: BranchSummaryEntry;
 		/** Raw session context built during navigation — pass to renderInitialMessages to skip a second O(N) walk. */
 		sessionContext?: SessionContext;
+		/**
+		 * Set when `targetId` is an `ask` toolResult and `options.reanswerAskResult`
+		 * was not supplied: nothing was mutated. The caller must re-open the ask
+		 * picker with these `questions`, then call `navigateTree(targetId, {
+		 * ...options, reanswerAskResult })` with the produced result to actually
+		 * branch (issue #5642).
+		 */
+		reopenAsk?: { toolCallId: string; questions: AskToolInput["questions"] };
 	}> {
 		await this.#flushPendingBashMessages();
 		const oldLeafId = this.sessionManager.getLeafId();
@@ -16698,6 +16720,25 @@ export class AgentSession {
 		const targetEntry = this.sessionManager.getEntry(targetId);
 		if (!targetEntry) {
 			throw new Error(`Entry ${targetId} not found`);
+		}
+
+		// `ask` toolResult, first pass: hand control back to the caller to
+		// re-open the picker instead of landing on the stale answer in place.
+		// Nothing is mutated here — see the `reanswerAskResult` branch below for
+		// the actual sibling-branch construction once the caller has an answer.
+		if (
+			!options.reanswerAskResult &&
+			targetEntry.type === "message" &&
+			targetEntry.message.role === "toolResult" &&
+			targetEntry.message.toolName === "ask"
+		) {
+			const toolCallId = targetEntry.message.toolCallId;
+			const questions = this.#recoverAskReanswerQuestions(targetEntry.parentId, toolCallId);
+			if (questions) {
+				return { cancelled: false, reopenAsk: { toolCallId, questions } };
+			}
+			// Original arguments couldn't be recovered (corrupted/legacy session
+			// data) — fall through to a plain leaf move so navigation still works.
 		}
 
 		// Collect entries to summarize (from old leaf to common ancestor)
@@ -16800,6 +16841,27 @@ export class AgentSession {
 							.filter((c): c is { type: "text"; text: string } => c.type === "text")
 							.map(c => c.text)
 							.join("");
+		} else if (
+			targetEntry.type === "message" &&
+			targetEntry.message.role === "toolResult" &&
+			targetEntry.message.toolName === "ask" &&
+			options.reanswerAskResult
+		) {
+			// `ask` toolResult, second pass: the caller re-opened the picker and
+			// is handing back a fresh answer. Branch a *new* sibling toolResult
+			// off the same `ask` toolCall instead of reusing `targetId` — the
+			// original answer's branch stays reachable (issue #5642).
+			const reanswer = options.reanswerAskResult;
+			const toolResultMessage: ToolResultMessage = {
+				role: "toolResult",
+				toolCallId: targetEntry.message.toolCallId,
+				toolName: "ask",
+				content: reanswer.content,
+				details: reanswer.details,
+				isError: reanswer.isError === true,
+				timestamp: Date.now(),
+			};
+			newLeafId = this.sessionManager.appendMessageToBranch(toolResultMessage, targetEntry.parentId);
 		} else {
 			// Non-user message (or a user-invoked skill-prompt injection): land the
 			// leaf on the selected node so it stays on the active branch. Skill
@@ -16860,6 +16922,26 @@ export class AgentSession {
 			return { editorText, cancelled: false, summaryEntry, sessionContext: rawContext };
 		}
 		return { editorText, cancelled: false, summaryEntry, sessionContext: stateContext };
+	}
+
+	/**
+	 * Look up the `ask` toolCall's persisted `arguments` inside its parent
+	 * assistant entry and validate them back into `questions`, for `/tree`
+	 * `ask` re-answer (issue #5642). Returns `undefined` when the parent
+	 * entry, toolCall, or arguments can't be resolved — the caller falls back
+	 * to a plain leaf move rather than opening a picker with bad data.
+	 */
+	#recoverAskReanswerQuestions(parentId: string | null, toolCallId: string): AskToolInput["questions"] | undefined {
+		if (parentId === null) return undefined;
+		const parentEntry = this.sessionManager.getEntry(parentId);
+		if (parentEntry?.type !== "message" || parentEntry.message.role !== "assistant") {
+			return undefined;
+		}
+		const toolCall = parentEntry.message.content.find(
+			(block): block is AgentToolCall => block.type === "toolCall" && block.id === toolCallId,
+		);
+		if (!toolCall) return undefined;
+		return recoverAskQuestions(toolCall.arguments);
 	}
 
 	/**

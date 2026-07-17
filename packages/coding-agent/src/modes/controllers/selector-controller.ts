@@ -1,4 +1,4 @@
-import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
+import { type AgentToolContext, type AgentToolResult, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import { PASTE_CODE_LOGIN_PROVIDERS } from "@oh-my-pi/pi-ai";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import type { OAuthProvider } from "@oh-my-pi/pi-ai/oauth/types";
@@ -63,8 +63,11 @@ import {
 	setExcludedSearchProviders,
 	setPreferredImageProvider,
 	setPreferredSearchProvider,
+	type ToolSession,
 } from "../../tools";
+import { AskTool, type AskToolDetails, type AskToolInput } from "../../tools/ask";
 import { shortenPath } from "../../tools/render-utils";
+import { ToolAbortError } from "../../tools/tool-errors";
 import { copyToClipboard } from "../../utils/clipboard";
 import { repo } from "../../utils/git";
 import { setSessionTerminalTitle } from "../../utils/title-generator";
@@ -1195,10 +1198,26 @@ export class SelectorController {
 					}
 
 					try {
-						const result = await this.ctx.session.navigateTree(entryId, {
+						let result = await this.ctx.session.navigateTree(entryId, {
 							summarize: wantsSummary,
 							customInstructions,
 						});
+
+						// Selecting an `ask` toolResult doesn't land the leaf directly —
+						// re-open the picker with the original questions first, then
+						// complete the navigation as a new sibling branch (issue #5642).
+						if (result.reopenAsk) {
+							const reanswer = await this.#reanswerAsk(result.reopenAsk.questions);
+							if (!reanswer) {
+								this.ctx.showStatus("Re-answer cancelled");
+								return;
+							}
+							result = await this.ctx.session.navigateTree(entryId, {
+								summarize: wantsSummary,
+								customInstructions,
+								reanswerAskResult: reanswer,
+							});
+						}
 
 						if (result.aborted) {
 							// Summarization aborted - re-show tree selector
@@ -1241,6 +1260,41 @@ export class SelectorController {
 			);
 			return { component: selector, focus: selector };
 		});
+	}
+
+	/**
+	 * Re-open the `ask` picker with the original `questions` (issue #5642):
+	 * runs a standalone `AskTool.execute()` outside a normal agent turn,
+	 * reusing the same picker/dialog primitives a live `ask` tool call gets.
+	 * Returns `undefined` when the user cancels — mirrors `navigateTree`'s
+	 * cancellation contract instead of throwing.
+	 */
+	async #reanswerAsk(questions: AskToolInput["questions"]): Promise<AgentToolResult<AskToolDetails> | undefined> {
+		const uiContext = this.ctx.getToolUIContext();
+		if (!uiContext) {
+			this.ctx.showError("Ask tool UI is not ready");
+			return undefined;
+		}
+		const toolSession: ToolSession = {
+			cwd: this.ctx.sessionManager.getCwd(),
+			hasUI: true,
+			settings: this.ctx.settings,
+			getSessionFile: () => this.ctx.sessionManager.getSessionFile() ?? null,
+			getSessionSpawns: () => null,
+			getPlanModeState: () => this.ctx.session.getPlanModeState(),
+		};
+		const askTool = new AskTool(toolSession);
+		// AgentToolContext carries many runtime-only fields (cwd, sessionManager,
+		// compact, ...) a standalone re-answer never touches — AskTool only reads
+		// `hasUI`/`ui`/`abort()`. Matches the narrow-context convention already
+		// used by ask.test.ts's `createContext` helper.
+		const context = { hasUI: true, ui: uiContext, abort: () => {} } as unknown as AgentToolContext;
+		try {
+			return await askTool.execute("tree-reanswer", { questions }, undefined, undefined, context);
+		} catch (error) {
+			if (error instanceof ToolAbortError) return undefined;
+			throw error;
+		}
 	}
 
 	async showSessionSelector(): Promise<void> {

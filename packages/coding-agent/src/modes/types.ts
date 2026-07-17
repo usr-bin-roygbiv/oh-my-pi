@@ -420,6 +420,13 @@ export interface InteractiveModeContext {
 
 	// Hook UI methods
 	initHooksAndCustomTools(): Promise<void>;
+	/**
+	 * The live `ExtensionUIContext` (picker/dialog primitives) used for tool
+	 * execution, `undefined` before hooks have initialized. `/tree` `ask`
+	 * re-answer (issue #5642) reuses it to drive a standalone
+	 * `AskTool.execute()` call.
+	 */
+	getToolUIContext(): ExtensionUIContext | undefined;
 	emitCustomToolSessionEvent(
 		reason: "start" | "switch" | "branch" | "tree" | "shutdown",
 		previousSessionFile?: string,

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `/tree` re-answer for a past `ask` toolResult: selecting it now re-opens the picker with the original questions and branches the new answer as a sibling toolResult, leaving the original answer's branch reachable (#5642).
+
 ## [17.0.2] - 2026-07-17
 
 ### Added
