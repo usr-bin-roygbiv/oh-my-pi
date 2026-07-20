@@ -196,14 +196,27 @@ describe("streamDevin large request recovery", () => {
 					},
 					{
 						role: "assistant" as const,
-						content: "running a tool",
-						toolCalls: [
+						content: [
+							{ type: "text" as const, text: "running a tool" },
 							{
+								type: "toolCall" as const,
 								id: "call-1",
 								name: "large_tool",
 								arguments: {},
 							},
 						],
+						api: "devin-agent" as const,
+						provider: "devin" as const,
+						model: "devin-test",
+						usage: {
+							input: 0,
+							output: 0,
+							cacheRead: 0,
+							cacheWrite: 0,
+							totalTokens: 0,
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+						},
+						stopReason: "toolUse" as const,
 						timestamp: 2,
 					},
 					{
