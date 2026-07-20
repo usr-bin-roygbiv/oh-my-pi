@@ -43,9 +43,11 @@ import type {
 	Tool,
 	ToolCall,
 } from "../types";
+import { isDemotedThinking } from "../utils/block-symbols";
 import { deterministicUuid } from "../utils/deterministic-id";
 import { AssistantMessageEventStream } from "../utils/event-stream";
 import { toolWireSchema } from "../utils/schema/wire";
+import { transformMessages } from "./transform-messages";
 
 /** Base host for Codeium/Windsurf's Cascade chat API (Connect protocol over HTTP/1.1). */
 export const DEVIN_API_URL = "https://server.codeium.com";
@@ -443,6 +445,7 @@ function buildDevinChatRequest(
 		options?.stopSequences && options.stopSequences.length > 0
 			? [...DEVIN_DEFAULT_STOP_PATTERNS, ...options.stopSequences]
 			: DEVIN_DEFAULT_STOP_PATTERNS;
+	const messages = transformMessages(context.messages, model);
 	return create(GetChatMessageRequestSchema, {
 		metadata: create(MetadataSchema, {
 			apiKey,
@@ -454,7 +457,7 @@ function buildDevinChatRequest(
 			locale: "en",
 		}),
 		prompt: (context.systemPrompt ?? []).join("\n\n"),
-		chatMessagePrompts: buildChatMessagePrompts(context.messages, cascadeId),
+		chatMessagePrompts: buildChatMessagePrompts(messages, cascadeId, model),
 		chatModelUid: options?.chatModelUid ?? model.requestModelId ?? model.id,
 		requestType: ChatMessageRequestType.CASCADE,
 		plannerMode: ConversationalPlannerMode.DEFAULT,
@@ -486,7 +489,11 @@ function buildDevinChatRequest(
 }
 
 /** Map omp `Message` history onto Cascade `ChatMessagePrompt`s (USER / SYSTEM / TOOL channels). */
-function buildChatMessagePrompts(messages: Message[], cascadeId: string): ChatMessagePrompt[] {
+function buildChatMessagePrompts(
+	messages: Message[],
+	cascadeId: string,
+	model: Model<"devin-agent">,
+): ChatMessagePrompt[] {
 	const prompts: ChatMessagePrompt[] = [];
 	// messageId seeds are `cascadeId\0index\0role[...]` — prompt text is excluded
 	// so ids stay stable across content edits / history rebuilds.
@@ -514,16 +521,18 @@ function buildChatMessagePrompts(messages: Message[], cascadeId: string): ChatMe
 				}),
 			);
 		} else if (msg.role === "assistant") {
+			const isNativeDevinMessage =
+				msg.api === model.api && msg.provider === model.provider && msg.model === model.id;
 			let promptText = "";
 			let thinkingText = "";
 			let signature = "";
 			const toolCalls: ChatToolCall[] = [];
 			for (const part of msg.content) {
 				if (part.type === "text") {
-					promptText += part.text;
+					promptText += `${part.text}${isDemotedThinking(part) ? "\n" : ""}`;
 				} else if (part.type === "thinking") {
 					thinkingText += part.thinking;
-					if (!signature && part.thinkingSignature) signature = part.thinkingSignature;
+					if (isNativeDevinMessage && !signature && part.thinkingSignature) signature = part.thinkingSignature;
 				} else if (part.type === "toolCall") {
 					toolCalls.push(
 						create(ChatToolCallSchema, {
@@ -534,9 +543,13 @@ function buildChatMessagePrompts(messages: Message[], cascadeId: string): ChatMe
 					);
 				}
 			}
+			if (!promptText && !thinkingText && !signature && toolCalls.length === 0) continue;
 			prompts.push(
 				create(ChatMessagePromptSchema, {
-					messageId: msg.responseId ?? `bot-${deterministicUuid(`${cascadeId}\0${index}\0assistant`)}`,
+					messageId:
+						isNativeDevinMessage && msg.responseId
+							? msg.responseId
+							: `bot-${deterministicUuid(`${cascadeId}\0${index}\0assistant`)}`,
 					source: ChatMessageSource.SYSTEM,
 					prompt: promptText,
 					thinking: thinkingText,
