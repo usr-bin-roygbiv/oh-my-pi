@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed turn-ending Codex rate-limit errors remaining hidden behind the fullscreen Plan Review overlay and leaving its approval promise pending ([#6086](https://github.com/can1357/oh-my-pi/issues/6086)).
+
 ## [17.0.5] - 2026-07-18
 
 ### Added
