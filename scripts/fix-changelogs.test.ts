@@ -3,7 +3,14 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { $ } from "bun";
-import { collectPromotableAddedItemLines, fixChangelogContent, runChangelogFixer } from "./fix-changelogs";
+import {
+	collectPromotableAddedItemLines,
+	fixChangelogContent,
+	parseChangelog,
+	recordSummarizedItemFingerprints,
+	renderChangelog,
+	runChangelogFixer,
+} from "./fix-changelogs";
 
 describe("collectPromotableAddedItemLines", () => {
 	it("keeps new changelog item additions while ignoring moves and edits", () => {
@@ -153,6 +160,28 @@ describe("fixChangelogContent", () => {
 				"",
 			].join("\n"),
 		);
+	});
+
+	it("drops stale source bullets after summarization changes their text", () => {
+		const sourceItem =
+			"- Fixed isolated `task` subagents mutating the parent checkout and stacking parallel task branches ([#6003](https://github.com/can1357/oh-my-pi/issues/6003)).";
+		const document = parseChangelog(
+			["# Changelog", "", "## [Unreleased]", "", "### Fixed", "", sourceItem, ""].join("\n"),
+		);
+		const unreleased = document.sections.find(section => section.title === "Unreleased");
+		if (!unreleased) throw new Error("fixture is missing Unreleased");
+
+		recordSummarizedItemFingerprints(document, unreleased);
+		const summarizedItem =
+			"- Fixed isolated `task` subagents mutating the parent checkout by detaching the git directory.";
+		unreleased.subsections = [{ title: "Fixed", lines: [{ text: summarizedItem, lineNumber: 0 }] }];
+		const staleMerge = renderChangelog(document).replace(summarizedItem, `${summarizedItem}\n${sourceItem}`);
+
+		const result = fixChangelogContent(staleMerge, new Set());
+
+		expect(result.droppedReleasedDuplicates).toBe(1);
+		expect(result.content).toContain(summarizedItem);
+		expect(result.content).not.toContain(sourceItem);
 	});
 
 	it("can recover Unreleased by dropping bullets known to be historically released", () => {

@@ -7,6 +7,7 @@ const CHANGELOG_GLOB = "packages/*/CHANGELOG.md";
 const ORDERED_SECTION_TITLES = ["Breaking Changes", "Added", "Changed", "Fixed", "Removed"] as const;
 const CHANGELOG_BASELINE_REF = "refs/clog";
 const CHANGELOG_BASELINE_NAME = "clog";
+const SUMMARIZED_ITEM_MARKER = /^<!-- changelog-source-item sha256:([0-9a-f]{64}) -->$/;
 
 export interface NumberedLine {
 	text: string;
@@ -277,6 +278,45 @@ function itemTextKey(itemLines: readonly string[]): string {
 	return trimBlankLines(itemLines).join("\n");
 }
 
+function itemFingerprint(itemLines: readonly string[]): string {
+	const text = itemTextKey(itemLines);
+	if (!text) return "";
+	return new Bun.CryptoHasher("sha256").update(text).digest("hex");
+}
+
+function collectRecordedItemFingerprints(lines: readonly NumberedLine[], keys: Set<string>): void {
+	for (const line of lines) {
+		const fingerprint = line.text.match(SUMMARIZED_ITEM_MARKER)?.[1];
+		if (fingerprint) keys.add(fingerprint);
+	}
+}
+
+function addItemKeys(keys: Set<string>, itemLines: readonly string[]): void {
+	const text = itemTextKey(itemLines);
+	if (text) keys.add(text);
+	const fingerprint = itemFingerprint(itemLines);
+	if (fingerprint) keys.add(fingerprint);
+}
+
+/**
+ * Records source-item fingerprints before an Unreleased section is summarized.
+ */
+export function recordSummarizedItemFingerprints(document: ChangelogDocument, section: ReleaseSection): void {
+	const recorded = new Set<string>();
+	collectRecordedItemFingerprints(document.prefixLines, recorded);
+	for (const subsection of section.subsections) {
+		for (const item of parseItems(subsection.lines)) {
+			const fingerprint = itemFingerprint(item.lines);
+			if (!fingerprint || recorded.has(fingerprint)) continue;
+			document.prefixLines.push({
+				text: `<!-- changelog-source-item sha256:${fingerprint} -->`,
+				lineNumber: 0,
+			});
+			recorded.add(fingerprint);
+		}
+	}
+}
+
 function subsectionHasItem(subsection: Subsection, itemLines: readonly string[]): boolean {
 	const wanted = itemTextKey(itemLines);
 	if (!wanted) return true;
@@ -288,12 +328,12 @@ function subsectionHasItem(subsection: Subsection, itemLines: readonly string[])
 
 function collectReleasedItemKeys(document: ChangelogDocument): Set<string> {
 	const keys = new Set<string>();
+	collectRecordedItemFingerprints(document.prefixLines, keys);
 	for (const section of document.sections) {
 		if (section.title === "Unreleased") continue;
 		for (const subsection of section.subsections) {
 			for (const item of parseItems(subsection.lines)) {
-				const key = itemTextKey(item.lines);
-				if (key) keys.add(key);
+				addItemKeys(keys, item.lines);
 			}
 		}
 	}
@@ -301,11 +341,10 @@ function collectReleasedItemKeys(document: ChangelogDocument): Set<string> {
 }
 
 /**
- * Drop items from [Unreleased] that already appear verbatim in a released
- * section — the residue of a release that copied [Unreleased] into the new
- * version section without clearing it. The released copy is authoritative, so
- * the Unreleased duplicate is removed. Runs before promotion (while parse line
- * numbers are still real) and only ever mutates the Unreleased section.
+ * Drops items from [Unreleased] that already appeared in a released section or
+ * were consumed by changelog summarization. Summarization records source
+ * fingerprints before replacing the text, so stale branches cannot reintroduce
+ * the original wording. Runs before promotion and only mutates Unreleased.
  */
 function dropUnreleasedDuplicatesOfReleased(
 	document: ChangelogDocument,
@@ -319,7 +358,11 @@ function dropUnreleasedDuplicatesOfReleased(
 
 	let dropped = 0;
 	for (const subsection of unreleased.subsections) {
-		const duplicates = parseItems(subsection.lines).filter(item => releasedKeys.has(itemTextKey(item.lines)));
+		const duplicates = parseItems(subsection.lines).filter(item => {
+			const text = itemTextKey(item.lines);
+			const fingerprint = itemFingerprint(item.lines);
+			return releasedKeys.has(text) || releasedKeys.has(fingerprint);
+		});
 		if (duplicates.length === 0) continue;
 		const linesToRemove = lineRangeSet(duplicates);
 		subsection.lines = subsection.lines.filter(line => !linesToRemove.has(line.lineNumber));
@@ -804,11 +847,12 @@ async function collectHistoricalReleaseRecovery(
 				if (recovery.sectionsByTitle.get(section.title) !== undefined) {
 					for (const subsection of section.subsections) {
 						for (const item of parseItems(subsection.lines)) {
-							recovery.itemKeys.add(itemTextKey(item.lines));
+							addItemKeys(recovery.itemKeys, item.lines);
 						}
 					}
 				}
 			}
+			if (recovery) collectRecordedItemFingerprints(document.prefixLines, recovery.itemKeys);
 		}
 	}
 
@@ -929,7 +973,7 @@ function usage(): string {
 		"Usage: bun scripts/fix-changelogs.ts [--dry-run|--check] [--since <tag>] [--recover] [--pin]",
 		"",
 		"Moves changelog items added since the baseline from released sections into [Unreleased],",
-		"drops [Unreleased] items that already appear verbatim in a released section, removes",
+		"drops [Unreleased] items already released or consumed by changelog summarization, removes",
 		"blank separators between adjacent bullet items, then removes duplicate or empty",
 		"### category headings.",
 		"",

@@ -51,6 +51,7 @@ import {
 	parseChangelog,
 	parseItems,
 	type ReleaseSection,
+	recordSummarizedItemFingerprints,
 	renderChangelog,
 	resolveRepoRoot,
 } from "./fix-changelogs";
@@ -335,6 +336,7 @@ async function run(options: RunOptions): Promise<RunResult> {
 				.trim();
 
 			const rewritten = await requestRewrite(model, changelogPath, unreleasedBody);
+			recordSummarizedItemFingerprints(document, section);
 			applyRewrite(section, rewritten);
 			const next = renderChangelog(document);
 			if (next === content) continue;
