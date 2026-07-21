@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed JS/TS `debug` launches timing out on WSL2 with `networkingMode=mirrored` by waiting for the adapter's listening banner before connecting (avoiding the ghost-accept window on a just-released reservation port) and rejecting pending DAP requests and event waiters the moment the transport closes, so any transport failure surfaces as an immediate `DAP connection closed` error instead of a silent 30s timeout ([#6055](https://github.com/can1357/oh-my-pi/issues/6055)).
+
 ## [17.0.5] - 2026-07-18
 
 ### Added

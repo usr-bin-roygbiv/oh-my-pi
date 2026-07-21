@@ -487,6 +487,112 @@ describe("DAP launch failure handling", () => {
 	});
 });
 
+describe("DAP TCP transport resilience", () => {
+	const TCP_ADAPTER_BASE: DapResolvedAdapter = {
+		...TEST_ADAPTER,
+		name: "js-debug-adapter",
+		command: process.execPath,
+		resolvedCommand: process.execPath,
+		connectMode: "tcp",
+	};
+
+	// Adapter that binds the reserved port, accepts the first connection, then
+	// drops it after 30ms without answering — the WSL2-mirrored ghost socket.
+	const GHOST_ADAPTER = `
+const port = Number(process.argv[2]);
+const server = Bun.listen({ hostname: "127.0.0.1", port, socket: {
+	open(s){ setTimeout(() => { try { s.end(); } catch {} }, 30); },
+	data(){}, close(){}, error(){},
+}});
+console.log("Debug server listening at 127.0.0.1:" + port);
+await Bun.sleep(60_000);
+`;
+
+	// Adapter that binds only after a delay, prints the listening banner from
+	// inside its listen callback, then answers initialize over the socket.
+	const DELAYED_BANNER_ADAPTER = `
+const port = Number(process.argv[2]);
+await Bun.sleep(150);
+const server = Bun.listen({ hostname: "127.0.0.1", port, socket: {
+	open(){},
+	data(s, data){
+		const text = Buffer.from(data).toString();
+		const m = /Content-Length: (\\d+)\\r\\n\\r\\n([\\s\\S]*)/.exec(text);
+		if (!m) return;
+		const req = JSON.parse(m[2].slice(0, Number(m[1])));
+		const resp = JSON.stringify({ seq: 1, type: "response", request_seq: req.seq, success: true, command: req.command, body: { supportsConfigurationDoneRequest: true } });
+		s.write(\`Content-Length: \${Buffer.byteLength(resp)}\\r\\n\\r\\n\${resp}\`);
+	},
+	close(){}, error(){},
+}});
+console.log("Debug server listening at 127.0.0.1:" + port);
+await Bun.sleep(60_000);
+`;
+
+	async function withTcpAdapter(
+		source: string,
+		run: (adapter: DapResolvedAdapter, cwd: string) => Promise<void>,
+	): Promise<void> {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "omp-debug-tcp-"));
+		const adapterPath = path.join(cwd, "tcp-adapter.mjs");
+		await fs.writeFile(adapterPath, source);
+		const adapter: DapResolvedAdapter = {
+			...TCP_ADAPTER_BASE,
+			args: [adapterPath, "${port}", "127.0.0.1"],
+		};
+		try {
+			await run(adapter, cwd);
+		} finally {
+			await removeWithRetries(cwd);
+		}
+	}
+
+	it("rejects a pending request fast when the transport closes cleanly without answering", async () => {
+		await withTcpAdapter(GHOST_ADAPTER, async (adapter, cwd) => {
+			const client = await DapClient.spawn({ adapter, cwd, socketReadyTimeoutMs: 5_000 });
+			try {
+				const start = Date.now();
+				// The ghost socket ends the read stream cleanly. Before the fix the
+				// request sat pending until its own 5s timeout; now the reader wakes
+				// it with a descriptive connection-closed error well before then.
+				await expect(client.sendRequest("initialize", {}, undefined, 5_000)).rejects.toThrow(
+					/DAP connection closed/,
+				);
+				expect(Date.now() - start).toBeLessThan(2_000);
+			} finally {
+				await client.dispose();
+			}
+		});
+	});
+
+	it("wakes an event waiter when the transport closes instead of waiting out its timeout", async () => {
+		await withTcpAdapter(GHOST_ADAPTER, async (adapter, cwd) => {
+			const client = await DapClient.spawn({ adapter, cwd, socketReadyTimeoutMs: 5_000 });
+			try {
+				const start = Date.now();
+				await expect(client.waitForEvent("stopped", undefined, undefined, 5_000)).rejects.toThrow(
+					/DAP connection closed/,
+				);
+				expect(Date.now() - start).toBeLessThan(2_000);
+			} finally {
+				await client.dispose();
+			}
+		});
+	});
+
+	it("defers the first connect until the adapter announces its listening port", async () => {
+		await withTcpAdapter(DELAYED_BANNER_ADAPTER, async (adapter, cwd) => {
+			const client = await DapClient.spawn({ adapter, cwd, socketReadyTimeoutMs: 5_000 });
+			try {
+				const caps = await client.initialize({ clientID: "omp", adapterID: "js-debug-adapter" }, undefined, 5_000);
+				expect(caps).toMatchObject({ supportsConfigurationDoneRequest: true });
+			} finally {
+				await client.dispose();
+			}
+		});
+	});
+});
+
 describe("DebugTool launch validation", () => {
 	it("rejects directory programs when the selected adapter cannot debug a directory", async () => {
 		const launchSpy = spyOn(dapModule, "selectLaunchAdapter").mockReturnValue({
