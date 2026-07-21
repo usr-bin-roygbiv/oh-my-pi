@@ -7,6 +7,12 @@
 - Added `/tree` re-answer for a past `ask` toolResult: selecting it now re-opens the picker with the original questions and branches the new answer as a sibling toolResult, leaving the original answer's branch reachable ([#5895](https://github.com/can1357/oh-my-pi/pull/5895) by [@Mathews-Tom](https://github.com/Mathews-Tom)).
 
 ## [17.0.3] - 2026-07-17
+## [17.0.7] - 2026-07-21
+
+### Fixed
+
+- Fixed Portkey/gateway custom models whose ids start with `@` (e.g. `@modal/GLM-5-2-FP8`) being rewritten to unrelated bundled wire ids (e.g. `glm-5-2`), which caused `400` responses requiring `x-portkey-config` or `x-portkey-provider`.
+
 ## [17.0.6] - 2026-07-20
 
 - Fixed failed plan-mode exits leaving the session on the restored execution model while plan mode remained active and silently changing ambient `xd://` tool presentation; rollback now restores the plan model, thinking level, and exact top-level-versus-mounted tool partition so exit can be retried safely ([#6013](https://github.com/can1357/oh-my-pi/pull/6013)).
