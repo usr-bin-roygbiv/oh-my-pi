@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed a terminal provider error on the continuation turn after a failed tool result silently ending the run with no durable record of why. When retry, model fallback, and compaction all declined a `stopReason: "error"` turn with no substantive content, `#persistSessionMessageIfMissing` dropped it as an empty error turn, so the session JSONL stopped at the last tool result and the provider's `errorMessage` was lost. The non-retry terminal error tail now persists the empty error turn (mirroring the retry-lifecycle dead-ends), keeping it off the wire on reload while preserving the diagnostic ([#6249](https://github.com/can1357/oh-my-pi/issues/6249)).
+
 ## [17.0.7] - 2026-07-21
 
 ### Fixed
