@@ -16,6 +16,16 @@ function getCellItalic(terminal: VirtualTerminal, row: number, col: number): boo
 }
 
 describe("renderInlineMarkdown", () => {
+	it("preserves ST-terminated OSC 8 links before inline lexing", () => {
+		const st = "\x1b\\";
+		const input = `\x1b]8;;file:///tmp/example.ts${st}\`example.ts\`\x1b]8;;${st}`;
+		const rendered = renderInlineMarkdown(input, defaultMarkdownTheme);
+		const plain = stripVTControlCharacters(rendered.replace(/\x1b\]8;[^\x07\x1b]*(?:\x07|\x1b\\)/g, ""));
+
+		expect(rendered.includes("\x1b]8;;file:///tmp/example.ts\x07")).toBeTruthy();
+		expect(plain).toBe("example.ts");
+	});
+
 	it("preserves ordered list items as visible inline text", () => {
 		const rendered = renderInlineMarkdown("1. Review against a base branch (PR Style)", defaultMarkdownTheme);
 		const plain = stripVTControlCharacters(rendered);
