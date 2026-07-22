@@ -2541,7 +2541,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			// artifacts dir) — only the SessionManager differs.
 			const buildSubagentSessionOptions = (sessionManagerForRun: SessionManager): CreateAgentSessionOptions => ({
 				cwd: worktree ?? cwd,
-				additionalDirectories: options.additionalDirectories,
+				additionalDirectories: worktree !== undefined ? undefined : options.additionalDirectories,
 				authStorage,
 				modelRegistry,
 				settings: subagentSettings,
