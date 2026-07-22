@@ -808,7 +808,8 @@ export class SessionManager {
 			parentSession: options?.parentSession,
 			providerPromptCacheKey: options?.providerPromptCacheKey,
 		};
-		this.#additionalDirectories = options?.additionalDirectories ?? [];
+		const workspace = normalizeSessionWorkspace({ cwd: this.#cwd, directories: options?.additionalDirectories ?? [] });
+		this.#additionalDirectories = additionalWorkspaceDirectories(workspace);
 		if (this.#additionalDirectories.length > 0) {
 			this.#header.additionalDirectories = [...this.#additionalDirectories];
 		}
