@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed ST-terminated OSC 8 hyperlinks corrupting Markdown table column widths when linked text started with inline markup.
+
 ## [17.0.6] - 2026-07-20
 
 ### Fixed
