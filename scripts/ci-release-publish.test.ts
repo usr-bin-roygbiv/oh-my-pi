@@ -35,6 +35,7 @@ describe("release publish", () => {
 		expect(isVersionAlreadyPublished("npm error code E409\nnpm error Cannot publish over existing version")).toBe(
 			true,
 		);
+		expect(isVersionAlreadyPublished("npm ERR! code E409")).toBe(true);
 		expect(isVersionAlreadyPublished("npm error code EPUBLISHCONFLICT")).toBe(true);
 		expect(isVersionAlreadyPublished("You cannot publish over the previously published versions: 1.2.3.")).toBe(true);
 		expect(isVersionAlreadyPublished("cannot publish over the previously published version")).toBe(false);

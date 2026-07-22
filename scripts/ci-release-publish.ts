@@ -263,8 +263,8 @@ async function packAndPublish(dir: string, name: string): Promise<void> {
 		const tarball = (await fs.readdir(packDir)).find(entry => entry.endsWith(".tgz"));
 		if (!tarball) throw new Error(`bun pm pack produced no tarball for ${name} (${path.relative(repoRoot, dir)})`);
 		const packedTarball = await inspectPackedTarball(path.join(packDir, tarball));
-		// Preflight the exact packed version so reruns skip deterministically;
-		// the conflict handling below remains a race fallback.
+		// Preflight the exact packed version so reruns skip deterministically.
+		// Fail open on lookup errors; only a confirmed published version may skip publishing.
 		const preflight = await $`npm view ${`${packedTarball.name}@${packedTarball.version}`} version`.quiet().nothrow();
 		if (preflight.exitCode === 0 && preflight.stdout.toString().trim()) {
 			console.log(`Skipping ${packedTarball.name} (version already published)`);
@@ -287,12 +287,12 @@ async function packAndPublish(dir: string, name: string): Promise<void> {
 }
 
 /**
- * npm's stable machine codes for an existing exact version, plus npm 11's
- * registry-precheck prose when it emits no machine code.
+ * npm's existing-version machine codes across supported CLI generations, plus
+ * npm 11's registry-precheck prose when it emits no machine code.
  */
 export function isVersionAlreadyPublished(output: string): boolean {
 	return (
-		/npm error code (E409|EPUBLISHCONFLICT)\b/i.test(output) ||
+		/npm (?:error|err!) code (E409|EPUBLISHCONFLICT)\b/i.test(output) ||
 		/you cannot publish over (?:the )?previously published versions?\b/i.test(output)
 	);
 }
