@@ -70,8 +70,10 @@ export function searchExactVectorIndex<TId>(
 	if (queryNormSq <= 0) return [];
 	// Native batch kernel: one N-API crossing scores every row and ranks the
 	// top k with the same stable ordering as the TS sort. TS guards above
-	// (finite query, positive norm, non-empty index) are preserved.
-	const topK = vectorIndexTopK(index.matrix, index.dimensions, Float64Array.from(query), k);
+	// (finite query, positive norm, non-empty index) are preserved. Clamp k to
+	// the row count before the u32 boundary: Infinity or >= 2**32 would
+	// otherwise wrap (ToUint32) and return no hits.
+	const topK = vectorIndexTopK(index.matrix, index.dimensions, Float64Array.from(query), Math.min(k, index.count));
 	const hits: ExactVectorSearchHit<TId>[] = [];
 	for (let i = 0; i < topK.indices.length; i += 1) {
 		const row = topK.indices[i] ?? 0;

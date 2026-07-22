@@ -8,7 +8,8 @@ import {
 	vectorIndexTopK,
 } from "@oh-my-pi/pi-natives";
 import { hammingDistance, hammingDistanceForDimension } from "../src/core/binary-vectors";
-import { jaccardSimilarity } from "../src/core/mmr";
+import { jaccardSimilarity, mmrRerank } from "../src/core/mmr";
+import { buildExactVectorIndex, searchExactVectorIndex } from "../src/core/vector-index";
 import { cosineSimilarity } from "../src/core/vector-math";
 
 /** Deterministic LCG so parity failures reproduce exactly. */
@@ -180,5 +181,60 @@ describe("native vector kernel parity", () => {
 				expect(Array.from(native)).toEqual(selected.slice(0, topK));
 			}
 		}
+	});
+
+	test("mmrRerank wrapper preserves the pre-native limit contract at u32 boundaries", () => {
+		const results = Array.from({ length: 8 }, (_v, i) => ({
+			content: `item ${i} alpha beta`,
+			score: (8 - i) / 10,
+		}));
+		const all = mmrRerank(results, 0.7, results.length);
+		// Infinity and >= 2**32 previously walked every candidate; ToUint32
+		// would have collapsed them to 0/1 without the TS-side clamp.
+		expect(mmrRerank(results, 0.7, Number.POSITIVE_INFINITY)).toEqual(all);
+		expect(mmrRerank(results, 0.7, 2 ** 32)).toEqual(all);
+		expect(mmrRerank(results, 0.7, 2 ** 32 + 1)).toEqual(all);
+		// NaN: loop guard is false but the first result is already selected.
+		expect(mmrRerank(results, 0.7, Number.NaN)).toEqual([results[0] as (typeof results)[number]]);
+		expect(mmrRerank(results, 0.7, 0)).toEqual([]);
+		expect(mmrRerank(results, 0.7, -3)).toEqual([]);
+	});
+
+	test("mmrRerank matches the TS path on contextual-lowercase and lone-surrogate content", () => {
+		// Force the TS selection loop by defeating the identity check.
+		const tsJaccard = (a: string, b: string): number => jaccardSimilarity(a, b);
+		// Final_Sigma: JS lowercases "ΟΣ" to "ος"; a context-insensitive
+		// lowercase would produce "οσ" and score these words as distinct.
+		const sigma = [
+			{ content: "ΟΣ", score: 0.9 },
+			{ content: "ος", score: 0.8 },
+			{ content: "other words entirely", score: 0.7 },
+		];
+		for (const lambda of [0, 0.3, 0.7]) {
+			expect(mmrRerank(sigma, lambda, 2)).toEqual(mmrRerank(sigma, lambda, 2, tsJaccard));
+		}
+		// Lone surrogates route to the TS path: N-API would convert them to
+		// U+FFFD and merge the first two tokens.
+		const surrogate = [
+			{ content: "\ud800", score: 0.9 },
+			{ content: "\ufffd", score: 0.8 },
+			{ content: "other", score: 0.7 },
+		];
+		expect(mmrRerank(surrogate, 0, 2)).toEqual(mmrRerank(surrogate, 0, 2, tsJaccard));
+	});
+
+	test("searchExactVectorIndex preserves the pre-native limit contract at u32 boundaries", () => {
+		const rows = Array.from({ length: 6 }, (_v, i) => ({
+			id: i,
+			vector: Array.from({ length: 8 }, (_x, j) => Math.sin(i * 8 + j)),
+		}));
+		const index = buildExactVectorIndex(rows);
+		const query = Array.from({ length: 8 }, (_x, j) => Math.cos(j));
+		const all = searchExactVectorIndex(index, query, index.count);
+		expect(all.length).toBe(index.count);
+		expect(searchExactVectorIndex(index, query, Number.POSITIVE_INFINITY)).toEqual(all);
+		expect(searchExactVectorIndex(index, query, 2 ** 32)).toEqual(all);
+		expect(searchExactVectorIndex(index, query, Number.NaN)).toEqual([]);
+		expect(searchExactVectorIndex(index, query, 0)).toEqual([]);
 	});
 });
