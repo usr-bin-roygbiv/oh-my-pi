@@ -16788,6 +16788,8 @@ export class AgentSession {
 					error: String(error),
 				});
 			}
+			// Refresh the workspace-roots block to match the resumed session's directory set.
+			await this.refreshBaseSystemPrompt();
 			this.#finishBashSessionTransition(bashTransition, true);
 			return true;
 		} catch (error) {
