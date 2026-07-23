@@ -10,6 +10,10 @@ import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, TailBuffer, truncateTail } from "
 import { replaceTabs, shortenPath } from "../../tools/render-utils";
 import { throwIfAborted } from "../../tools/tool-errors";
 import * as git from "../../utils/git";
+import {
+	CONTRIBUTION_HARNESS_SHA256_ASI_KEY,
+	CONTRIBUTION_WORKTREE_TREE_ASI_KEY,
+} from "../contribution";
 import { parseWorkDirDirtyPaths } from "../git";
 import {
 	EXPERIMENT_MAX_BYTES,
@@ -24,7 +28,7 @@ import {
 import { buildExperimentState } from "../state";
 import { openAutoresearchStorageIfExists } from "../storage";
 import type { AutoresearchToolFactoryOptions, RunDetails, RunExperimentProgressDetails } from "../types";
-import { DEFAULT_HARNESS_COMMAND } from "./init-experiment";
+import { DEFAULT_HARNESS_COMMAND, HARNESS_FILENAME } from "./init-experiment";
 import { beginAutoresearchMutation } from "./mutation-authorization";
 
 const runExperimentSchema = type({
@@ -77,6 +81,12 @@ export function createRunExperimentTool(
 				}
 
 				const runtime = options.getRuntime(ctx);
+				let contributionHarnessSha256: string | null = null;
+				if (runtime.contribution.status === "running") {
+					const harnessBytes = await Bun.file(path.join(ctx.cwd, HARNESS_FILENAME)).arrayBuffer();
+					contributionHarnessSha256 = new Bun.CryptoHasher("sha256").update(harnessBytes).digest("hex");
+					await mutation.authorizeMutation();
+				}
 
 				const abandonedPriorRun = (() => {
 					const pending = storage.getPendingRun(session.id);
@@ -148,6 +158,9 @@ export function createRunExperimentTool(
 					options.dashboard.requestRender();
 				}
 				await mutation.authorizeMutation();
+				const contributionWorktreeTree =
+					contributionHarnessSha256 === null ? null : await git.writeWorktreeTree(ctx.cwd, operationSignal);
+				await mutation.authorizeMutation();
 
 				const completedAt = Date.now();
 				const durationMs = completedAt - startedAt;
@@ -167,6 +180,14 @@ export function createRunExperimentTool(
 				const parsedMetrics = parsedMetricsMap.size > 0 ? Object.fromEntries(parsedMetricsMap.entries()) : null;
 				const parsedPrimary = parsedMetricsMap.get(session.primaryMetric) ?? null;
 				const parsedAsi = parseAsiLines(execution.output);
+				const storedParsedAsi =
+					contributionHarnessSha256 !== null && contributionWorktreeTree !== null
+						? {
+								...(parsedAsi ?? {}),
+								[CONTRIBUTION_HARNESS_SHA256_ASI_KEY]: contributionHarnessSha256,
+								[CONTRIBUTION_WORKTREE_TREE_ASI_KEY]: contributionWorktreeTree,
+							}
+						: parsedAsi;
 				runtime.lastRunAsi = parsedAsi;
 
 				storage.markRunCompleted({
@@ -177,7 +198,7 @@ export function createRunExperimentTool(
 					timedOut: execution.killed,
 					parsedPrimary,
 					parsedMetrics,
-					parsedAsi,
+					parsedAsi: storedParsedAsi,
 				});
 
 				const passed = execution.exitCode === 0 && !execution.killed;

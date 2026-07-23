@@ -91,6 +91,7 @@ export interface CommitOptions {
 	readonly author?: CommitAuthor;
 	readonly files?: readonly string[];
 	readonly signal?: AbortSignal;
+	readonly noVerify?: boolean;
 }
 
 export interface PushOptions {
@@ -1343,6 +1344,7 @@ export async function commit(cwd: string, message: string, options: CommitOption
 		if (options.author.date) args.push(`--date=${options.author.date}`);
 	}
 	if (options.allowEmpty) args.push("--allow-empty");
+	if (options.noVerify) args.push("--no-verify");
 	if (options.files?.length) args.push("--", ...options.files);
 	return runChecked(cwd, args, { signal: options.signal, stdin: message });
 }
@@ -1427,6 +1429,24 @@ export async function readTree(
 /** Write the current index as a tree and return its object id. */
 export async function writeTree(cwd: string, options: Pick<CommandOptions, "env" | "signal"> = {}): Promise<string> {
 	return (await runText(cwd, ["write-tree"], options)).trim();
+}
+
+/** Materialize the current tracked and untracked worktree bytes as an immutable tree without touching the real index. */
+export async function writeWorktreeTree(cwd: string, signal?: AbortSignal): Promise<string> {
+	const temporaryIndex = path.join(os.tmpdir(), `omp-worktree-tree-${crypto.randomUUID()}.index`);
+	const env = { GIT_INDEX_FILE: temporaryIndex };
+	try {
+		await runEffect(cwd, ["read-tree", "HEAD"], { env, signal });
+		await runEffect(cwd, ["add", "-A", "--"], { env, signal });
+		const tree = (await runText(cwd, ["write-tree"], { env, signal })).trim();
+		if (!/^[0-9a-f]{40}$/.test(tree)) throw new Error("Git returned an invalid worktree tree object id.");
+		return tree;
+	} finally {
+		await Promise.all([
+			fs.promises.rm(temporaryIndex, { force: true }),
+			fs.promises.rm(`${temporaryIndex}.lock`, { force: true }),
+		]);
+	}
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1731,10 +1751,19 @@ export async function isAncestor(
 	signal?: AbortSignal,
 ): Promise<boolean> {
 	ensureAvailable();
-	const result = await git(cwd, ["merge-base", "--is-ancestor", ancestor, descendant], { readOnly: true, signal });
+	const repository = await resolveRepository(cwd);
+	if (!repository) throw new Error("Not a Git repository.");
+	try {
+		const grafts = await Bun.file(path.join(repository.commonDir, "info", "grafts")).text();
+		if (grafts.trim().length > 0) return false;
+	} catch (error) {
+		if (!isEnoent(error)) throw error;
+	}
+	const args = ["--no-replace-objects", "merge-base", "--is-ancestor", ancestor, descendant];
+	const result = await git(cwd, args, { readOnly: true, signal });
 	if (result.exitCode === 0) return true;
 	if (result.exitCode === 1) return false;
-	throw new GitCommandError(["merge-base", "--is-ancestor", ancestor, descendant], result);
+	throw new GitCommandError(args, result);
 }
 
 // ════════════════════════════════════════════════════════════════════════════

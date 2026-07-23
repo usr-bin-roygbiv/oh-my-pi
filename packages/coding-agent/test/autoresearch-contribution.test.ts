@@ -1508,6 +1508,16 @@ function createIntegrationHarness(cwd: string, options: IntegrationHarnessOption
 	let forkMetadataRequestCount = 0;
 	let ancestryRequestCount = 0;
 
+	const realWriteWorktreeTree = git.writeWorktreeTree;
+	const realWriteTree = git.writeTree;
+	vi.spyOn(git, "writeWorktreeTree").mockImplementation(async (workDir, signal) =>
+		(await Bun.file(`${workDir}/.git`).exists())
+			? realWriteWorktreeTree(workDir, signal)
+			: CANDIDATE_TREE_SHA,
+	);
+	vi.spyOn(git, "writeTree").mockImplementation(async (workDir, writeOptions) =>
+		(await Bun.file(`${workDir}/.git`).exists()) ? realWriteTree(workDir, writeOptions) : CANDIDATE_TREE_SHA,
+	);
 	vi.spyOn(git.repo, "root").mockResolvedValue(cwd);
 	vi.spyOn(git.show, "prefix").mockResolvedValue("");
 	const statusMock = Object.assign(
@@ -1990,7 +2000,10 @@ async function preparePendingContribution(harness: IntegrationHarness, cwd: stri
 		timedOut: false,
 		parsedPrimary: 1,
 		parsedMetrics: { runtime_ms: 1 },
-		parsedAsi: null,
+		parsedAsi: {
+			[CONTRIBUTION_HARNESS_SHA256_ASI_KEY]: HARNESS_SHA256,
+			[CONTRIBUTION_WORKTREE_TREE_ASI_KEY]: CANDIDATE_TREE_SHA,
+		},
 	});
 	return { run, session, storage };
 }

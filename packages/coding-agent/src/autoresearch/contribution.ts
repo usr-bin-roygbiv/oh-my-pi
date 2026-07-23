@@ -14,6 +14,8 @@ export const CONTRIBUTION_SCENARIO_PLACEHOLDER =
 	"[EMPTY — required: describe the exercised scenario before opening the pull request]" as const;
 export const CONTRIBUTION_RESULT_PLACEHOLDER =
 	"[EMPTY — required: describe the observed result before opening the pull request]" as const;
+export const CONTRIBUTION_HARNESS_SHA256_ASI_KEY = "_omp_contribution_harness_sha256" as const;
+export const CONTRIBUTION_WORKTREE_TREE_ASI_KEY = "_omp_contribution_worktree_tree" as const;
 
 const CONTRIBUTION_GOAL_MAX_BASE64_LENGTH =
 	Math.ceil(CONTRIBUTION_GOAL_MAX_BYTES / 3) * 4 +
@@ -188,7 +190,7 @@ export interface PublishContributionCandidateOptions {
 	readonly candidate: ContributionCandidate;
 	readonly approvedDraft: ContributionPrDraft;
 	readonly signal?: AbortSignal;
-	readonly authorizePush?: (publication: PublishedContributionCandidate) => void;
+	readonly authorizePush?: (publication: PublishedContributionCandidate) => void | Promise<void>;
 	readonly request?: ContributionGitHubRequest;
 	readonly git?: ContributionPublicationGit;
 }
@@ -662,7 +664,7 @@ export async function publishContributionCandidate(
 		reviewUrl,
 		prDraft,
 	};
-	options.authorizePush?.(publication);
+	await options.authorizePush?.(publication);
 	try {
 		await publicationGit.push(options.cwd, {
 			remote: options.remoteName,

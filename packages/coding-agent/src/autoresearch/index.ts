@@ -4,11 +4,14 @@ import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AutocompleteItem } from "@oh-my-pi/pi-tui";
 import { logger, prompt } from "@oh-my-pi/pi-utils";
 import type { ExtensionContext, ExtensionFactory } from "../extensibility/extensions";
+import type { SessionManager } from "../session/session-manager";
 import { ToolAbortError, throwIfAborted } from "../tools/tool-errors";
 import * as git from "../utils/git";
 import commandResumeTemplate from "./command-resume.md" with { type: "text" };
 import {
 	assertContributionGoalUnchanged,
+	CONTRIBUTION_HARNESS_SHA256_ASI_KEY,
+	CONTRIBUTION_WORKTREE_TREE_ASI_KEY,
 	buildContributionCompareUrl,
 	buildContributionPrDraft,
 	buildContributionReviewUrl,
@@ -117,6 +120,10 @@ function boundedString(value: unknown, maxLength: number): value is string {
 	return typeof value === "string" && value.length > 0 && value.length <= maxLength && !value.includes("\0");
 }
 
+function boundedPossiblyEmptyString(value: unknown, maxLength: number): value is string {
+	return typeof value === "string" && value.length <= maxLength && !value.includes("\0");
+}
+
 function parsePublicationDraft(
 	value: unknown,
 	remote: GitHubRemote,
@@ -129,7 +136,7 @@ function parsePublicationDraft(
 	if (value.humanSummary !== "" || value.base !== "main" || value.head !== `${remote.owner}:${branchName}`)
 		return null;
 	if (value.baseSha !== baseSha || value.candidateHead !== candidateHead) return null;
-	if (!boundedString(value.scenario, 500) || !boundedString(value.result, 500)) return null;
+	if (!boundedPossiblyEmptyString(value.scenario, 500) || !boundedPossiblyEmptyString(value.result, 500)) return null;
 	if (
 		!boundedString(value.initialGoalCommitSha, 40) ||
 		!boundedString(value.goalCommitSha, 40) ||
@@ -233,6 +240,8 @@ function hasExecutableContributionTddProof(
 	loggedRuns: readonly RunRow[],
 ): boolean {
 	const command = session.preferredCommand?.trim() ?? "";
+	const candidateHarness = candidate?.parsedAsi?.[CONTRIBUTION_HARNESS_SHA256_ASI_KEY];
+	const candidateTree = candidate?.parsedAsi?.[CONTRIBUTION_WORKTREE_TREE_ASI_KEY];
 	if (
 		!candidate ||
 		command.length === 0 ||
@@ -243,12 +252,17 @@ function hasExecutableContributionTddProof(
 		candidate.flagged ||
 		candidate.completedAt === null ||
 		candidate.timedOut ||
-		candidate.exitCode !== 0
+		candidate.exitCode !== 0 ||
+		typeof candidateHarness !== "string" ||
+		!/^[0-9a-f]{64}$/.test(candidateHarness) ||
+		typeof candidateTree !== "string" ||
+		!/^[0-9a-f]{40}$/.test(candidateTree)
 	) {
 		return false;
 	}
-	return loggedRuns.some(
-		run =>
+	return loggedRuns.some(run => {
+		const redHarness = run.parsedAsi?.[CONTRIBUTION_HARNESS_SHA256_ASI_KEY];
+		return (
 			run.id < candidate.id &&
 			run.sessionId === session.id &&
 			run.segment === session.currentSegment &&
@@ -256,8 +270,10 @@ function hasExecutableContributionTddProof(
 			run.status === "checks_failed" &&
 			!run.flagged &&
 			run.completedAt !== null &&
-			(run.timedOut || (run.exitCode !== null && run.exitCode !== 0)),
-	);
+			(run.timedOut || (run.exitCode !== null && run.exitCode !== 0)) &&
+			redHarness === candidateHarness
+		);
+	});
 }
 
 const contributionPublicationGit: ContributionPublicationGit = {
@@ -983,7 +999,17 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 			}
 
 			if (command === "off") {
+				const sessionKey = getSessionKey(ctx);
 				const wasOff = runtime.contribution.status === "off";
+				if (
+					wasOff &&
+					!contributionStartTransactions.has(sessionKey) &&
+					!contributionPublicationOperations.has(sessionKey) &&
+					!contributionStopOperations.has(sessionKey)
+				) {
+					ctx.ui.notify("Contribution mode is already off.", "info");
+					return;
+				}
 				const warnings = await stopContributionRuntime(ctx, runtime);
 				dashboard.updateWidget(ctx, runtime);
 				if (runtime.contribution.status === "review") {
@@ -1006,6 +1032,14 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 					ctx.ui.notify("Contribution review requires a running contribution session.", "error");
 					return;
 				}
+				const reviewSessionKey = getSessionKey(ctx);
+				const releaseReviewAdmission = acquireMutationAdmissionHold(reviewSessionKey);
+				try {
+					await drainAutoresearchMutationOperations(reviewSessionKey);
+					if (runtime.contribution.status !== "running") {
+						ctx.ui.notify("Contribution review authorization changed while active mutations settled.", "error");
+						return;
+					}
 				const contribution = runtime.contribution;
 				const storage = await openAutoresearchStorageIfExists(ctx.cwd);
 				if (!storage || contribution.sessionId === null) {
@@ -1015,6 +1049,10 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 				const session = storage.getSessionById(contribution.sessionId);
 				if (!session || session.branch !== contribution.branch) {
 					ctx.ui.notify("The recorded contribution experiment no longer matches its dedicated branch.", "error");
+					return;
+				}
+				if (storage.getPendingRun(session.id)) {
+					ctx.ui.notify("Contribution review requires every pending experiment to be logged first.", "error");
 					return;
 				}
 				runtime.state = buildExperimentState(session, storage.listLoggedRuns(session.id));
@@ -1122,7 +1160,6 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 					contribution.branch,
 					contribution.baseProof,
 				);
-				const reviewSessionKey = getSessionKey(ctx);
 				const reviewAuthorization = contribution.authorization;
 				const reviewBranch = contribution.branch;
 				const reviewSessionId = contribution.sessionId;
@@ -1151,6 +1188,22 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 					ctx.ui.notify(`Contribution review failed: ${describeContributionError(error)}`, "error");
 					return;
 				}
+				const confirmedSession = storage.getSessionById(session.id);
+				const confirmedCandidateRun = candidateRun === null ? null : storage.getRunById(candidateRun.id);
+				if (
+					!confirmedSession ||
+					confirmedSession.branch !== contribution.branch ||
+					confirmedSession.currentSegment !== session.currentSegment ||
+					confirmedCandidateRun?.commitHash !== currentHead ||
+					!hasExecutableContributionTddProof(
+						confirmedSession,
+						confirmedCandidateRun,
+						storage.listLoggedRuns(confirmedSession.id),
+					)
+				) {
+					ctx.ui.notify("Contribution review proof changed after approval; publication cancelled.", "error");
+					return;
+				}
 				if (contributionPublicationOperations.has(reviewSessionKey)) {
 					ctx.ui.notify("A contribution publication is already active for this session.", "error");
 					return;
@@ -1168,7 +1221,7 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 					}
 					assertContributionIdentity();
 				};
-				const authorizePush = (publication: PublishedContributionCandidate): void => {
+				const authorizePush = async (publication: PublishedContributionCandidate): Promise<void> => {
 					authorizePublication();
 					const intent = createPublicationEntryData(
 						"intent",
@@ -1178,6 +1231,8 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 						publication,
 					);
 					api.appendEntry(CONTRIBUTION_PUBLICATION_ENTRY, intent);
+					await (ctx.sessionManager as SessionManager).flush();
+					authorizePublication();
 					ctx.ui.notify(
 						renderPublicationHandoff("Contribution publication plan (push outcome pending):", intent),
 						"info",
@@ -1258,6 +1313,9 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 					publicationOperation.settlement.resolve();
 				}
 				return;
+				} finally {
+					releaseReviewAdmission();
+				}
 			}
 
 			if (command !== "") {
@@ -1266,6 +1324,17 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 			}
 			if (!ctx.hasUI) {
 				ctx.ui.notify("Contribution mode requires an interactive UI for explicit confirmations.", "error");
+				return;
+			}
+			if (!ctx.sessionManager.getSessionFile()) {
+				ctx.ui.notify("Contribution mode requires a persistent session transcript for publication recovery.", "error");
+				return;
+			}
+			const initialStartSessionKey = getSessionKey(ctx);
+			const initialRehydrate = rehydrateOperations.get(initialStartSessionKey);
+			if (initialRehydrate) await initialRehydrate;
+			if (getSessionKey(ctx) !== initialStartSessionKey) {
+				ctx.ui.notify("Contribution mode session changed while startup state was loading.", "error");
 				return;
 			}
 			if (runtime.contribution.status === "running") {
@@ -1277,11 +1346,27 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 				"Run bounded read-only discovery of official goal provenance, authenticated models, the clean base, active autoresearch state, and GitHub fork remotes? No model, branch, tools, or durable contribution state will change.",
 			);
 			if (!preflightConfirmed) return;
-			await drainAutoresearchMutationOperations(getSessionKey(ctx));
-
 			let contributionStartSessionKey: string | null = null;
 			let contributionStartTransaction: ContributionStartTransaction | null = null;
+			let releaseStartAdmission: (() => void) | null = null;
+			const startSessionKey = getSessionKey(ctx);
+			const startTransaction: ContributionStartTransaction = {
+				token: Symbol("contribution-start-authorization"),
+				phase: "confirming",
+				settlement: Promise.withResolvers<void>(),
+			};
+			contributionStartSessionKey = startSessionKey;
+			contributionStartTransaction = startTransaction;
+			releaseStartAdmission = acquireMutationAdmissionHold(startSessionKey);
+			contributionStartTransactions.set(startSessionKey, startTransaction);
 			try {
+				const currentRehydrate = rehydrateOperations.get(startSessionKey);
+				if (currentRehydrate) await currentRehydrate;
+				assertContributionStartIdentity(ctx, runtime, startSessionKey, startTransaction);
+				const startContribution = runtime.contribution;
+				const startState = runtime.state;
+				let ownedContribution: AutoresearchRuntime["contribution"] = startContribution;
+				let ownedState = startState;
 				const control = reconstructControlState(ctx.sessionManager.getBranch());
 				const resumingAfterReview = runtime.contribution.status === "review";
 				if (
@@ -1354,19 +1439,6 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 				if (!selectedRemote) return;
 				await verifyContributionFork(ctx.cwd, selectedRemote.pushRemote);
 				const branchName = await allocateAutoresearchBranchName(api, ctx.cwd, `contribute-${goal.title}`);
-				const startSessionKey = getSessionKey(ctx);
-				const startTransaction: ContributionStartTransaction = {
-					token: Symbol("contribution-start-authorization"),
-					phase: "confirming",
-					settlement: Promise.withResolvers<void>(),
-				};
-				const startContribution = runtime.contribution;
-				const startState = runtime.state;
-				let ownedContribution: AutoresearchRuntime["contribution"] = startContribution;
-				let ownedState = startState;
-				contributionStartSessionKey = startSessionKey;
-				contributionStartTransaction = startTransaction;
-				contributionStartTransactions.set(startSessionKey, startTransaction);
 				assertContributionStartFresh(
 					ctx,
 					runtime,
@@ -1587,6 +1659,7 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 					}
 					contributionStartTransaction.settlement.resolve();
 				}
+				releaseStartAdmission?.();
 			}
 		},
 	});
