@@ -4,7 +4,7 @@ import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AutocompleteItem } from "@oh-my-pi/pi-tui";
 import { logger, prompt } from "@oh-my-pi/pi-utils";
 import type { ExtensionContext, ExtensionFactory } from "../extensibility/extensions";
-import { throwIfAborted } from "../tools/tool-errors";
+import { ToolAbortError, throwIfAborted } from "../tools/tool-errors";
 import * as git from "../utils/git";
 import commandResumeTemplate from "./command-resume.md" with { type: "text" };
 import {
@@ -179,7 +179,7 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 	const invalidateInitExperimentOperation = (sessionKey: string): Promise<void> | undefined => {
 		const operation = initExperimentOperations.get(sessionKey);
 		if (!operation) return undefined;
-		operation.controller.abort(new DOMException("Autoresearch init authorization changed before mutation.", "AbortError"));
+		operation.controller.abort(new ToolAbortError("Autoresearch init authorization changed before mutation."));
 		return operation.settlement.promise;
 	};
 

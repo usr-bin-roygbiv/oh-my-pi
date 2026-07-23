@@ -87,7 +87,7 @@ export function createInitExperimentTool(
 				const prepareNewSegment = options.prepareNewSegment;
 				const preparedNewSegment =
 					params.new_segment === true && prepareNewSegment
-						? ((await untilAborted(operationSignal, () => prepareNewSegment(ctx, operationSignal))) ?? null)
+						? ((await awaitAbortable(operationSignal, () => prepareNewSegment(ctx, operationSignal))) ?? null)
 						: null;
 				if (preparedNewSegment) throwIfAborted(operationSignal);
 				await authorizeMutation();
@@ -110,7 +110,7 @@ export function createInitExperimentTool(
 					? Math.floor(params.max_iterations)
 					: null;
 			const branch =
-				(await untilAborted(operationSignal, () => git.branch.current(ctx.cwd, operationSignal))) ?? null;
+				(await awaitAbortable(operationSignal, () => git.branch.current(ctx.cwd, operationSignal))) ?? null;
 			const onAutoresearchBranch = branch?.startsWith("autoresearch/") ?? false;
 
 			const existing = storage?.getActiveSessionForBranch(branch) ?? null;
@@ -305,7 +305,7 @@ function renderInitCall(name: string, theme: Theme): string {
 
 async function tryReadHeadSha(cwd: string, signal?: AbortSignal): Promise<string | null> {
 	try {
-		return (await untilAborted(signal, () => git.head.sha(cwd, signal))) ?? null;
+		return (await awaitAbortable(signal, () => git.head.sha(cwd, signal))) ?? null;
 	} catch {
 		throwIfAborted(signal);
 		return null;
@@ -314,10 +314,10 @@ async function tryReadHeadSha(cwd: string, signal?: AbortSignal): Promise<string
 
 async function detectPendingChanges(cwd: string, signal?: AbortSignal): Promise<boolean> {
 	try {
-		const statusText = await untilAborted(signal, () =>
+		const statusText = await awaitAbortable(signal, () =>
 			git.status(cwd, { porcelainV1: true, untrackedFiles: "all", z: true, signal }),
 		);
-		const workDirPrefix = await untilAborted(signal, () => git.show.prefix(cwd, signal)).catch(() => {
+		const workDirPrefix = await awaitAbortable(signal, () => git.show.prefix(cwd, signal)).catch(() => {
 			throwIfAborted(signal);
 			return "";
 		});
@@ -325,6 +325,15 @@ async function detectPendingChanges(cwd: string, signal?: AbortSignal): Promise<
 	} catch {
 		throwIfAborted(signal);
 		return false;
+	}
+}
+
+async function awaitAbortable<T>(signal: AbortSignal | undefined, operation: () => Promise<T>): Promise<T> {
+	try {
+		return await untilAborted(signal, operation);
+	} catch (error) {
+		throwIfAborted(signal);
+		throw error;
 	}
 }
 
