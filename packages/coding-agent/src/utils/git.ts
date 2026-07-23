@@ -97,6 +97,7 @@ export interface PushOptions {
 	readonly forceWithLease?: boolean | string;
 	readonly refspec?: string;
 	readonly remote?: string;
+	readonly verifiedRemoteUrl?: string;
 	readonly signal?: AbortSignal;
 }
 
@@ -1351,13 +1352,28 @@ export async function push(cwd: string, options: PushOptions = {}): Promise<void
 	// branch — rejected refs ("permission denied") on remotes the user
 	// cannot tag (e.g. PR-head forks), failing the call after the branch
 	// itself already updated. Tool pushes push exactly the named refspec.
-	const args = ["push", "--no-follow-tags"];
+	const args: string[] = [];
+	let remote = options.remote;
+	if (options.verifiedRemoteUrl !== undefined) {
+		// An explicit pushurl disables url.*.pushInsteadOf for this command.
+		// A unique command-scoped remote also prevents repository config from
+		// supplying an additional destination under the same remote name.
+		const verifiedRemote = `omp-verified-push-${crypto.randomUUID()}`;
+		args.push(
+			"-c",
+			`remote.${verifiedRemote}.url=${options.verifiedRemoteUrl}`,
+			"-c",
+			`remote.${verifiedRemote}.pushurl=${options.verifiedRemoteUrl}`,
+		);
+		remote = verifiedRemote;
+	}
+	args.push("push", "--no-follow-tags");
 	if (typeof options.forceWithLease === "string") {
 		args.push(`--force-with-lease=${options.forceWithLease}`);
 	} else if (options.forceWithLease) {
 		args.push("--force-with-lease");
 	}
-	if (options.remote) args.push(options.remote);
+	if (remote) args.push(remote);
 	if (options.refspec) args.push(options.refspec);
 	await runEffect(cwd, args, { signal: options.signal });
 }
@@ -1795,6 +1811,11 @@ export const remote = {
 	/** Get the URL for a remote. */
 	async url(cwd: string, name: string, signal?: AbortSignal): Promise<string | undefined> {
 		return trimScalar(await tryText(cwd, ["remote", "get-url", name], { readOnly: true, signal }));
+	},
+
+	/** Get the push-effective URL for a remote, including pushurl and pushInsteadOf. */
+	async pushUrl(cwd: string, name: string, signal?: AbortSignal): Promise<string | undefined> {
+		return trimScalar(await tryText(cwd, ["remote", "get-url", "--push", name], { readOnly: true, signal }));
 	},
 
 	/**

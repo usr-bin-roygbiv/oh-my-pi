@@ -154,6 +154,7 @@ export interface ContributionPrDraft {
 
 export interface ContributionPublicationGit {
 	readRemoteUrl(cwd: string, remoteName: string, signal?: AbortSignal): Promise<string | undefined>;
+	readPushRemoteUrl(cwd: string, remoteName: string, signal?: AbortSignal): Promise<string | undefined>;
 	readBranch(cwd: string, signal?: AbortSignal): Promise<string | null>;
 	readHead(cwd: string, signal?: AbortSignal): Promise<string | null>;
 	readStatus(cwd: string, signal?: AbortSignal): Promise<string>;
@@ -162,6 +163,7 @@ export interface ContributionPublicationGit {
 		cwd: string,
 		options: {
 			readonly remote: string;
+			readonly verifiedRemoteUrl: string;
 			readonly refspec: string;
 			readonly forceWithLease: string;
 			readonly signal?: AbortSignal;
@@ -173,6 +175,7 @@ export interface PublishContributionCandidateOptions {
 	readonly cwd: string;
 	readonly remoteName: string;
 	readonly confirmedRemoteUrl: string;
+	readonly confirmedPushRemoteUrl: string;
 	readonly branchName: string;
 	readonly currentBranch: string | null;
 	readonly currentHead: string;
@@ -234,6 +237,7 @@ export interface VerifyContributionForkOptions {
 
 const DEFAULT_PUBLICATION_GIT: ContributionPublicationGit = {
 	readRemoteUrl: (cwd, remoteName, signal) => git.remote.url(cwd, remoteName, signal),
+	readPushRemoteUrl: (cwd, remoteName, signal) => git.remote.pushUrl(cwd, remoteName, signal),
 	readBranch: (cwd, signal) => git.branch.current(cwd, signal),
 	readHead: (cwd, signal) => git.head.sha(cwd, signal),
 	readStatus: (cwd, signal) => git.status(cwd, { porcelainV1: true, untrackedFiles: "all", z: true, signal }),
@@ -539,6 +543,10 @@ export async function publishContributionCandidate(
 	}
 	validateRemoteName(options.remoteName);
 	const approvedRemote = validateContributionForkRemote(options.confirmedRemoteUrl);
+	const approvedPushRemote = validateContributionForkRemote(options.confirmedPushRemoteUrl);
+	if (approvedPushRemote.slug !== approvedRemote.slug) {
+		throw new ContributionError("remote_changed", "The approved push destination differs from the confirmed fork.");
+	}
 	const approvedDraft = buildContributionPrDraft(
 		options.goal,
 		options.candidate,
@@ -563,6 +571,12 @@ export async function publishContributionCandidate(
 	if (currentRemote.slug !== approvedRemote.slug) {
 		throw new ContributionError("remote_changed", `The confirmed remote ${options.remoteName} changed destination.`);
 	}
+	validateContributionPushRemoteUrl(
+		await publicationGit.readPushRemoteUrl(options.cwd, options.remoteName, options.signal),
+		options.confirmedPushRemoteUrl,
+		approvedRemote,
+		options.remoteName,
+	);
 	await verifyContributionFork(options.cwd, currentRemote, {
 		request: options.request,
 		signal: options.signal,
@@ -614,10 +628,11 @@ export async function publishContributionCandidate(
 			"The contribution candidate does not descend from the frozen official base.",
 		);
 	}
-	const [finalBranch, finalHead, finalStatusOutput] = await Promise.all([
+	const [finalBranch, finalHead, finalStatusOutput, finalPushRemoteUrl] = await Promise.all([
 		publicationGit.readBranch(options.cwd, options.signal),
 		publicationGit.readHead(options.cwd, options.signal),
 		publicationGit.readStatus(options.cwd, options.signal),
+		publicationGit.readPushRemoteUrl(options.cwd, options.remoteName, options.signal),
 	]);
 	if (finalBranch !== options.branchName) {
 		throw new ContributionError(
@@ -631,10 +646,17 @@ export async function publishContributionCandidate(
 	if (finalStatusOutput.length > 0) {
 		throw new ContributionError("worktree_dirty", "The contribution worktree changed after approval.");
 	}
+	validateContributionPushRemoteUrl(
+		finalPushRemoteUrl,
+		options.confirmedPushRemoteUrl,
+		approvedRemote,
+		options.remoteName,
+	);
 	options.authorizePush?.();
 	try {
 		await publicationGit.push(options.cwd, {
-			remote: options.confirmedRemoteUrl,
+			remote: options.remoteName,
+			verifiedRemoteUrl: options.confirmedPushRemoteUrl,
 			refspec,
 			forceWithLease: `${targetRef}:`,
 			signal: options.signal,
@@ -1021,6 +1043,25 @@ function validateRemoteName(remoteName: string): void {
 	if (remoteName.length === 0 || /[\x00-\x20\x7f]/.test(remoteName) || remoteName.startsWith("-")) {
 		throw new ContributionError("remote_invalid", "The contribution remote name is invalid.");
 	}
+}
+
+function validateContributionPushRemoteUrl(
+	remoteUrl: string | undefined,
+	confirmedRemoteUrl: string,
+	approvedRemote: GitHubRemote,
+	remoteName: string,
+): GitHubRemote {
+	if (remoteUrl === undefined) {
+		throw new ContributionError("remote_missing", `The confirmed push remote ${remoteName} no longer exists.`);
+	}
+	const remote = validateContributionForkRemote(remoteUrl);
+	if (remoteUrl !== confirmedRemoteUrl) {
+		throw new ContributionError("remote_changed", `The confirmed push destination for ${remoteName} changed.`);
+	}
+	if (remote.slug !== approvedRemote.slug) {
+		throw new ContributionError("remote_changed", `The push destination for ${remoteName} changed repository.`);
+	}
+	return remote;
 }
 
 function collapseInlineText(value: string): string {

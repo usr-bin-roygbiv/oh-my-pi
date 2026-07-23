@@ -646,6 +646,7 @@ describe("contribution fork validation and publication", () => {
 			cwd: "/work/repo",
 			remoteName: "origin",
 			confirmedRemoteUrl: FORK_URL,
+			confirmedPushRemoteUrl: FORK_URL,
 			branchName: CONTRIBUTION_BRANCH,
 			currentBranch: CONTRIBUTION_BRANCH,
 			worktreeClean: true,
@@ -668,6 +669,7 @@ describe("contribution fork validation and publication", () => {
 			{
 				cwd: "/work/repo",
 				remote: "origin",
+				verifiedRemoteUrl: FORK_URL,
 				refspec: `HEAD:refs/heads/${CONTRIBUTION_BRANCH}`,
 				forceWithLease: `refs/heads/${CONTRIBUTION_BRANCH}:`,
 			},
@@ -697,6 +699,7 @@ describe("contribution fork validation and publication", () => {
 				cwd: "/work/repo",
 				remoteName: "origin",
 				confirmedRemoteUrl: FORK_URL,
+				confirmedPushRemoteUrl: FORK_URL,
 				branchName: CONTRIBUTION_BRANCH,
 				currentBranch: CONTRIBUTION_BRANCH,
 				worktreeClean: true,
@@ -758,6 +761,7 @@ describe("contribution fork validation and publication", () => {
 				cwd: "/work/repo",
 				remoteName: "origin",
 				confirmedRemoteUrl: FORK_URL,
+				confirmedPushRemoteUrl: FORK_URL,
 				branchName: CONTRIBUTION_BRANCH,
 				currentBranch: CONTRIBUTION_BRANCH,
 				worktreeClean: true,
@@ -810,6 +814,7 @@ describe("contribution fork validation and publication", () => {
 				cwd: "/work/repo",
 				remoteName: "origin",
 				confirmedRemoteUrl: FORK_URL,
+				confirmedPushRemoteUrl: FORK_URL,
 				branchName: CONTRIBUTION_BRANCH,
 				currentBranch: CONTRIBUTION_BRANCH,
 				worktreeClean: true,
@@ -850,6 +855,7 @@ describe("contribution fork validation and publication", () => {
 					cwd: "/work/repo",
 					remoteName: "origin",
 					confirmedRemoteUrl: FORK_URL,
+					confirmedPushRemoteUrl: FORK_URL,
 					branchName: CONTRIBUTION_BRANCH,
 					currentBranch: CONTRIBUTION_BRANCH,
 					worktreeClean: true,
@@ -889,6 +895,7 @@ describe("contribution fork validation and publication", () => {
 			cwd: "/work/repo",
 			remoteName: "origin",
 			confirmedRemoteUrl: FORK_URL,
+			confirmedPushRemoteUrl: FORK_URL,
 			branchName: CONTRIBUTION_BRANCH,
 			currentBranch: CONTRIBUTION_BRANCH,
 			worktreeClean: true,
@@ -930,6 +937,7 @@ describe("contribution fork validation and publication", () => {
 				cwd: "/work/repo",
 				remoteName: "origin",
 				confirmedRemoteUrl: FORK_URL,
+				confirmedPushRemoteUrl: FORK_URL,
 				branchName: CONTRIBUTION_BRANCH,
 				currentBranch: CONTRIBUTION_BRANCH,
 				worktreeClean: true,
@@ -959,6 +967,7 @@ describe("contribution fork validation and publication", () => {
 				cwd: "/work/repo",
 				remoteName: "upstream",
 				confirmedRemoteUrl: upstreamUrl,
+				confirmedPushRemoteUrl: upstreamUrl,
 				branchName: CONTRIBUTION_BRANCH,
 				currentBranch: CONTRIBUTION_BRANCH,
 				worktreeClean: true,
@@ -1002,6 +1011,7 @@ describe("contribution fork validation and publication", () => {
 				cwd: "/work/repo",
 				remoteName: "origin",
 				confirmedRemoteUrl: FORK_URL,
+				confirmedPushRemoteUrl: FORK_URL,
 				branchName: CONTRIBUTION_BRANCH,
 				currentBranch: CONTRIBUTION_BRANCH,
 				worktreeClean: true,
@@ -1037,6 +1047,7 @@ describe("contribution fork validation and publication", () => {
 				cwd: "/work/repo",
 				remoteName: "origin",
 				confirmedRemoteUrl: FORK_URL,
+				confirmedPushRemoteUrl: FORK_URL,
 				branchName: CONTRIBUTION_BRANCH,
 				currentBranch: CONTRIBUTION_BRANCH,
 				worktreeClean: true,
@@ -1073,6 +1084,7 @@ describe("contribution fork validation and publication", () => {
 					cwd: "/work/repo",
 					remoteName: "origin",
 					confirmedRemoteUrl: FORK_URL,
+					confirmedPushRemoteUrl: FORK_URL,
 					branchName: CONTRIBUTION_BRANCH,
 					currentBranch: CONTRIBUTION_BRANCH,
 					worktreeClean: true,
@@ -1237,7 +1249,12 @@ function createIntegrationHarness(cwd: string, options: IntegrationHarnessOption
 	const githubEndpoints: string[] = [];
 	const githubArgumentVectors: string[][] = [];
 	const gitEvents: string[] = [];
-	const pushes: Array<{ remote?: string; refspec?: string; forceWithLease?: boolean | string }> = [];
+	const pushes: Array<{
+		remote?: string;
+		verifiedRemoteUrl?: string;
+		refspec?: string;
+		forceWithLease?: boolean | string;
+	}> = [];
 	const approvalModeMutations: string[] = [];
 	const confirmAnswers = [...(options.confirmAnswers ?? [true, true])];
 	const setModelResults = [...(options.setModelResults ?? [])];
@@ -1319,9 +1336,13 @@ function createIntegrationHarness(cwd: string, options: IntegrationHarnessOption
 	vi.spyOn(git.remote, "url").mockImplementation(async (_workDir, remote) =>
 		remote === "origin" ? FORK_URL : "https://github.com/can1357/oh-my-pi.git",
 	);
+	vi.spyOn(git.remote, "pushUrl").mockImplementation(async (_workDir, remote) =>
+		remote === "origin" ? FORK_URL : "https://github.com/can1357/oh-my-pi.git",
+	);
 	vi.spyOn(git, "push").mockImplementation(async (_workDir, pushOptions) => {
 		pushes.push({
 			remote: pushOptions?.remote,
+			verifiedRemoteUrl: pushOptions?.verifiedRemoteUrl,
 			refspec: pushOptions?.refspec,
 			forceWithLease: pushOptions?.forceWithLease,
 		});
@@ -2289,7 +2310,8 @@ describe("process-local contribution lifecycle", () => {
 		const branch = harness.currentBranch();
 		expect(harness.pushes).toEqual([
 			{
-				remote: FORK_URL,
+				remote: "origin",
+				verifiedRemoteUrl: FORK_URL,
 				refspec: `HEAD:refs/heads/${branch}`,
 				forceWithLease: `refs/heads/${branch}:`,
 			},

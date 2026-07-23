@@ -60,7 +60,9 @@ const CONTRIBUTION_PAUSE_MARKER = "[CONTRIBUTE_PAUSE]";
 interface ContributionRemoteChoice {
 	name: string;
 	url: string;
+	pushUrl: string;
 	remote: GitHubRemote;
+	pushRemote: GitHubRemote;
 }
 
 interface ContributionStartTransaction {
@@ -71,6 +73,7 @@ interface ContributionStartTransaction {
 
 const contributionPublicationGit: ContributionPublicationGit = {
 	readRemoteUrl: (cwd, remote, signal) => git.remote.url(cwd, remote, signal),
+	readPushRemoteUrl: (cwd, remote, signal) => git.remote.pushUrl(cwd, remote, signal),
 	readBranch: (cwd, signal) => git.branch.current(cwd, signal),
 	readHead: (cwd, signal) => git.head.sha(cwd, signal),
 	readStatus: (cwd, signal) => git.status(cwd, { porcelainV1: true, untrackedFiles: "all", z: true, signal }),
@@ -78,6 +81,7 @@ const contributionPublicationGit: ContributionPublicationGit = {
 	push: (cwd, options) =>
 		git.push(cwd, {
 			remote: options.remote,
+			verifiedRemoteUrl: options.verifiedRemoteUrl,
 			refspec: options.refspec,
 			forceWithLease: options.forceWithLease,
 			signal: options.signal,
@@ -87,10 +91,13 @@ const contributionPublicationGit: ContributionPublicationGit = {
 async function discoverContributionRemotes(cwd: string): Promise<ContributionRemoteChoice[]> {
 	const choices: ContributionRemoteChoice[] = [];
 	for (const name of await git.remote.list(cwd)) {
-		const url = await git.remote.url(cwd, name);
-		if (!url) continue;
+		const [url, pushUrl] = await Promise.all([git.remote.url(cwd, name), git.remote.pushUrl(cwd, name)]);
+		if (!url || !pushUrl) continue;
 		try {
-			choices.push({ name, url, remote: validateContributionForkRemote(url) });
+			const remote = validateContributionForkRemote(url);
+			const pushRemote = validateContributionForkRemote(pushUrl);
+			if (pushRemote.slug !== remote.slug) continue;
+			choices.push({ name, url, pushUrl, remote, pushRemote });
 		} catch (error) {
 			if (!(error instanceof ContributionError)) throw error;
 		}
@@ -675,6 +682,26 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 					metricName: runtime.state.metricName.trim().replace(/\s+/g, " ").slice(0, 80) || "metric",
 					metricUnit: runtime.state.metricUnit.trim().replace(/\s+/g, " ").slice(0, 20),
 				};
+				let reviewPushRemoteUrl: string;
+				try {
+					const [reviewRemoteUrl, pushRemoteUrl] = await Promise.all([
+						git.remote.url(ctx.cwd, contribution.remoteName),
+						git.remote.pushUrl(ctx.cwd, contribution.remoteName),
+					]);
+					if (reviewRemoteUrl !== contribution.remoteUrl || pushRemoteUrl === undefined) {
+						throw new ContributionError("remote_changed", "The confirmed fork destination changed before review.");
+					}
+					const reviewRemote = validateContributionForkRemote(reviewRemoteUrl);
+					const pushRemote = validateContributionForkRemote(pushRemoteUrl);
+					if (pushRemote.slug !== reviewRemote.slug) {
+						throw new ContributionError("remote_changed", "The push-effective destination differs from the confirmed fork.");
+					}
+					await verifyContributionFork(ctx.cwd, pushRemote);
+					reviewPushRemoteUrl = pushRemoteUrl;
+				} catch (error) {
+					ctx.ui.notify(`Contribution review failed: ${describeContributionError(error)}`, "error");
+					return;
+				}
 				const remote = validateContributionForkRemote(contribution.remoteUrl);
 				const approvedDraft = buildContributionPrDraft(
 					contribution.goal,
@@ -703,7 +730,7 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 				};
 				const approved = await ctx.ui.confirm(
 					"Push exact contribution candidate for review?",
-					`${approvedDraft.body}\n\nThis approval pushes only the verified current HEAD candidate ${currentHead} with \`HEAD:refs/heads/${contribution.branch}\` to the confirmed fork URL ${contribution.remoteUrl} (${contribution.remoteName}), and requires that remote branch to be absent. It does not create or approve a pull request. The SHA-bound human sentence remains empty and must be written by the human reviewer.`,
+					`${approvedDraft.body}\n\nThis approval pushes only the verified current HEAD candidate ${currentHead} with \`HEAD:refs/heads/${contribution.branch}\` through the confirmed fork remote ${contribution.remoteName}. Its verified push-effective destination is ${reviewPushRemoteUrl}, and the candidate branch must be absent. A command-scoped explicit pushurl prevents Git URL rewrite rules from changing that destination. This does not create or approve a pull request. The SHA-bound human sentence remains empty and must be written by the human reviewer.`,
 				);
 				if (!approved) return;
 				try {
@@ -730,6 +757,7 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 						cwd: ctx.cwd,
 						remoteName: contribution.remoteName,
 						confirmedRemoteUrl: contribution.remoteUrl,
+						confirmedPushRemoteUrl: reviewPushRemoteUrl,
 						branchName: contribution.branch,
 						currentBranch,
 						currentHead,
@@ -883,7 +911,7 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 				if (!remoteSelection) return;
 				const selectedRemote = remotes[remoteLabels.indexOf(remoteSelection)];
 				if (!selectedRemote) return;
-				await verifyContributionFork(ctx.cwd, selectedRemote.remote);
+				await verifyContributionFork(ctx.cwd, selectedRemote.pushRemote);
 				const branchName = await allocateAutoresearchBranchName(api, ctx.cwd, `contribute-${goal.title}`);
 				const startSessionKey = getSessionKey(ctx);
 				const startTransaction: ContributionStartTransaction = {
@@ -908,7 +936,7 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 				);
 				const finalConfirmed = await ctx.ui.confirm(
 					"Start exact upstream contribution session?",
-					`Goal: ${goal.title}\nOfficial main commit/base: ${goal.commitSha}\nGoal blob: ${goal.blobSha}\nGoal SHA-256: ${goal.sha256}\nModel: ${selectedModel.provider}/${selectedModel.id}\nConfirmed fork: ${selectedRemote.name} (${selectedRemote.url})\nFresh local candidate branch: ${branchName}\n\nThis native OMP session continues indefinitely until /contribute off, an input/review gate, interruption, or session exit. It consumes model tokens, runs tests/commands under normal approval policy, and may create commits on the candidate branch. /contribute review requires another exact approval before an absent candidate branch is pushed to this fork; it never opens a pull request.\n\nOn confirmation only: recheck the official base and fork, switch model, create this exact branch from the frozen base commit, activate the existing autoresearch tools, then start the turn. Global approval policy is unchanged.`,
+					`Goal: ${goal.title}\nOfficial main commit/base: ${goal.commitSha}\nGoal blob: ${goal.blobSha}\nGoal SHA-256: ${goal.sha256}\nModel: ${selectedModel.provider}/${selectedModel.id}\nConfirmed fork: ${selectedRemote.name} (${selectedRemote.url})\nVerified push-effective destination: ${selectedRemote.pushUrl}\nFresh local candidate branch: ${branchName}\n\nThis native OMP session continues indefinitely until /contribute off, an input/review gate, interruption, or session exit. It consumes model tokens, runs tests/commands under normal approval policy, and may create commits on the candidate branch. /contribute review requires another exact approval before an absent candidate branch is pushed to this fork; it never opens a pull request.\n\nOn confirmation only: recheck the official base and fork, switch model, create this exact branch from the frozen base commit, activate the existing autoresearch tools, then start the turn. Global approval policy is unchanged.`,
 				);
 				if (!finalConfirmed) return;
 				assertContributionStartFresh(
@@ -923,17 +951,25 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 				const recheckedGoal = await fetchOfficialContributionGoal(ctx.cwd);
 				assertContributionGoalUnchanged(goal, recheckedGoal);
 
-				const recheckedRemoteUrl = await git.remote.url(ctx.cwd, selectedRemote.name);
-				if (recheckedRemoteUrl !== selectedRemote.url) {
-					ctx.ui.notify("The selected fork remote changed after confirmation; start cancelled.", "error");
+				const [recheckedRemoteUrl, recheckedPushRemoteUrl] = await Promise.all([
+					git.remote.url(ctx.cwd, selectedRemote.name),
+					git.remote.pushUrl(ctx.cwd, selectedRemote.name),
+				]);
+				if (recheckedRemoteUrl !== selectedRemote.url || recheckedPushRemoteUrl !== selectedRemote.pushUrl) {
+					ctx.ui.notify("The selected fork or its push-effective destination changed after confirmation; start cancelled.", "error");
 					return;
 				}
 				const recheckedRemote = validateContributionForkRemote(recheckedRemoteUrl);
-				if (recheckedRemote.slug !== selectedRemote.remote.slug) {
+				const recheckedPushRemote = validateContributionForkRemote(recheckedPushRemoteUrl);
+				if (
+					recheckedRemote.slug !== selectedRemote.remote.slug ||
+					recheckedPushRemote.slug !== selectedRemote.pushRemote.slug ||
+					recheckedPushRemote.slug !== recheckedRemote.slug
+				) {
 					ctx.ui.notify("The selected fork destination changed after confirmation; start cancelled.", "error");
 					return;
 				}
-				await verifyContributionFork(ctx.cwd, recheckedRemote);
+				await verifyContributionFork(ctx.cwd, recheckedPushRemote);
 
 				const frozenBaseProof = await verifyContributionBase(ctx.cwd, goal);
 				if (await hasActiveAutoresearchSession(ctx.cwd)) {
