@@ -64,7 +64,7 @@ import { xiaomiProvider } from "./xiaomi";
 import { xiaomiTokenPlanAmsProvider } from "./xiaomi-token-plan-ams";
 import { xiaomiTokenPlanCnProvider } from "./xiaomi-token-plan-cn";
 import { xiaomiTokenPlanSgpProvider } from "./xiaomi-token-plan-sgp";
-import { zaiProvider } from "./zai";
+import { zaiCodingPlanProvider, zaiProvider } from "./zai";
 import { zenmuxProvider } from "./zenmux";
 import { zhipuCodingPlanProvider } from "./zhipu-coding-plan";
 
@@ -80,6 +80,7 @@ const ALL = [
 	openaiCodexProvider,
 	anthropicProvider,
 	zaiProvider,
+	zaiCodingPlanProvider,
 	kimiCodeProvider,
 	openrouterProvider,
 	githubCopilotProvider,
