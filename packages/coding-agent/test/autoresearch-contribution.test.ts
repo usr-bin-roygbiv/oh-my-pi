@@ -40,6 +40,7 @@ import {
 	openAutoresearchStorage,
 	type SessionRow,
 } from "@oh-my-pi/pi-coding-agent/autoresearch/storage";
+import * as bashExecutor from "@oh-my-pi/pi-coding-agent/exec/bash-executor";
 import type {
 	AgentEndEvent,
 	ExtensionAPI,
@@ -1289,6 +1290,7 @@ interface IntegrationHarness {
 		forceWithLease?: boolean | string;
 	}>;
 	approvalModeMutations: string[];
+	readonly widgetUpdates: number;
 	setPendingMessages(value: boolean): void;
 	setStatusText(value: string): void;
 	setHeadSha(value: string): void;
@@ -1353,6 +1355,7 @@ function createIntegrationHarness(cwd: string, options: IntegrationHarnessOption
 		forceWithLease?: boolean | string;
 	}> = [];
 	const approvalModeMutations: string[] = [];
+	let widgetUpdates = 0;
 	const confirmAnswers = [...(options.confirmAnswers ?? [true, true])];
 	const setModelResults = [...(options.setModelResults ?? [])];
 	const models = options.models ?? [
@@ -1598,7 +1601,9 @@ function createIntegrationHarness(cwd: string, options: IntegrationHarnessOption
 			setHeader(): void {},
 			setStatus(): void {},
 			setTitle(): void {},
-			setWidget(): void {},
+			setWidget(): void {
+				widgetUpdates++;
+			},
 			setWorkingMessage(): void {},
 		},
 		waitForIdle: async () => {},
@@ -1627,6 +1632,9 @@ function createIntegrationHarness(cwd: string, options: IntegrationHarnessOption
 		gitEvents,
 		pushes,
 		approvalModeMutations,
+		get widgetUpdates(): number {
+			return widgetUpdates;
+		},
 		setPendingMessages(value: boolean): void {
 			pendingMessages = value;
 		},
@@ -1750,13 +1758,13 @@ async function prepareKeptContribution(harness: IntegrationHarness, cwd: string)
 	return session;
 }
 
-async function preparePendingContribution(harness: IntegrationHarness, cwd: string) {
+async function prepareInitializedContribution(harness: IntegrationHarness, cwd: string) {
 	await Bun.write(`${cwd}/autoresearch.sh`, "#!/usr/bin/env bash\necho METRIC runtime_ms=1\n");
 	const init = harness.tools.get("init_experiment");
 	if (!init) throw new Error("Expected init_experiment tool");
 	await init.execute(
-		"initial-pending",
-		{ name: "pending candidate", primary_metric: "runtime_ms", metric_unit: "ms" },
+		"initial-session",
+		{ name: "candidate", primary_metric: "runtime_ms", metric_unit: "ms" },
 		undefined,
 		undefined,
 		harness.ctx as ExtensionContext,
@@ -1764,6 +1772,11 @@ async function preparePendingContribution(harness: IntegrationHarness, cwd: stri
 	const storage = await openAutoresearchStorage(cwd);
 	const session = storage.getActiveSessionForBranch(harness.currentBranch());
 	if (!session) throw new Error("Expected contribution session");
+	return { session, storage };
+}
+
+async function preparePendingContribution(harness: IntegrationHarness, cwd: string) {
+	const { session, storage } = await prepareInitializedContribution(harness, cwd);
 	const now = Date.now();
 	const run = storage.insertRun({
 		sessionId: session.id,
@@ -1970,6 +1983,103 @@ describe("process-local contribution lifecycle", () => {
 		expect(transitionResult.status).toBe("fulfilled");
 		expect(storage.getPendingRun(session.id)?.id).toBe(run.id);
 		expect(storage.listLoggedRuns(session.id)).toEqual([]);
+		expect(harness.activeTools).toEqual(["read", "bash"]);
+	});
+
+	it("aborts and drains an in-flight run before contribution off publishes completion", async () => {
+		const harness = createIntegrationHarness(cwd.path());
+		await startContribution(harness);
+		const { session, storage } = await prepareInitializedContribution(harness, cwd.path());
+		const run = harness.tools.get("run_experiment");
+		if (!run) throw new Error("Expected run_experiment tool");
+		let processSignal: AbortSignal | undefined;
+		let offPromise: Promise<void> | null = null;
+		let offSettled = false;
+		let offSettledDuringProcess = false;
+		vi.spyOn(bashExecutor, "executeBash").mockImplementation(async (_command, options) => {
+			processSignal = options?.signal;
+			offPromise = commandRequired(harness, "contribute")
+				.handler("off", harness.ctx)
+				.finally(() => {
+					offSettled = true;
+				});
+			for (let turn = 0; turn < 4; turn++) await Promise.resolve();
+			offSettledDuringProcess = offSettled;
+			if (processSignal?.aborted) {
+				throw processSignal.reason ?? new DOMException("Contribution run aborted", "AbortError");
+			}
+			return {
+				output: "",
+				exitCode: 0,
+				cancelled: false,
+				truncated: false,
+				totalLines: 0,
+				totalBytes: 0,
+				outputLines: 0,
+				outputBytes: 0,
+			};
+		});
+
+		const [runResult] = await Promise.allSettled([
+			run.execute("run-during-off", {}, undefined, undefined, harness.ctx as ExtensionContext),
+		]);
+		const startedOff = offPromise as Promise<void> | null;
+		if (!startedOff) throw new Error("Expected contribution off to start during run");
+		const [offResult] = await Promise.allSettled([startedOff]);
+		const pendingRun = storage.getPendingRun(session.id);
+
+		expect(offSettledDuringProcess).toBe(false);
+		expect(processSignal).toBeDefined();
+		expect(processSignal?.aborted).toBe(true);
+		expect(runResult).toMatchObject({ status: "rejected", reason: { name: "ToolAbortError" } });
+		expect(offResult.status).toBe("fulfilled");
+		expect(pendingRun).not.toBeNull();
+		expect(pendingRun?.completedAt).toBeNull();
+		expect(storage.listLoggedRuns(session.id)).toEqual([]);
+		expect(harness.activeTools).toEqual(["read", "bash"]);
+	});
+
+	it("aborts and drains update_notes before SQLite and runtime mutation on session transition", async () => {
+		const harness = createIntegrationHarness(cwd.path());
+		await startContribution(harness);
+		const { session, storage } = await prepareInitializedContribution(harness, cwd.path());
+		const updateNotes = harness.tools.get("update_notes");
+		if (!updateNotes) throw new Error("Expected update_notes tool");
+		const originalNotes = session.notes;
+		const widgetUpdatesBefore = harness.widgetUpdates;
+		const contributionBranch = harness.currentBranch();
+		let branchSignal: AbortSignal | undefined;
+		let transitionPromise: Promise<void> | null = null;
+		vi.spyOn(git.branch, "current").mockImplementation(async (_workDir, signal) => {
+			branchSignal = signal;
+			transitionPromise = Promise.resolve(
+				handlerRequired<SessionBeforeSwitchEvent>(harness, "session_before_switch")(
+					{ type: "session_before_switch", reason: "resume", targetSessionFile: "/tmp/notes-switch.jsonl" },
+					harness.ctx as ExtensionContext,
+				),
+			);
+			return contributionBranch;
+		});
+
+		const [updateResult] = await Promise.allSettled([
+			updateNotes.execute(
+				"notes-during-switch",
+				{ body: "mutated after transition" },
+				undefined,
+				undefined,
+				harness.ctx as ExtensionContext,
+			),
+		]);
+		const startedTransition = transitionPromise as Promise<void> | null;
+		if (!startedTransition) throw new Error("Expected session transition to start during notes branch read");
+		const [transitionResult] = await Promise.allSettled([startedTransition]);
+
+		expect(branchSignal).toBeDefined();
+		expect(branchSignal?.aborted).toBe(true);
+		expect(updateResult).toMatchObject({ status: "rejected", reason: { name: "ToolAbortError" } });
+		expect(transitionResult.status).toBe("fulfilled");
+		expect(storage.getSessionById(session.id)?.notes).toBe(originalNotes);
+		expect(harness.widgetUpdates).toBe(widgetUpdatesBefore);
 		expect(harness.activeTools).toEqual(["read", "bash"]);
 	});
 
