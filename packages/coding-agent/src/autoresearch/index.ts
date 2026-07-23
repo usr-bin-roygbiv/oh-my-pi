@@ -71,6 +71,11 @@ interface ContributionStartTransaction {
 	readonly settlement: PromiseWithResolvers<void>;
 }
 
+interface InitExperimentOperation {
+	readonly controller: AbortController;
+	readonly settlement: PromiseWithResolvers<void>;
+}
+
 const contributionPublicationGit: ContributionPublicationGit = {
 	readRemoteUrl: (cwd, remote, signal) => git.remote.url(cwd, remote, signal),
 	readPushRemoteUrl: (cwd, remote, signal) => git.remote.pushUrl(cwd, remote, signal),
@@ -158,6 +163,7 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 	const dashboard = createDashboardController();
 	const contributionStartTransactions = new Map<string, ContributionStartTransaction>();
 	const contributionPublicationControllers = new Map<string, AbortController>();
+	const initExperimentOperations = new Map<string, InitExperimentOperation>();
 
 	const invalidateContributionOperations = (sessionKey: string): Promise<void> | undefined => {
 		const startTransaction = contributionStartTransactions.get(sessionKey);
@@ -168,6 +174,13 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 			controller.abort();
 		}
 		return startTransaction?.phase === "activating" ? startTransaction.settlement.promise : undefined;
+	};
+
+	const invalidateInitExperimentOperation = (sessionKey: string): Promise<void> | undefined => {
+		const operation = initExperimentOperations.get(sessionKey);
+		if (!operation) return undefined;
+		operation.controller.abort(new DOMException("Autoresearch init authorization changed before mutation.", "AbortError"));
+		return operation.settlement.promise;
 	};
 
 	const getSessionKey = (ctx: ExtensionContext): string => ctx.sessionManager.getSessionId();
@@ -314,7 +327,10 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 		runtime: AutoresearchRuntime,
 		awaitActivationRollback = false,
 	): Promise<string[]> => {
-		const activationSettlement = invalidateContributionOperations(getSessionKey(ctx));
+		const sessionKey = getSessionKey(ctx);
+		const initSettlement = invalidateInitExperimentOperation(sessionKey);
+		const activationSettlement = invalidateContributionOperations(sessionKey);
+		if (initSettlement) await initSettlement;
 		if (awaitActivationRollback && activationSettlement) await activationSettlement;
 		if (runtime.contribution.status === "off") return [];
 		const contribution = runtime.contribution;
@@ -345,30 +361,54 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 			pi: api,
 			captureMutationAuthorization(ctx) {
 				const sessionKey = getSessionKey(ctx);
+				if (contributionStartTransactions.has(sessionKey)) {
+					throw new Error("Contribution startup is already active for this session.");
+				}
+				if (initExperimentOperations.has(sessionKey)) {
+					throw new Error("An init_experiment operation is already active for this session.");
+				}
 				const captured = getRuntime(ctx).contribution;
-				if (captured.status !== "running") return null;
-				const { authorization, branch, sessionId } = captured;
+				const operation: InitExperimentOperation = {
+					controller: new AbortController(),
+					settlement: Promise.withResolvers<void>(),
+				};
+				initExperimentOperations.set(sessionKey, operation);
+				let settled = false;
 				const assertProcessIdentity = (currentCtx: ExtensionContext): void => {
 					const current = getRuntime(currentCtx).contribution;
+					if (getSessionKey(currentCtx) !== sessionKey) {
+						throw new Error("Autoresearch init authorization changed before mutation.");
+					}
+					if (captured.status !== "running") {
+						if (current.status === "running") {
+							throw new Error("Contribution startup overtook autoresearch init before mutation.");
+						}
+						return;
+					}
 					if (
-						getSessionKey(currentCtx) !== sessionKey ||
 						current.status !== "running" ||
-						current.authorization !== authorization ||
-						current.branch !== branch ||
-						current.sessionId !== sessionId
+						current.authorization !== captured.authorization ||
+						current.branch !== captured.branch ||
+						current.sessionId !== captured.sessionId
 					) {
 						throw new Error("Contribution init authorization changed before mutation.");
 					}
 				};
 				return {
+					signal: operation.controller.signal,
 					async authorizeMutation(currentCtx, signal): Promise<void> {
 						throwIfAborted(signal);
 						assertProcessIdentity(currentCtx);
-						const storage = await openAutoresearchStorageIfExists(currentCtx.cwd);
-						const currentBranch = await git.branch.current(currentCtx.cwd, signal);
-						const session = storage?.getActiveSessionForBranch(branch) ?? null;
-						if (currentBranch !== branch || (sessionId === null ? session !== null : session?.id !== sessionId)) {
-							throw new Error("Contribution branch or experiment session changed before mutation.");
+						if (captured.status === "running") {
+							const storage = await openAutoresearchStorageIfExists(currentCtx.cwd);
+							const currentBranch = await git.branch.current(currentCtx.cwd, signal);
+							const session = storage?.getActiveSessionForBranch(captured.branch) ?? null;
+							if (
+								currentBranch !== captured.branch ||
+								(captured.sessionId === null ? session !== null : session?.id !== captured.sessionId)
+							) {
+								throw new Error("Contribution branch or experiment session changed before mutation.");
+							}
 						}
 						assertProcessIdentity(currentCtx);
 						throwIfAborted(signal);
@@ -376,6 +416,14 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 					assertRuntimeCurrent(currentCtx, signal): void {
 						throwIfAborted(signal);
 						assertProcessIdentity(currentCtx);
+					},
+					settle(): void {
+						if (settled) return;
+						settled = true;
+						if (initExperimentOperations.get(sessionKey) === operation) {
+							initExperimentOperations.delete(sessionKey);
+						}
+						operation.settlement.resolve();
 					},
 				};
 			},
@@ -843,6 +891,8 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 				"Run bounded read-only discovery of official goal provenance, authenticated models, the clean base, active autoresearch state, and GitHub fork remotes? No model, branch, tools, or durable contribution state will change.",
 			);
 			if (!preflightConfirmed) return;
+			const preflightInitSettlement = invalidateInitExperimentOperation(getSessionKey(ctx));
+			if (preflightInitSettlement) await preflightInitSettlement;
 
 			let contributionStartSessionKey: string | null = null;
 			let contributionStartTransaction: ContributionStartTransaction | null = null;
@@ -945,6 +995,8 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 					`Goal: ${goal.title}\nOfficial main commit/base: ${goal.commitSha}\nGoal blob: ${goal.blobSha}\nGoal SHA-256: ${goal.sha256}\nModel: ${selectedModel.provider}/${selectedModel.id}\nConfirmed fork: ${selectedRemote.name} (${selectedRemote.url})\nVerified push-effective destination: ${selectedRemote.pushUrl}\nFresh local candidate branch: ${branchName}\n\nThis native OMP session continues indefinitely until /contribute off, an input/review gate, interruption, or session exit. It consumes model tokens, runs tests/commands under normal approval policy, and may create commits on the candidate branch. /contribute review requires another exact approval before an absent candidate branch is pushed to this fork; it never opens a pull request.\n\nOn confirmation only: recheck the official base and fork, switch model, create this exact branch from the frozen base commit, activate the existing autoresearch tools, then start the turn. Global approval policy is unchanged.`,
 				);
 				if (!finalConfirmed) return;
+				const confirmedInitSettlement = invalidateInitExperimentOperation(startSessionKey);
+				if (confirmedInitSettlement) await confirmedInitSettlement;
 				assertContributionStartFresh(
 					ctx,
 					runtime,

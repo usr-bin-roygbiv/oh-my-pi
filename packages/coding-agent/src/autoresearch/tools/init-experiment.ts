@@ -1,6 +1,7 @@
 import * as path from "node:path";
 
 import { Text } from "@oh-my-pi/pi-tui";
+import { untilAborted } from "@oh-my-pi/pi-utils";
 import { type } from "arktype";
 import type { ExtensionContext, ToolDefinition } from "../../extensibility/extensions";
 import type { Theme } from "../../modes/theme/theme";
@@ -46,8 +47,10 @@ interface PreparedNewSegment {
 }
 
 interface InitExperimentMutationAuthorization {
+	readonly signal: AbortSignal;
 	authorizeMutation(ctx: ExtensionContext, signal?: AbortSignal): Promise<void>;
 	assertRuntimeCurrent(ctx: ExtensionContext, signal?: AbortSignal): void;
+	settle(): void;
 }
 
 interface InitExperimentToolFactoryOptions extends AutoresearchToolFactoryOptions {
@@ -67,18 +70,27 @@ export function createInitExperimentTool(
 			"Initialize or reconfigure the autoresearch session. On first call (Phase 1 → Phase 2 transition), requires `./autoresearch.sh` to exist and pending harness changes are auto-committed on an autoresearch branch. Pass `new_segment: true` to start a fresh baseline within an existing session.",
 		parameters: initExperimentSchema,
 		defaultInactive: true,
-		concurrency: params => (params.new_segment === true ? "exclusive" : "shared"),
+		concurrency: () => "exclusive",
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			const mutationAuthorization = options.captureMutationAuthorization?.(ctx) ?? null;
-			const authorizeMutation = async (): Promise<void> => {
-				throwIfAborted(signal);
-				await mutationAuthorization?.authorizeMutation(ctx, signal);
-				throwIfAborted(signal);
-			};
-			const preparedNewSegment =
-				params.new_segment === true ? ((await options.prepareNewSegment?.(ctx, signal)) ?? null) : null;
-			if (preparedNewSegment) throwIfAborted(signal);
-			await authorizeMutation();
+			const operationSignal = mutationAuthorization
+				? signal
+					? AbortSignal.any([signal, mutationAuthorization.signal])
+					: mutationAuthorization.signal
+				: signal;
+			try {
+				const authorizeMutation = async (): Promise<void> => {
+					throwIfAborted(operationSignal);
+					await mutationAuthorization?.authorizeMutation(ctx, operationSignal);
+					throwIfAborted(operationSignal);
+				};
+				const prepareNewSegment = options.prepareNewSegment;
+				const preparedNewSegment =
+					params.new_segment === true && prepareNewSegment
+						? ((await untilAborted(operationSignal, () => prepareNewSegment(ctx, operationSignal))) ?? null)
+						: null;
+				if (preparedNewSegment) throwIfAborted(operationSignal);
+				await authorizeMutation();
 			let storage = await openAutoresearchStorageIfExists(ctx.cwd);
 			const runtime = options.getRuntime(ctx);
 			const direction = params.direction ?? "lower";
@@ -97,7 +109,8 @@ export function createInitExperimentTool(
 				: params.max_iterations !== undefined && Number.isFinite(params.max_iterations) && params.max_iterations > 0
 					? Math.floor(params.max_iterations)
 					: null;
-			const branch = (await git.branch.current(ctx.cwd)) ?? null;
+			const branch =
+				(await untilAborted(operationSignal, () => git.branch.current(ctx.cwd, operationSignal))) ?? null;
 			const onAutoresearchBranch = branch?.startsWith("autoresearch/") ?? false;
 
 			const existing = storage?.getActiveSessionForBranch(branch) ?? null;
@@ -121,22 +134,23 @@ export function createInitExperimentTool(
 			let harnessCommitted = false;
 			let commitWarning: string | null = null;
 			if (requiresHarness && onAutoresearchBranch) {
-				const dirty = await detectPendingChanges(ctx.cwd);
+				const dirty = await detectPendingChanges(ctx.cwd, operationSignal);
 				if (dirty) {
 					await authorizeMutation();
 					try {
-						await git.stage.files(ctx.cwd, []);
+						await git.stage.files(ctx.cwd, [], operationSignal);
 						const message = buildHarnessCommitMessage(goal, params.name);
 						await authorizeMutation();
-						await git.commit(ctx.cwd, message);
+						await git.commit(ctx.cwd, message, { signal: operationSignal });
 						harnessCommitted = true;
 					} catch (err) {
+						throwIfAborted(operationSignal);
 						commitWarning = `Failed to auto-commit harness changes: ${err instanceof Error ? err.message : String(err)}. Recording baseline at current HEAD; discard may not preserve uncommitted harness files.`;
 					}
 				}
 			}
 
-			const baselineCommit = await tryReadHeadSha(ctx.cwd);
+			const baselineCommit = await tryReadHeadSha(ctx.cwd, operationSignal);
 			await authorizeMutation();
 			if (!storage) {
 				storage = await openAutoresearchStorage(ctx.cwd, authorizeMutation);
@@ -192,9 +206,9 @@ export function createInitExperimentTool(
 
 			const loggedRuns = storage.listLoggedRuns(session.id);
 			const state = buildExperimentState(session, loggedRuns);
-			throwIfAborted(signal);
-			mutationAuthorization?.assertRuntimeCurrent(ctx, signal);
-			throwIfAborted(signal);
+			throwIfAborted(operationSignal);
+			mutationAuthorization?.assertRuntimeCurrent(ctx, operationSignal);
+			throwIfAborted(operationSignal);
 			runtime.state = state;
 			runtime.goal = session.goal;
 			runtime.autoresearchMode = true;
@@ -271,6 +285,9 @@ export function createInitExperimentTool(
 					baselineCommit: session.baselineCommit,
 				},
 			};
+			} finally {
+				mutationAuthorization?.settle();
+			}
 		},
 		renderCall(args, _options, theme): Text {
 			return new Text(renderInitCall(args.name, theme), 0, 0);
@@ -286,20 +303,27 @@ function renderInitCall(name: string, theme: Theme): string {
 	return `${theme.fg("toolTitle", theme.bold("init_experiment"))} ${theme.fg("accent", truncateToWidth(replaceTabs(name), 100))}`;
 }
 
-async function tryReadHeadSha(cwd: string): Promise<string | null> {
+async function tryReadHeadSha(cwd: string, signal?: AbortSignal): Promise<string | null> {
 	try {
-		return (await git.head.sha(cwd)) ?? null;
+		return (await untilAborted(signal, () => git.head.sha(cwd, signal))) ?? null;
 	} catch {
+		throwIfAborted(signal);
 		return null;
 	}
 }
 
-async function detectPendingChanges(cwd: string): Promise<boolean> {
+async function detectPendingChanges(cwd: string, signal?: AbortSignal): Promise<boolean> {
 	try {
-		const statusText = await git.status(cwd, { porcelainV1: true, untrackedFiles: "all", z: true });
-		const workDirPrefix = await git.show.prefix(cwd).catch(() => "");
+		const statusText = await untilAborted(signal, () =>
+			git.status(cwd, { porcelainV1: true, untrackedFiles: "all", z: true, signal }),
+		);
+		const workDirPrefix = await untilAborted(signal, () => git.show.prefix(cwd, signal)).catch(() => {
+			throwIfAborted(signal);
+			return "";
+		});
 		return parseWorkDirDirtyPaths(statusText, workDirPrefix).length > 0;
 	} catch {
+		throwIfAborted(signal);
 		return false;
 	}
 }
