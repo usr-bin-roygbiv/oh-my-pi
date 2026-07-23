@@ -2848,7 +2848,10 @@ describe("process-local contribution lifecycle", () => {
 				harness.ctx as ExtensionContext,
 			),
 		).rejects.toThrow("Operation aborted");
-		expect(observedSignal).toBe(controller.signal);
+		expect(observedSignal).toBeDefined();
+		expect(observedSignal?.aborted).toBe(true);
+		expect(observedSignal?.reason).toBe(controller.signal.reason);
+		expect(observedSignal?.reason?.message).toBe("user interrupted");
 		expect(snapshotStorageArtifacts(dbDir.path())).toEqual(beforeArtifacts);
 	});
 });
