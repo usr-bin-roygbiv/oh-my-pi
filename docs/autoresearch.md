@@ -240,8 +240,9 @@ HEAD:refs/heads/<candidate-branch>
 ```
 
 The destination is the verified push-effective URL for the previously confirmed
-fork. A unique command-scoped remote with an explicit `pushurl` prevents
-`url.*.pushInsteadOf` or a configured `pushurl` from redirecting the operation.
+fork. A unique command-scoped remote uses an explicit `pushurl` through a random,
+exact-match URL alias. This bypasses configured `pushurl`, `pushInsteadOf`, and
+ordinary `insteadOf` redirection while retaining the verified destination.
 A force-with-lease expecting an absent remote branch prevents overwriting an
 existing ref. Nothing is pushed to the official repository. The command never
 creates, approves, or merges a pull request.

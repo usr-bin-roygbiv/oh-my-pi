@@ -1355,21 +1355,23 @@ export async function push(cwd: string, options: PushOptions = {}): Promise<void
 	const configArgs: string[] = [];
 	let remote = options.remote;
 	if (options.verifiedRemoteUrl !== undefined) {
-		// An explicit pushurl disables url.*.pushInsteadOf for this command. The
-		// exact self insteadOf rule prevents a broader ordinary insteadOf from
-		// rewriting that pushurl. A unique command-scoped remote prevents local
-		// config from supplying an additional destination under the same name.
+		// The explicit pushurl disables url.*.pushInsteadOf for this command.
+		// Route it through a random, exact-match alias: that match is longer
+		// than any configured ordinary insteadOf prefix, and its single
+		// expansion is the already-verified URL. A unique command-scoped
+		// remote prevents local config from adding another destination.
 		const verifiedRemote = `omp-verified-push-${crypto.randomUUID()}`;
+		const transportAlias = `omp-verified-push://${crypto.randomUUID()}`;
 		configArgs.push(
 			"-c",
 			`remote.${verifiedRemote}.url=${options.verifiedRemoteUrl}`,
 			"-c",
-			`remote.${verifiedRemote}.pushurl=${options.verifiedRemoteUrl}`,
+			`remote.${verifiedRemote}.pushurl=${transportAlias}`,
 			"-c",
-			`url.${options.verifiedRemoteUrl}.insteadOf=${options.verifiedRemoteUrl}`,
+			`url.${options.verifiedRemoteUrl}.insteadOf=${transportAlias}`,
 		);
 		const resolvedPushUrl = trimScalar(
-			await runText(cwd, [...configArgs, "remote", "get-url", "--push", verifiedRemote], {
+			await runText(cwd, [...configArgs, "ls-remote", "--get-url", transportAlias], {
 				readOnly: true,
 				signal: options.signal,
 			}),
