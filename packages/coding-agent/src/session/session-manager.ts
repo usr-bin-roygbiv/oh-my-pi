@@ -1335,6 +1335,18 @@ export class SessionManager {
 	}
 
 	/**
+	 * Persist a workspace-directory change to the session header. Respects the
+	 * lazy-persistence gate: a session with no durable output yet keeps the
+	 * change in memory (the header lands with the first real write), so seeding
+	 * roots at launch never materializes an empty resumable session file.
+	 */
+	async #persistWorkspaceDirectoriesChange(): Promise<void> {
+		if (!this.#persist || !this.#sessionFile || !this.#shouldHaveSessionFile()) return;
+		this.#rewriteRequired = true;
+		await this.#rewriteAtomically();
+	}
+
+	/**
 	 * Add a workspace directory. Normalizes (relative to cwd), dedupes, rejects
 	 * the cwd itself, persists to the session header, and triggers an atomic
 	 * rewrite so the change survives a crash. Returns the resolved absolute
@@ -1348,10 +1360,7 @@ export class SessionManager {
 		if (this.#additionalDirectories.includes(resolved)) return null;
 		this.#additionalDirectories = [...this.#additionalDirectories, resolved];
 		this.#header.additionalDirectories = this.#additionalDirectories;
-		if (this.#persist && this.#sessionFile) {
-			this.#rewriteRequired = true;
-			await this.#rewriteAtomically();
-		}
+		await this.#persistWorkspaceDirectoriesChange();
 		return resolved;
 	}
 
@@ -1370,26 +1379,24 @@ export class SessionManager {
 		} else {
 			this.#header.additionalDirectories = this.#additionalDirectories;
 		}
-		if (this.#persist && this.#sessionFile) {
-			this.#rewriteRequired = true;
-			await this.#rewriteAtomically();
-		}
+		await this.#persistWorkspaceDirectoriesChange();
 		return resolved;
 	}
 
-	/** Seed additional directories from settings or a passed list. Also called on resumed sessions with --add-dir; persists the updated header when a session file already exists. */
+	/** Seed additional directories from settings or a passed list. Also called on resumed sessions with --add-dir; persists the updated header when the session file is already durable. No-op when the normalized list is unchanged (avoids rewriting large session files on every startup). */
 	async setAdditionalDirectories(directories: string[]): Promise<void> {
 		const workspace = normalizeSessionWorkspace({ cwd: this.#cwd, directories });
-		this.#additionalDirectories = additionalWorkspaceDirectories(workspace);
+		const next = additionalWorkspaceDirectories(workspace);
+		if (next.length === this.#additionalDirectories.length && next.every((d, i) => d === this.#additionalDirectories[i])) {
+			return;
+		}
+		this.#additionalDirectories = next;
 		if (this.#additionalDirectories.length > 0) {
 			this.#header.additionalDirectories = this.#additionalDirectories;
 		} else {
 			this.#header.additionalDirectories = undefined;
 		}
-		if (this.#persist && this.#sessionFile) {
-			this.#rewriteRequired = true;
-			await this.#rewriteAtomically();
-		}
+		await this.#persistWorkspaceDirectoriesChange();
 	}
 
 	getUsageStatistics(): UsageStatistics {

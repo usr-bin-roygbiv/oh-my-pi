@@ -8,6 +8,7 @@ import {
 	normalizeSessionWorkspace,
 } from "@oh-my-pi/pi-coding-agent/session/session-workspace";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { makeAssistantMessage } from "./helpers";
 
 describe("normalizeSessionWorkspace", () => {
 	it("places cwd first and dedupes additional directories", () => {
@@ -105,8 +106,8 @@ describe("SessionManager workspace directories", () => {
 		using tempDir = TempDir.createSync("@pi-session-workspace-persist-");
 		const session = SessionManager.create(tempDir.path(), tempDir.path());
 		await session.addWorkspaceDirectory(path.join(tempDir.path(), "sibling"));
-		// Materialize on disk so reopen reads the header.
-		session.appendMessage({ role: "user", content: "hello", timestamp: 1 });
+		// Materialize on disk so reopen reads the header (lazy gate needs assistant output).
+		session.appendMessage(makeAssistantMessage());
 		await session.flush();
 
 		const file = session.getSessionFile();
@@ -123,7 +124,7 @@ describe("SessionManager workspace directories", () => {
 		using tempDir = TempDir.createSync("@pi-session-workspace-clear-");
 		const session = SessionManager.create(tempDir.path(), tempDir.path());
 		await session.addWorkspaceDirectory(path.join(tempDir.path(), "extra"));
-		session.appendMessage({ role: "user", content: "hi", timestamp: 1 });
+		session.appendMessage(makeAssistantMessage());
 		await session.flush();
 
 		await session.removeWorkspaceDirectory(path.join(tempDir.path(), "extra"));
@@ -149,8 +150,8 @@ describe("SessionManager workspace directories", () => {
 	it("setAdditionalDirectories persists the updated header on a resumed session", async () => {
 		using tempDir = TempDir.createSync("@pi-session-workspace-resume-");
 		const session = SessionManager.create(tempDir.path(), tempDir.path());
-		// Simulate a resumed session: append a message so the file exists, then setAdditionalDirectories.
-		session.appendMessage({ role: "user", content: "hello", timestamp: 1 });
+		// Simulate a resumed session: append an assistant message so the file exists, then setAdditionalDirectories.
+		session.appendMessage(makeAssistantMessage());
 		await session.flush();
 
 		await session.setAdditionalDirectories([path.join(tempDir.path(), "added")]);
@@ -164,11 +165,29 @@ describe("SessionManager workspace directories", () => {
 		expect(header.additionalDirectories).toEqual([path.join(tempDir.path(), "added")]);
 	});
 
+	it("keeps seeded roots in memory until the session is durable (no empty session file)", async () => {
+		using tempDir = TempDir.createSync("@pi-session-workspace-lazy-");
+		const session = SessionManager.create(tempDir.path(), tempDir.path());
+		await session.setAdditionalDirectories([path.join(tempDir.path(), "extra")]);
+		await session.addWorkspaceDirectory(path.join(tempDir.path(), "extra2"));
+		// Seeding roots must not materialize an empty resumable session file.
+		expect(fs.readdirSync(tempDir.path()).filter(f => f.endsWith(".jsonl"))).toEqual([]);
+
+		// Once the session produces durable output, the header carries the roots.
+		session.appendMessage(makeAssistantMessage());
+		await session.flush();
+		const reopened = await SessionManager.open(session.getSessionFile()!);
+		expect(reopened.getAdditionalDirectories()).toEqual([
+			path.join(tempDir.path(), "extra"),
+			path.join(tempDir.path(), "extra2"),
+		]);
+	});
+
 	it("forkFrom preserves additionalDirectories from the source session", async () => {
 		using tempDir = TempDir.createSync("@pi-session-workspace-fork-");
 		const source = SessionManager.create(tempDir.path(), tempDir.path());
 		await source.addWorkspaceDirectory(path.join(tempDir.path(), "extra"));
-		source.appendMessage({ role: "user", content: "hello", timestamp: 1 });
+		source.appendMessage(makeAssistantMessage());
 		await source.flush();
 
 		const forked = await SessionManager.forkFrom(source.getSessionFile()!, tempDir.path());
