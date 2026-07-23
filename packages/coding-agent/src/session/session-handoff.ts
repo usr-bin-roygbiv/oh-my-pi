@@ -124,6 +124,7 @@ export class SessionHandoff {
 			}
 		}
 
+		let sessionTransition: { transitionId: string; committed: boolean } | undefined;
 		try {
 			if (handoffSignal.aborted) {
 				throw new Error("Handoff cancelled");
@@ -210,10 +211,12 @@ export class SessionHandoff {
 			}
 
 			// Start a new session
+			sessionTransition = { transitionId: crypto.randomUUID(), committed: false };
 			const previousSessionFile = this.#host.sessionFile();
 			if (this.#host.extensionRunner?.hasHandlers("session_before_switch")) {
 				const result = (await this.#host.extensionRunner.emit({
 					type: "session_before_switch",
+					transitionId: sessionTransition.transitionId,
 					reason: "handoff",
 				})) as SessionBeforeSwitchResult | undefined;
 
@@ -231,6 +234,7 @@ export class SessionHandoff {
 				await this.#host.sessionManager.newSession(
 					previousSessionFile ? { parentSession: previousSessionFile } : undefined,
 				);
+				sessionTransition.committed = true;
 				this.#host.markBashSessionTransition(bashTransition);
 				sessionTransitioned = true;
 			} finally {
@@ -303,6 +307,14 @@ export class SessionHandoff {
 		} finally {
 			sourceSignal?.removeEventListener("abort", onSourceAbort);
 			this.#handoffAbortController = undefined;
+			if (sessionTransition && this.#host.extensionRunner?.hasHandlers("session_transition_end")) {
+				await this.#host.extensionRunner.emit({
+					type: "session_transition_end",
+					transitionId: sessionTransition.transitionId,
+					kind: "switch",
+					committed: sessionTransition.committed,
+				});
+			}
 		}
 	}
 }

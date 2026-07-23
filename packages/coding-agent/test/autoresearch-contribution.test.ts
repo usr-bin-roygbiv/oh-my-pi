@@ -2214,7 +2214,12 @@ describe("process-local contribution lifecycle", () => {
 			}
 			transitionPromise = Promise.resolve(
 				handlerRequired<SessionBeforeSwitchEvent>(harness, "session_before_switch")(
-					{ type: "session_before_switch", reason: "resume", targetSessionFile: "/tmp/log-switch.jsonl" },
+					{
+						type: "session_before_switch",
+						transitionId: "log-switch",
+						reason: "resume",
+						targetSessionFile: "/tmp/log-switch.jsonl",
+					},
 					harness.ctx as ExtensionContext,
 				),
 			);
@@ -2322,7 +2327,12 @@ describe("process-local contribution lifecycle", () => {
 			branchSignal = signal;
 			transitionPromise = Promise.resolve(
 				handlerRequired<SessionBeforeSwitchEvent>(harness, "session_before_switch")(
-					{ type: "session_before_switch", reason: "resume", targetSessionFile: "/tmp/notes-switch.jsonl" },
+					{
+						type: "session_before_switch",
+						transitionId: "notes-switch",
+						reason: "resume",
+						targetSessionFile: "/tmp/notes-switch.jsonl",
+					},
 					harness.ctx as ExtensionContext,
 				),
 			);
@@ -2426,6 +2436,7 @@ describe("process-local contribution lifecycle", () => {
 							handlerRequired<SessionBeforeSwitchEvent, { cancel?: boolean }>(harness, transition)(
 								{
 									type: "session_before_switch",
+									transitionId: `${transition}-publication`,
 									reason: "resume",
 									targetSessionFile: "/tmp/publication-switch.jsonl",
 								},
@@ -2435,7 +2446,7 @@ describe("process-local contribution lifecycle", () => {
 					: transition === "session_before_branch"
 						? Promise.resolve(
 								handlerRequired<SessionBeforeBranchEvent, { cancel?: boolean }>(harness, transition)(
-									{ type: "session_before_branch", entryId: "publication-source" },
+									{ type: "session_before_branch", transitionId: `${transition}-publication`, entryId: "publication-source" },
 									harness.ctx as ExtensionContext,
 								),
 							)
@@ -2443,6 +2454,7 @@ describe("process-local contribution lifecycle", () => {
 								handlerRequired<SessionBeforeTreeEvent, { cancel?: boolean }>(harness, transition)(
 									{
 										type: "session_before_tree",
+										transitionId: `${transition}-publication`,
 										preparation: {
 											targetId: "publication-target",
 											oldLeafId: "publication-source",
@@ -2455,8 +2467,28 @@ describe("process-local contribution lifecycle", () => {
 									harness.ctx as ExtensionContext,
 								),
 							)
-			).then(result => {
+			).then(async result => {
 				transitionResult = result;
+				const kind =
+					transition === "session_before_switch"
+						? "switch"
+						: transition === "session_before_branch"
+							? "branch"
+							: "tree";
+				await handlerRequired<{
+					type: "session_transition_end";
+					transitionId: string;
+					kind: "switch" | "branch" | "tree";
+					committed: boolean;
+				}>(harness, "session_transition_end")(
+					{
+						type: "session_transition_end",
+						transitionId: `${transition}-publication`,
+						kind,
+						committed: false,
+					},
+					harness.ctx as ExtensionContext,
+				);
 			});
 			void transitionPromise.finally(() => {
 				transitionSettled = true;
@@ -2626,7 +2658,12 @@ describe("process-local contribution lifecycle", () => {
 					}
 					beforeSwitch = Promise.resolve(
 						handlerRequired<SessionBeforeSwitchEvent, { cancel?: boolean }>(harness, "session_before_switch")(
-							{ type: "session_before_switch", reason: "resume", targetSessionFile: "/tmp/switched.jsonl" },
+							{
+								type: "session_before_switch",
+								transitionId: "final-confirm-switch",
+								reason: "resume",
+								targetSessionFile: "/tmp/switched.jsonl",
+							},
 							harness.ctx as ExtensionContext,
 						),
 					);
@@ -2639,6 +2676,20 @@ describe("process-local contribution lifecycle", () => {
 			if (invalidation === "session switch") {
 				if (!beforeSwitch) throw new Error("Expected session-before-switch handler to start");
 				expect(await beforeSwitch).toEqual({ cancel: true });
+				await handlerRequired<{
+					type: "session_transition_end";
+					transitionId: string;
+					kind: "switch";
+					committed: boolean;
+				}>(harness, "session_transition_end")(
+					{
+						type: "session_transition_end",
+						transitionId: "final-confirm-switch",
+						kind: "switch",
+						committed: false,
+					},
+					harness.ctx as ExtensionContext,
+				);
 			}
 
 			expect(harness.confirmCalls.at(-1)?.title).toBe("Start exact upstream contribution session?");
@@ -2673,13 +2724,28 @@ describe("process-local contribution lifecycle", () => {
 						)(
 							{
 								type: "session_before_switch",
+								transitionId: "activation-switch",
 								reason: "resume",
 								targetSessionFile: "/tmp/activation-switch.jsonl",
 							},
 							harness.ctx as ExtensionContext,
 						),
-					).then(result => {
+					).then(async result => {
 						transitionResult = result;
+						await handlerRequired<{
+							type: "session_transition_end";
+							transitionId: string;
+							kind: "switch";
+							committed: boolean;
+						}>(harness, "session_transition_end")(
+							{
+								type: "session_transition_end",
+								transitionId: "activation-switch",
+								kind: "switch",
+								committed: false,
+							},
+							harness.ctx as ExtensionContext,
+						);
 						transitionSettled = true;
 					});
 				} else if (callNumber === 2) {
@@ -2716,8 +2782,11 @@ describe("process-local contribution lifecycle", () => {
 			const priorModel = requiredBundledModel("anthropic", "claude-sonnet-4-5");
 			const selectedModel = requiredBundledModel("anthropic", "claude-sonnet-4-6");
 			let harness!: IntegrationHarness;
-			const invalidate = async (callNumber: number): Promise<void> => {
-				if (callNumber === 1) await commandRequired(harness, "contribute").handler("off", harness.ctx);
+			let offPromise: Promise<void> | null = null;
+			const invalidate = (callNumber: number): void => {
+				if (callNumber === 1) {
+					offPromise = commandRequired(harness, "contribute").handler("off", harness.ctx);
+				}
 			};
 			harness = createIntegrationHarness(cwd.path(), {
 				currentModel: priorModel,
@@ -2728,6 +2797,9 @@ describe("process-local contribution lifecycle", () => {
 			});
 
 			await startContribution(harness);
+			const startedOff = offPromise as Promise<void> | null;
+			if (!startedOff) throw new Error("Expected contribution off during activation");
+			await startedOff;
 
 			expect(harness.currentModel()).toBe(priorModel);
 			expect(harness.currentBranch()).toBe("main");
@@ -3161,17 +3233,36 @@ describe("process-local contribution lifecycle", () => {
 		it(`aborts review publication during ${race.point} on ${race.invalidation} with zero push`, async () => {
 			let harness!: IntegrationHarness;
 			let publicationSignal: AbortSignal | undefined;
+			let invalidationPromise: Promise<void> | null = null;
 			const invalidate = async (signal: AbortSignal | undefined): Promise<void> => {
 				publicationSignal = signal;
 				if (race.invalidation === "off") {
-					await commandRequired(harness, "contribute").handler("off", harness.ctx);
+					invalidationPromise = commandRequired(harness, "contribute").handler("off", harness.ctx);
 					return;
 				}
-				await handlerRequired<SessionBeforeSwitchEvent>(harness, "session_before_switch")(
-					{ type: "session_before_switch", reason: "resume", targetSessionFile: "/tmp/review-switched.jsonl" },
+				const result = await handlerRequired<SessionBeforeSwitchEvent, { cancel?: boolean }>(
+					harness,
+					"session_before_switch",
+				)(
+					{
+						type: "session_before_switch",
+						transitionId: "review-switch",
+						reason: "resume",
+						targetSessionFile: "/tmp/review-switched.jsonl",
+					},
 					harness.ctx as ExtensionContext,
 				);
-				harness.setSessionId("review-switched-session");
+				expect(result).toEqual({ cancel: true });
+				await handlerRequired<{
+					type: "session_transition_end";
+					transitionId: string;
+					kind: "switch";
+					committed: boolean;
+				}>(harness, "session_transition_end")(
+					{ type: "session_transition_end", transitionId: "review-switch", kind: "switch", committed: false },
+					harness.ctx as ExtensionContext,
+				);
+				invalidationPromise = commandRequired(harness, "contribute").handler("off", harness.ctx);
 			};
 			harness = createIntegrationHarness(cwd.path(), {
 				confirmAnswers: [true, true, true],
@@ -3186,6 +3277,9 @@ describe("process-local contribution lifecycle", () => {
 			await prepareKeptContribution(harness, cwd.path());
 
 			await commandRequired(harness, "contribute").handler("review", harness.ctx);
+			const startedInvalidation = invalidationPromise as Promise<void> | null;
+			if (!startedInvalidation) throw new Error("Expected publication invalidation");
+			await startedInvalidation;
 
 			expect(publicationSignal).toBeDefined();
 			expect(publicationSignal?.aborted).toBe(true);

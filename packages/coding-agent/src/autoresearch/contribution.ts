@@ -167,6 +167,8 @@ export interface ContributionPublicationGit {
 			readonly refspec: string;
 			readonly forceWithLease: string;
 			readonly signal?: AbortSignal;
+			readonly noVerify?: boolean;
+			readonly recurseSubmodules?: "no";
 		},
 	): Promise<void>;
 }
@@ -186,7 +188,7 @@ export interface PublishContributionCandidateOptions {
 	readonly candidate: ContributionCandidate;
 	readonly approvedDraft: ContributionPrDraft;
 	readonly signal?: AbortSignal;
-	readonly authorizePush?: () => void;
+	readonly authorizePush?: (publication: PublishedContributionCandidate) => void;
 	readonly request?: ContributionGitHubRequest;
 	readonly git?: ContributionPublicationGit;
 }
@@ -652,13 +654,23 @@ export async function publishContributionCandidate(
 		approvedRemote,
 		options.remoteName,
 	);
-	options.authorizePush?.();
+	const publication: PublishedContributionCandidate = {
+		remote: currentRemote,
+		branchName: options.branchName,
+		refspec,
+		compareUrl,
+		reviewUrl,
+		prDraft,
+	};
+	options.authorizePush?.(publication);
 	try {
 		await publicationGit.push(options.cwd, {
 			remote: options.remoteName,
 			verifiedRemoteUrl: options.confirmedPushRemoteUrl,
 			refspec,
 			forceWithLease: `${targetRef}:`,
+			noVerify: true,
+			recurseSubmodules: "no",
 			signal: options.signal,
 		});
 	} catch (error) {
@@ -667,14 +679,7 @@ export async function publishContributionCandidate(
 			`Failed to publish the contribution candidate: ${error instanceof Error ? error.message : String(error)}`,
 		);
 	}
-	return {
-		remote: currentRemote,
-		branchName: options.branchName,
-		refspec,
-		compareUrl,
-		reviewUrl,
-		prDraft,
-	};
+	return publication;
 }
 
 async function requestGitHub(

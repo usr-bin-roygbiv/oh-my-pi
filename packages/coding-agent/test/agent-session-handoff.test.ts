@@ -1795,7 +1795,9 @@ describe("AgentSession handoff", () => {
 		await waitFor(() => events.filter(event => event.type === "auto_compaction_end").length === 1);
 
 		expect(generateHandoffSpy).toHaveBeenCalledTimes(1);
-		expect(emitSpy).toHaveBeenCalledWith({ type: "session_before_switch", reason: "handoff" });
+		expect(emitSpy).toHaveBeenCalledWith(
+			expect.objectContaining({ type: "session_before_switch", reason: "handoff" }),
+		);
 		expect(emitSpy).not.toHaveBeenCalledWith(expect.objectContaining({ type: "session_switch" }));
 		expect(session.sessionFile).toBe(previousSessionFile);
 		expect(sessionManager.getEntries().filter(entry => entry.type === "compaction")).toHaveLength(0);

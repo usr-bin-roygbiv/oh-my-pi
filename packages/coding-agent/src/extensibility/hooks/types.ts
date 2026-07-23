@@ -36,6 +36,7 @@ import type {
 	SessionStartEvent,
 	SessionSwitchEvent,
 	SessionTreeEvent,
+	SessionTransitionEndEvent,
 	TodoReminderEvent,
 	ToolCallEventResult,
 	ToolResultEventResult,
@@ -270,6 +271,8 @@ export type {
 	SessionStartEvent,
 	SessionSwitchEvent,
 	SessionTreeEvent,
+	SessionTransitionEndEvent,
+	SessionTransitionKind,
 	TreePreparation,
 } from "../shared-events";
 
@@ -495,6 +498,7 @@ export interface HookAPI {
 	on(event: "session_shutdown", handler: HookHandler<SessionShutdownEvent>): void;
 	on(event: "session_before_tree", handler: HookHandler<SessionBeforeTreeEvent, SessionBeforeTreeResult>): void;
 	on(event: "session_tree", handler: HookHandler<SessionTreeEvent>): void;
+	on(event: "session_transition_end", handler: HookHandler<SessionTransitionEndEvent>): void;
 
 	// Context and agent events
 	on(event: "context", handler: HookHandler<ContextEvent, ContextEventResult>): void;

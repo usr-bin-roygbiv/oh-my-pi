@@ -32,6 +32,8 @@ export interface SessionStartEvent {
 /** Fired before switching to another session (can be cancelled) */
 export interface SessionBeforeSwitchEvent {
 	type: "session_before_switch";
+	/** Unique ID shared with the matching session_transition_end event. */
+	transitionId: string;
 	/** Reason for the switch */
 	reason: "new" | "resume" | "fork" | "handoff";
 	/** Session file we're switching to (only for "resume") */
@@ -50,6 +52,8 @@ export interface SessionSwitchEvent {
 /** Fired before branching a session (can be cancelled) */
 export interface SessionBeforeBranchEvent {
 	type: "session_before_branch";
+	/** Unique ID shared with the matching session_transition_end event. */
+	transitionId: string;
 	/** ID of the entry to branch from */
 	entryId: string;
 }
@@ -121,6 +125,8 @@ export interface TreePreparation {
 /** Fired before navigating to a different node in the session tree (can be cancelled) */
 export interface SessionBeforeTreeEvent {
 	type: "session_before_tree";
+	/** Unique ID shared with the matching session_transition_end event. */
+	transitionId: string;
 	/** Preparation data for the navigation */
 	preparation: TreePreparation;
 	/** Abort signal - honors Escape during summarization (model available via ctx.model) */
@@ -138,6 +144,19 @@ export interface SessionTreeEvent {
 	summaryEntry?: BranchSummaryEntry;
 	/** Whether summary came from extension/hook */
 	fromExtension?: boolean;
+}
+
+export type SessionTransitionKind = "switch" | "branch" | "tree";
+
+/** Fired exactly once when an attempted session transition settles. */
+export interface SessionTransitionEndEvent {
+	type: "session_transition_end";
+	/** ID from the corresponding session_before_* event. */
+	transitionId: string;
+	/** Category of session transition that settled. */
+	kind: SessionTransitionKind;
+	/** True once the underlying session or active leaf changed. */
+	committed: boolean;
 }
 
 /** Union of all session event types */
@@ -160,6 +179,7 @@ export type SessionEvent =
 	| SessionShutdownEvent
 	| SessionBeforeTreeEvent
 	| SessionTreeEvent
+	| SessionTransitionEndEvent
 	| GoalUpdatedEvent;
 
 // ============================================================================

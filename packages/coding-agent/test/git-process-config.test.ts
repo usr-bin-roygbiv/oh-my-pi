@@ -122,7 +122,7 @@ describe("git subprocess config", () => {
 				refspec: "0123456789abcdef0123456789abcdef01234567:refs/heads/feature",
 				noVerify: true,
 				recurseSubmodules: "no",
-			} as never,
+			},
 		);
 
 		expect(spawnCalls).toHaveLength(1);

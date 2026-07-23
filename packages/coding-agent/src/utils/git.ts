@@ -95,6 +95,8 @@ export interface CommitOptions {
 
 export interface PushOptions {
 	readonly forceWithLease?: boolean | string;
+	readonly noVerify?: boolean;
+	readonly recurseSubmodules?: "check" | "on-demand" | "only" | "no";
 	readonly refspec?: string;
 	readonly remote?: string;
 	readonly verifiedRemoteUrl?: string;
@@ -1382,6 +1384,8 @@ export async function push(cwd: string, options: PushOptions = {}): Promise<void
 		remote = verifiedRemote;
 	}
 	const args = [...configArgs, "push", "--no-follow-tags"];
+	if (options.noVerify) args.push("--no-verify");
+	if (options.recurseSubmodules !== undefined) args.push(`--recurse-submodules=${options.recurseSubmodules}`);
 	if (typeof options.forceWithLease === "string") {
 		args.push(`--force-with-lease=${options.forceWithLease}`);
 	} else if (options.forceWithLease) {

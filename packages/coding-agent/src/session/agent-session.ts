@@ -132,6 +132,7 @@ import { ManagedTimers } from "../extensibility/extensions/managed-timers";
 import { createExtensionModelQuery } from "../extensibility/extensions/model-api";
 import type { CompactOptions, ContextUsage } from "../extensibility/extensions/types";
 import type { HookCommandContext } from "../extensibility/hooks/types";
+import type { SessionTransitionKind } from "../extensibility/shared-events";
 import type { Skill, SkillWarning } from "../extensibility/skills";
 import { expandSlashCommand, type FileSlashCommand } from "../extensibility/slash-commands";
 import { GoalRuntime } from "../goals/runtime";
@@ -325,6 +326,24 @@ import { TtsrCoordinator, type TtsrCoordinatorHost } from "./ttsr-coordinator";
 
 const PLAN_MODE_REMINDER_MAX = 3;
 
+interface SessionTransitionState {
+	transitionId: string;
+	committed: boolean;
+}
+
+interface TreeNavigationResult {
+	editorText?: string;
+	cancelled: boolean;
+	aborted?: boolean;
+	summaryEntry?: BranchSummaryEntry;
+	/** Raw session context built during navigation — pass to renderInitialMessages to skip a second O(N) walk. */
+	sessionContext?: SessionContext;
+	/**
+	 * Set when an interactive ask re-answer probe needs the caller to reopen the
+	 * picker before a later call performs the leaf transition.
+	 */
+	reopenAsk?: { toolCallId: string; questions: AskToolInput["questions"] };
+}
 /** Internal marker for hook messages queued through the agent loop */
 // ============================================================================
 // Constants
@@ -5895,12 +5914,17 @@ export class AgentSession {
 	 */
 	async newSession(options?: NewSessionOptions): Promise<boolean> {
 		this.#assertVibeSessionTransitionAllowed("start a new session");
+		return this.#runSessionTransition("switch", transition => this.#newSession(options, transition));
+	}
+
+	async #newSession(options: NewSessionOptions | undefined, transition: SessionTransitionState): Promise<boolean> {
 		const previousSessionFile = this.sessionFile;
 
 		// Emit session_before_switch event with reason "new" (can be cancelled)
 		if (this.#extensionRunner?.hasHandlers("session_before_switch")) {
 			const result = (await this.#extensionRunner.emit({
 				type: "session_before_switch",
+				transitionId: transition.transitionId,
 				reason: "new",
 			})) as SessionBeforeSwitchResult | undefined;
 
@@ -5937,6 +5961,7 @@ export class AgentSession {
 				...options,
 				additionalDirectories: this.settings.get("workspace.additionalDirectories"),
 			});
+			transition.committed = true;
 			this.#bash.markSessionTransition(bashTransition);
 			sessionTransitioned = true;
 		} finally {
@@ -5994,12 +6019,17 @@ export class AgentSession {
 	 */
 	async fork(): Promise<boolean> {
 		this.#assertVibeSessionTransitionAllowed("fork the session");
+		return this.#runSessionTransition("switch", transition => this.#fork(transition));
+	}
+
+	async #fork(transition: SessionTransitionState): Promise<boolean> {
 		const previousSessionFile = this.sessionFile;
 
 		// Emit session_before_switch event with reason "fork" (can be cancelled)
 		if (this.#extensionRunner?.hasHandlers("session_before_switch")) {
 			const result = (await this.#extensionRunner.emit({
 				type: "session_before_switch",
+				transitionId: transition.transitionId,
 				reason: "fork",
 			})) as SessionBeforeSwitchResult | undefined;
 
@@ -6025,6 +6055,7 @@ export class AgentSession {
 			this.#bash.finishSessionTransition(bashTransition, false);
 			return false;
 		}
+		transition.committed = true;
 		this.#bash.markSessionTransition(bashTransition);
 		this.#bash.finishSessionTransition(bashTransition, true);
 
@@ -6864,6 +6895,32 @@ export class AgentSession {
 	// Session Management
 	// =========================================================================
 
+	async #runSessionTransition<T>(
+		kind: SessionTransitionKind,
+		operation: (transition: SessionTransitionState) => Promise<T>,
+	): Promise<T> {
+		const transition: SessionTransitionState = {
+			transitionId: crypto.randomUUID(),
+			committed: false,
+		};
+		try {
+			return await operation(transition);
+		} finally {
+			await this.#finishSessionTransition(kind, transition);
+		}
+	}
+
+	async #finishSessionTransition(kind: SessionTransitionKind, transition: SessionTransitionState): Promise<void> {
+		if (this.#extensionRunner?.hasHandlers("session_transition_end")) {
+			await this.#extensionRunner.emit({
+				type: "session_transition_end",
+				transitionId: transition.transitionId,
+				kind,
+				committed: transition.committed,
+			});
+		}
+	}
+
 	/**
 	 * Reload the current session from disk.
 	 *
@@ -6883,6 +6940,10 @@ export class AgentSession {
 	 * @returns true if switch completed, false if cancelled by hook
 	 */
 	async switchSession(sessionPath: string): Promise<boolean> {
+		return this.#runSessionTransition("switch", transition => this.#switchSession(sessionPath, transition));
+	}
+
+	async #switchSession(sessionPath: string, transition: SessionTransitionState): Promise<boolean> {
 		const previousSessionFile = this.sessionManager.getSessionFile();
 		const switchingToDifferentSession = previousSessionFile
 			? path.resolve(previousSessionFile) !== path.resolve(sessionPath)
@@ -6891,6 +6952,7 @@ export class AgentSession {
 		if (this.#extensionRunner?.hasHandlers("session_before_switch")) {
 			const result = (await this.#extensionRunner.emit({
 				type: "session_before_switch",
+				transitionId: transition.transitionId,
 				reason: "resume",
 				targetSessionFile: sessionPath,
 			})) as SessionBeforeSwitchResult | undefined;
@@ -6953,6 +7015,7 @@ export class AgentSession {
 
 		try {
 			await this.sessionManager.setSessionFile(sessionPath);
+			transition.committed = true;
 			this.#bash.markSessionTransition(bashTransition);
 			if (switchingToDifferentSession) {
 				this.#freshProviderSessionId = undefined;
@@ -7141,7 +7204,6 @@ export class AgentSession {
 		selectedText: string;
 		cancelled: boolean;
 	}> {
-		const previousSessionFile = this.sessionFile;
 		const selectedEntry = this.sessionManager.getEntry(entryId);
 
 		if (selectedEntry?.type !== "message" || selectedEntry.message.role !== "user") {
@@ -7149,13 +7211,25 @@ export class AgentSession {
 		}
 
 		const selectedText = this.#extractUserMessageText(selectedEntry.message.content);
+		return this.#runSessionTransition("branch", transition =>
+			this.#branch(entryId, selectedEntry.parentId, selectedText, transition),
+		);
+	}
 
+	async #branch(
+		entryId: string,
+		selectedParentId: string | null,
+		selectedText: string,
+		transition: SessionTransitionState,
+	): Promise<{ selectedText: string; cancelled: boolean }> {
+		const previousSessionFile = this.sessionFile;
 		let skipConversationRestore = false;
 
 		// Emit session_before_branch event (can be cancelled)
 		if (this.#extensionRunner?.hasHandlers("session_before_branch")) {
 			const result = (await this.#extensionRunner.emit({
 				type: "session_before_branch",
+				transitionId: transition.transitionId,
 				entryId,
 			})) as SessionBeforeBranchResult | undefined;
 
@@ -7179,11 +7253,12 @@ export class AgentSession {
 
 		let sessionTransitioned = false;
 		try {
-			if (!selectedEntry.parentId) {
+			if (!selectedParentId) {
 				await this.sessionManager.newSession({ parentSession: previousSessionFile });
 			} else {
-				this.sessionManager.createBranchedSession(selectedEntry.parentId);
+				this.sessionManager.createBranchedSession(selectedParentId);
 			}
+			transition.committed = true;
 			this.#bash.markSessionTransition(bashTransition);
 			sessionTransitioned = true;
 		} finally {
@@ -7242,9 +7317,23 @@ export class AgentSession {
 			throw new Error("Cannot branch /btw while session maintenance or user work is still running");
 		}
 
+		return this.#runSessionTransition("branch", transition =>
+			this.#branchFromBtw(question, assistantMessage, previousSessionFile, leafId, transition),
+		);
+	}
+
+	async #branchFromBtw(
+		question: string,
+		assistantMessage: AssistantMessage,
+		previousSessionFile: string | undefined,
+		leafId: string,
+		transition: SessionTransitionState,
+	): Promise<{ cancelled: boolean; sessionFile: string | undefined }> {
+
 		if (this.#extensionRunner?.hasHandlers("session_before_branch")) {
 			const result = (await this.#extensionRunner.emit({
 				type: "session_before_branch",
+				transitionId: transition.transitionId,
 				entryId: leafId,
 			})) as SessionBeforeBranchResult | undefined;
 
@@ -7281,6 +7370,7 @@ export class AgentSession {
 		let sessionTransitioned = false;
 		try {
 			this.sessionManager.createBranchedSession(leafId);
+			transition.committed = true;
 			this.#bash.markSessionTransition(bashTransition);
 			sessionTransitioned = true;
 		} finally {
@@ -7357,23 +7447,7 @@ export class AgentSession {
 			 */
 			reanswerAskResult?: AgentToolResult<AskToolDetails>;
 		} = {},
-	): Promise<{
-		editorText?: string;
-		cancelled: boolean;
-		aborted?: boolean;
-		summaryEntry?: BranchSummaryEntry;
-		/** Raw session context built during navigation — pass to renderInitialMessages to skip a second O(N) walk. */
-		sessionContext?: SessionContext;
-		/**
-		 * Set when `targetId` is an `ask` toolResult, `options.allowAskReopen`
-		 * was set, and `options.reanswerAskResult` was not supplied: nothing was
-		 * mutated. The caller must re-open the ask picker with these
-		 * `questions`, then call `navigateTree(targetId, { ...options,
-		 * reanswerAskResult })` with the produced result to actually branch
-		 * (issue #5642).
-		 */
-		reopenAsk?: { toolCallId: string; questions: AskToolInput["questions"] };
-	}> {
+	): Promise<TreeNavigationResult> {
 		await this.#bash.flushPending();
 		const oldLeafId = this.sessionManager.getLeafId();
 
@@ -7454,6 +7528,34 @@ export class AgentSession {
 			userWantsSummary: options.summarize ?? false,
 		};
 
+		return this.#runSessionTransition("tree", transition =>
+			this.#navigateTree(
+				targetId,
+				options,
+				oldLeafId,
+				targetEntry,
+				entriesToSummarize,
+				preparation,
+				transition,
+			),
+		);
+	}
+
+	async #navigateTree(
+		targetId: string,
+		options: {
+			summarize?: boolean;
+			customInstructions?: string;
+			allowAskReopen?: boolean;
+			reanswerAskResult?: AgentToolResult<AskToolDetails>;
+		},
+		oldLeafId: string | null,
+		targetEntry: SessionEntry,
+		entriesToSummarize: SessionEntry[],
+		preparation: TreePreparation,
+		transition: SessionTransitionState,
+	): Promise<TreeNavigationResult> {
+
 		// Set up abort controller for summarization
 		this.#branchSummaryAbortController = new AbortController();
 		let hookSummary: { summary: string; details?: unknown } | undefined;
@@ -7463,6 +7565,7 @@ export class AgentSession {
 		if (this.#extensionRunner?.hasHandlers("session_before_tree")) {
 			const result = (await this.#extensionRunner.emit({
 				type: "session_before_tree",
+				transitionId: transition.transitionId,
 				preparation,
 				signal: this.#branchSummaryAbortController.signal,
 			})) as SessionBeforeTreeResult | undefined;
@@ -7559,6 +7662,7 @@ export class AgentSession {
 				timestamp: Date.now(),
 			};
 			newLeafId = this.sessionManager.appendMessageToBranch(toolResultMessage, targetEntry.parentId);
+			transition.committed = true;
 		} else {
 			// Non-user message (or a user-invoked skill-prompt injection): land the
 			// leaf on the selected node so it stays on the active branch. Skill
@@ -7581,11 +7685,14 @@ export class AgentSession {
 					summaryDetails,
 					fromExtension,
 				);
+				transition.committed = true;
 				summaryEntry = this.sessionManager.getEntry(summaryId) as BranchSummaryEntry;
 			} else if (newLeafId === null) {
 				this.sessionManager.resetLeaf();
+				transition.committed = true;
 			} else {
 				this.sessionManager.branch(newLeafId);
+				transition.committed = true;
 			}
 			this.#bash.markSessionTransition(bashTransition);
 			branchTransitioned = true;

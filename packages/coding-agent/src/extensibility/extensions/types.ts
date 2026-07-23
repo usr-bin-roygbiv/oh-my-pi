@@ -93,6 +93,7 @@ import type {
 	SessionStopEventResult,
 	SessionSwitchEvent,
 	SessionTreeEvent,
+	SessionTransitionEndEvent,
 	TodoReminderEvent,
 	ToolCallEventResult,
 	ToolResultEventResult,
@@ -614,6 +615,8 @@ export type {
 	SessionStartEvent,
 	SessionSwitchEvent,
 	SessionTreeEvent,
+	SessionTransitionEndEvent,
+	SessionTransitionKind,
 	TreePreparation,
 } from "../shared-events";
 
@@ -1103,6 +1106,7 @@ export interface ExtensionAPI {
 	on(event: "session_shutdown", handler: ExtensionHandler<SessionShutdownEvent>): void;
 	on(event: "session_before_tree", handler: ExtensionHandler<SessionBeforeTreeEvent, SessionBeforeTreeResult>): void;
 	on(event: "session_tree", handler: ExtensionHandler<SessionTreeEvent>): void;
+	on(event: "session_transition_end", handler: ExtensionHandler<SessionTransitionEndEvent>): void;
 	on(event: "context", handler: ExtensionHandler<ContextEvent, ContextEventResult>): void;
 	on(
 		event: "before_provider_request",
