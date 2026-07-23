@@ -1352,22 +1352,34 @@ export async function push(cwd: string, options: PushOptions = {}): Promise<void
 	// branch — rejected refs ("permission denied") on remotes the user
 	// cannot tag (e.g. PR-head forks), failing the call after the branch
 	// itself already updated. Tool pushes push exactly the named refspec.
-	const args: string[] = [];
+	const configArgs: string[] = [];
 	let remote = options.remote;
 	if (options.verifiedRemoteUrl !== undefined) {
-		// An explicit pushurl disables url.*.pushInsteadOf for this command.
-		// A unique command-scoped remote also prevents repository config from
-		// supplying an additional destination under the same remote name.
+		// An explicit pushurl disables url.*.pushInsteadOf for this command. The
+		// exact self insteadOf rule prevents a broader ordinary insteadOf from
+		// rewriting that pushurl. A unique command-scoped remote prevents local
+		// config from supplying an additional destination under the same name.
 		const verifiedRemote = `omp-verified-push-${crypto.randomUUID()}`;
-		args.push(
+		configArgs.push(
 			"-c",
 			`remote.${verifiedRemote}.url=${options.verifiedRemoteUrl}`,
 			"-c",
 			`remote.${verifiedRemote}.pushurl=${options.verifiedRemoteUrl}`,
+			"-c",
+			`url.${options.verifiedRemoteUrl}.insteadOf=${options.verifiedRemoteUrl}`,
 		);
+		const resolvedPushUrl = trimScalar(
+			await runText(cwd, [...configArgs, "remote", "get-url", "--push", verifiedRemote], {
+				readOnly: true,
+				signal: options.signal,
+			}),
+		);
+		if (resolvedPushUrl !== options.verifiedRemoteUrl) {
+			throw new ToolError("Git configuration rewrote the verified push destination.");
+		}
 		remote = verifiedRemote;
 	}
-	args.push("push", "--no-follow-tags");
+	const args = [...configArgs, "push", "--no-follow-tags"];
 	if (typeof options.forceWithLease === "string") {
 		args.push(`--force-with-lease=${options.forceWithLease}`);
 	} else if (options.forceWithLease) {
