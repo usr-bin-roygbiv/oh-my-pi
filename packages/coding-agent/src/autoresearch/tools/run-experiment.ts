@@ -10,10 +10,7 @@ import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, TailBuffer, truncateTail } from "
 import { replaceTabs, shortenPath } from "../../tools/render-utils";
 import { throwIfAborted } from "../../tools/tool-errors";
 import * as git from "../../utils/git";
-import {
-	CONTRIBUTION_HARNESS_SHA256_ASI_KEY,
-	CONTRIBUTION_WORKTREE_TREE_ASI_KEY,
-} from "../contribution";
+import { CONTRIBUTION_HARNESS_SHA256_ASI_KEY, CONTRIBUTION_WORKTREE_TREE_ASI_KEY } from "../contribution";
 import { parseWorkDirDirtyPaths } from "../git";
 import {
 	EXPERIMENT_MAX_BYTES,

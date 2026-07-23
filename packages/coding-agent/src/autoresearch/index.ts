@@ -1040,279 +1040,286 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 						ctx.ui.notify("Contribution review authorization changed while active mutations settled.", "error");
 						return;
 					}
-				const contribution = runtime.contribution;
-				const storage = await openAutoresearchStorageIfExists(ctx.cwd);
-				if (!storage || contribution.sessionId === null) {
-					ctx.ui.notify("Contribution review requires an initialized experiment session.", "error");
-					return;
-				}
-				const session = storage.getSessionById(contribution.sessionId);
-				if (!session || session.branch !== contribution.branch) {
-					ctx.ui.notify("The recorded contribution experiment no longer matches its dedicated branch.", "error");
-					return;
-				}
-				if (storage.getPendingRun(session.id)) {
-					ctx.ui.notify("Contribution review requires every pending experiment to be logged first.", "error");
-					return;
-				}
-				runtime.state = buildExperimentState(session, storage.listLoggedRuns(session.id));
-				let currentBranch: string | null;
-				let currentHead: string | null;
-				let statusOutput: string;
-				try {
-					[currentBranch, currentHead, statusOutput] = await Promise.all([
-						git.branch.current(ctx.cwd),
-						git.head.sha(ctx.cwd),
-						git.status(ctx.cwd, { porcelainV1: true, untrackedFiles: "all", z: true }),
-					]);
-				} catch (error) {
-					ctx.ui.notify(`Contribution review failed: ${describeContributionError(error)}`, "error");
-					return;
-				}
-				if (currentBranch !== contribution.branch) {
-					ctx.ui.notify("Review requires the recorded dedicated contribution branch.", "error");
-					return;
-				}
-				if (statusOutput.length > 0) {
-					ctx.ui.notify("Review requires a completely clean contribution worktree.", "error");
-					return;
-				}
-				if (!currentHead) {
-					ctx.ui.notify("Unable to read the contribution candidate HEAD.", "error");
-					return;
-				}
-				try {
-					if (!(await git.isAncestor(ctx.cwd, contribution.baseProof.baseSha, currentHead))) {
-						throw new ContributionError(
-							"candidate_not_descendant",
-							"The contribution candidate does not descend from the frozen official base.",
+					const contribution = runtime.contribution;
+					const storage = await openAutoresearchStorageIfExists(ctx.cwd);
+					if (!storage || contribution.sessionId === null) {
+						ctx.ui.notify("Contribution review requires an initialized experiment session.", "error");
+						return;
+					}
+					const session = storage.getSessionById(contribution.sessionId);
+					if (!session || session.branch !== contribution.branch) {
+						ctx.ui.notify(
+							"The recorded contribution experiment no longer matches its dedicated branch.",
+							"error",
 						);
+						return;
 					}
-				} catch (error) {
-					ctx.ui.notify(`Contribution review failed: ${describeContributionError(error)}`, "error");
-					return;
-				}
-				const candidateResult = keptResultAtHead(runtime.state.results, runtime.state.currentSegment, currentHead);
-				if (!candidateResult) {
-					ctx.ui.notify(
-						"Contribution review requires the current HEAD to be an unflagged kept result in the current segment.",
-						"error",
-					);
-					return;
-				}
-				const candidateRun =
-					candidateResult.runNumber === null ? null : storage.getRunById(candidateResult.runNumber);
-				if (!hasExecutableContributionTddProof(session, candidateRun, storage.listLoggedRuns(session.id))) {
-					ctx.ui.notify(
-						"Contribution review requires executable TDD proof: an earlier unflagged failing run and the kept passing candidate must use the same fixed harness in the current segment.",
-						"error",
-					);
-					return;
-				}
-				const scenario =
-					typeof candidateResult.asi?.hypothesis === "string"
-						? candidateResult.asi.hypothesis.trim().replace(/\s+/g, " ").slice(0, 500)
-						: "";
-				const result = candidateResult.description.trim().replace(/\s+/g, " ").slice(0, 500);
-				const candidate: ContributionCandidate = {
-					status: "keep",
-					flagged: candidateResult.flagged,
-					segment: candidateResult.segment,
-					runNumber: candidateResult.runNumber,
-					commit: currentHead,
-					description: result,
-					scenario,
-					metric: candidateResult.metric,
-					metricName: runtime.state.metricName.trim().replace(/\s+/g, " ").slice(0, 80) || "metric",
-					metricUnit: runtime.state.metricUnit.trim().replace(/\s+/g, " ").slice(0, 20),
-				};
-				let reviewPushRemoteUrl: string;
-				try {
-					const [reviewRemoteUrl, pushRemoteUrl] = await Promise.all([
-						git.remote.url(ctx.cwd, contribution.remoteName),
-						git.remote.pushUrl(ctx.cwd, contribution.remoteName),
-					]);
-					if (reviewRemoteUrl !== contribution.remoteUrl || pushRemoteUrl === undefined) {
-						throw new ContributionError(
-							"remote_changed",
-							"The confirmed fork destination changed before review.",
-						);
+					if (storage.getPendingRun(session.id)) {
+						ctx.ui.notify("Contribution review requires every pending experiment to be logged first.", "error");
+						return;
 					}
-					const reviewRemote = validateContributionForkRemote(reviewRemoteUrl);
-					const pushRemote = validateContributionForkRemote(pushRemoteUrl);
-					if (pushRemote.slug !== reviewRemote.slug) {
-						throw new ContributionError(
-							"remote_changed",
-							"The push-effective destination differs from the confirmed fork.",
-						);
-					}
-					await verifyContributionFork(ctx.cwd, pushRemote);
-					reviewPushRemoteUrl = pushRemoteUrl;
-				} catch (error) {
-					ctx.ui.notify(`Contribution review failed: ${describeContributionError(error)}`, "error");
-					return;
-				}
-				const remote = validateContributionForkRemote(contribution.remoteUrl);
-				const approvedDraft = buildContributionPrDraft(
-					contribution.goal,
-					candidate,
-					remote,
-					contribution.branch,
-					contribution.baseProof,
-				);
-				const reviewAuthorization = contribution.authorization;
-				const reviewBranch = contribution.branch;
-				const reviewSessionId = contribution.sessionId;
-				const assertContributionIdentity = (): void => {
-					const currentRuntime = getRuntime(ctx);
-					const current = currentRuntime.contribution;
-					if (
-						getSessionKey(ctx) !== reviewSessionKey ||
-						currentRuntime !== runtime ||
-						current.status !== "running" ||
-						current.authorization !== reviewAuthorization ||
-						current.branch !== reviewBranch ||
-						current.sessionId !== reviewSessionId
-					) {
-						throw new Error("Contribution publication authorization changed.");
-					}
-				};
-				const approved = await ctx.ui.confirm(
-					"Push exact contribution candidate for review?",
-					`${approvedDraft.body}\n\nThis approval pushes only the verified candidate ${currentHead} with \`${currentHead}:refs/heads/${contribution.branch}\` through the confirmed fork remote ${contribution.remoteName}. Its verified push-effective destination is ${reviewPushRemoteUrl}, and the candidate branch must be absent. A command-scoped explicit pushurl prevents Git URL rewrite rules from changing that destination. This does not create or approve a pull request. The SHA-bound human sentence remains empty and must be written by the human reviewer.`,
-				);
-				if (!approved) return;
-				try {
-					assertContributionIdentity();
-				} catch (error) {
-					ctx.ui.notify(`Contribution review failed: ${describeContributionError(error)}`, "error");
-					return;
-				}
-				const confirmedSession = storage.getSessionById(session.id);
-				const confirmedCandidateRun = candidateRun === null ? null : storage.getRunById(candidateRun.id);
-				if (
-					!confirmedSession ||
-					confirmedSession.branch !== contribution.branch ||
-					confirmedSession.currentSegment !== session.currentSegment ||
-					confirmedCandidateRun?.commitHash !== currentHead ||
-					!hasExecutableContributionTddProof(
-						confirmedSession,
-						confirmedCandidateRun,
-						storage.listLoggedRuns(confirmedSession.id),
-					)
-				) {
-					ctx.ui.notify("Contribution review proof changed after approval; publication cancelled.", "error");
-					return;
-				}
-				if (contributionPublicationOperations.has(reviewSessionKey)) {
-					ctx.ui.notify("A contribution publication is already active for this session.", "error");
-					return;
-				}
-				const publicationOperation: ContributionPublicationOperation = {
-					controller: new AbortController(),
-					phase: "pre-push",
-					settlement: Promise.withResolvers<void>(),
-				};
-				contributionPublicationOperations.set(reviewSessionKey, publicationOperation);
-				const authorizePublication = (): void => {
-					throwIfAborted(publicationOperation.controller.signal);
-					if (contributionPublicationOperations.get(reviewSessionKey) !== publicationOperation) {
-						throw new Error("Contribution publication authorization changed.");
-					}
-					assertContributionIdentity();
-				};
-				const authorizePush = async (publication: PublishedContributionCandidate): Promise<void> => {
-					authorizePublication();
-					const intent = createPublicationEntryData(
-						"intent",
-						contribution,
-						reviewPushRemoteUrl,
-						currentHead,
-						publication,
-					);
-					api.appendEntry(CONTRIBUTION_PUBLICATION_ENTRY, intent);
-					await (ctx.sessionManager as SessionManager).flush();
-					authorizePublication();
-					ctx.ui.notify(
-						renderPublicationHandoff("Contribution publication plan (push outcome pending):", intent),
-						"info",
-					);
-					publicationOperation.phase = "pushing";
-				};
-
-				try {
-					let publication: PublishedContributionCandidate;
+					runtime.state = buildExperimentState(session, storage.listLoggedRuns(session.id));
+					let currentBranch: string | null;
+					let currentHead: string | null;
+					let statusOutput: string;
 					try {
-						publication = await publishContributionCandidate({
-							cwd: ctx.cwd,
-							remoteName: contribution.remoteName,
-							confirmedRemoteUrl: contribution.remoteUrl,
-							confirmedPushRemoteUrl: reviewPushRemoteUrl,
-							branchName: contribution.branch,
-							currentBranch,
-							currentHead,
-							baseProof: contribution.baseProof,
-							worktreeClean: statusOutput.length === 0,
-							currentSegment: runtime.state.currentSegment,
-							goal: contribution.goal,
-							candidate,
-							approvedDraft,
-							signal: publicationOperation.controller.signal,
-							authorizePush,
-							git: contributionPublicationGit,
-						});
+						[currentBranch, currentHead, statusOutput] = await Promise.all([
+							git.branch.current(ctx.cwd),
+							git.head.sha(ctx.cwd),
+							git.status(ctx.cwd, { porcelainV1: true, untrackedFiles: "all", z: true }),
+						]);
 					} catch (error) {
 						ctx.ui.notify(`Contribution review failed: ${describeContributionError(error)}`, "error");
 						return;
 					}
-					publicationOperation.phase = "committed";
-					api.appendEntry(
-						CONTRIBUTION_PUBLICATION_ENTRY,
-						createPublicationEntryData("success", contribution, reviewPushRemoteUrl, currentHead, publication),
+					if (currentBranch !== contribution.branch) {
+						ctx.ui.notify("Review requires the recorded dedicated contribution branch.", "error");
+						return;
+					}
+					if (statusOutput.length > 0) {
+						ctx.ui.notify("Review requires a completely clean contribution worktree.", "error");
+						return;
+					}
+					if (!currentHead) {
+						ctx.ui.notify("Unable to read the contribution candidate HEAD.", "error");
+						return;
+					}
+					try {
+						if (!(await git.isAncestor(ctx.cwd, contribution.baseProof.baseSha, currentHead))) {
+							throw new ContributionError(
+								"candidate_not_descendant",
+								"The contribution candidate does not descend from the frozen official base.",
+							);
+						}
+					} catch (error) {
+						ctx.ui.notify(`Contribution review failed: ${describeContributionError(error)}`, "error");
+						return;
+					}
+					const candidateResult = keptResultAtHead(
+						runtime.state.results,
+						runtime.state.currentSegment,
+						currentHead,
 					);
-					runtime.contribution = {
-						...contribution,
-						status: "review",
-						candidateHead: currentHead,
-						publication,
-					};
-					runtime.autoresearchMode = false;
-					runtime.autoResumeArmed = false;
-
-					const cleanupWarnings: string[] = [];
-					try {
-						await closeContributionSession(ctx, contribution);
-					} catch (error) {
-						cleanupWarnings.push(`session close: ${describeContributionError(error)}`);
-					}
-					try {
-						const experimentTools = new Set(EXPERIMENT_TOOL_NAMES);
-						await api.setActiveTools(api.getActiveTools().filter(name => !experimentTools.has(name)));
-					} catch (error) {
-						cleanupWarnings.push(`tool deactivation: ${describeContributionError(error)}`);
-					}
-					try {
-						dashboard.updateWidget(ctx, runtime);
-					} catch (error) {
-						cleanupWarnings.push(`dashboard update: ${describeContributionError(error)}`);
-					}
-					if (cleanupWarnings.length > 0) {
+					if (!candidateResult) {
 						ctx.ui.notify(
-							`Contribution candidate was pushed, but cleanup needs attention: ${cleanupWarnings.join("; ")}`,
-							"warning",
+							"Contribution review requires the current HEAD to be an unflagged kept result in the current segment.",
+							"error",
 						);
+						return;
 					}
-					ctx.ui.notify(
-						`Immutable SHA review: ${publication.reviewUrl}\nMutable branch compare: ${publication.compareUrl}\n\nPR draft (human sentence intentionally empty):\n${publication.prDraft.title}\n\n${publication.prDraft.body}`,
-						"info",
+					const candidateRun =
+						candidateResult.runNumber === null ? null : storage.getRunById(candidateResult.runNumber);
+					if (!hasExecutableContributionTddProof(session, candidateRun, storage.listLoggedRuns(session.id))) {
+						ctx.ui.notify(
+							"Contribution review requires executable TDD proof: an earlier unflagged failing run and the kept passing candidate must use the same fixed harness in the current segment.",
+							"error",
+						);
+						return;
+					}
+					const scenario =
+						typeof candidateResult.asi?.hypothesis === "string"
+							? candidateResult.asi.hypothesis.trim().replace(/\s+/g, " ").slice(0, 500)
+							: "";
+					const result = candidateResult.description.trim().replace(/\s+/g, " ").slice(0, 500);
+					const candidate: ContributionCandidate = {
+						status: "keep",
+						flagged: candidateResult.flagged,
+						segment: candidateResult.segment,
+						runNumber: candidateResult.runNumber,
+						commit: currentHead,
+						description: result,
+						scenario,
+						metric: candidateResult.metric,
+						metricName: runtime.state.metricName.trim().replace(/\s+/g, " ").slice(0, 80) || "metric",
+						metricUnit: runtime.state.metricUnit.trim().replace(/\s+/g, " ").slice(0, 20),
+					};
+					let reviewPushRemoteUrl: string;
+					try {
+						const [reviewRemoteUrl, pushRemoteUrl] = await Promise.all([
+							git.remote.url(ctx.cwd, contribution.remoteName),
+							git.remote.pushUrl(ctx.cwd, contribution.remoteName),
+						]);
+						if (reviewRemoteUrl !== contribution.remoteUrl || pushRemoteUrl === undefined) {
+							throw new ContributionError(
+								"remote_changed",
+								"The confirmed fork destination changed before review.",
+							);
+						}
+						const reviewRemote = validateContributionForkRemote(reviewRemoteUrl);
+						const pushRemote = validateContributionForkRemote(pushRemoteUrl);
+						if (pushRemote.slug !== reviewRemote.slug) {
+							throw new ContributionError(
+								"remote_changed",
+								"The push-effective destination differs from the confirmed fork.",
+							);
+						}
+						await verifyContributionFork(ctx.cwd, pushRemote);
+						reviewPushRemoteUrl = pushRemoteUrl;
+					} catch (error) {
+						ctx.ui.notify(`Contribution review failed: ${describeContributionError(error)}`, "error");
+						return;
+					}
+					const remote = validateContributionForkRemote(contribution.remoteUrl);
+					const approvedDraft = buildContributionPrDraft(
+						contribution.goal,
+						candidate,
+						remote,
+						contribution.branch,
+						contribution.baseProof,
 					);
-				} finally {
-					if (contributionPublicationOperations.get(reviewSessionKey) === publicationOperation) {
-						contributionPublicationOperations.delete(reviewSessionKey);
+					const reviewAuthorization = contribution.authorization;
+					const reviewBranch = contribution.branch;
+					const reviewSessionId = contribution.sessionId;
+					const assertContributionIdentity = (): void => {
+						const currentRuntime = getRuntime(ctx);
+						const current = currentRuntime.contribution;
+						if (
+							getSessionKey(ctx) !== reviewSessionKey ||
+							currentRuntime !== runtime ||
+							current.status !== "running" ||
+							current.authorization !== reviewAuthorization ||
+							current.branch !== reviewBranch ||
+							current.sessionId !== reviewSessionId
+						) {
+							throw new Error("Contribution publication authorization changed.");
+						}
+					};
+					const approved = await ctx.ui.confirm(
+						"Push exact contribution candidate for review?",
+						`${approvedDraft.body}\n\nThis approval pushes only the verified candidate ${currentHead} with \`${currentHead}:refs/heads/${contribution.branch}\` through the confirmed fork remote ${contribution.remoteName}. Its verified push-effective destination is ${reviewPushRemoteUrl}, and the candidate branch must be absent. A command-scoped explicit pushurl prevents Git URL rewrite rules from changing that destination. This does not create or approve a pull request. The SHA-bound human sentence remains empty and must be written by the human reviewer.`,
+					);
+					if (!approved) return;
+					try {
+						assertContributionIdentity();
+					} catch (error) {
+						ctx.ui.notify(`Contribution review failed: ${describeContributionError(error)}`, "error");
+						return;
 					}
-					publicationOperation.settlement.resolve();
-				}
-				return;
+					const confirmedSession = storage.getSessionById(session.id);
+					const confirmedCandidateRun = candidateRun === null ? null : storage.getRunById(candidateRun.id);
+					if (
+						!confirmedSession ||
+						confirmedSession.branch !== contribution.branch ||
+						confirmedSession.currentSegment !== session.currentSegment ||
+						confirmedCandidateRun?.commitHash !== currentHead ||
+						!hasExecutableContributionTddProof(
+							confirmedSession,
+							confirmedCandidateRun,
+							storage.listLoggedRuns(confirmedSession.id),
+						)
+					) {
+						ctx.ui.notify("Contribution review proof changed after approval; publication cancelled.", "error");
+						return;
+					}
+					if (contributionPublicationOperations.has(reviewSessionKey)) {
+						ctx.ui.notify("A contribution publication is already active for this session.", "error");
+						return;
+					}
+					const publicationOperation: ContributionPublicationOperation = {
+						controller: new AbortController(),
+						phase: "pre-push",
+						settlement: Promise.withResolvers<void>(),
+					};
+					contributionPublicationOperations.set(reviewSessionKey, publicationOperation);
+					const authorizePublication = (): void => {
+						throwIfAborted(publicationOperation.controller.signal);
+						if (contributionPublicationOperations.get(reviewSessionKey) !== publicationOperation) {
+							throw new Error("Contribution publication authorization changed.");
+						}
+						assertContributionIdentity();
+					};
+					const authorizePush = async (publication: PublishedContributionCandidate): Promise<void> => {
+						authorizePublication();
+						const intent = createPublicationEntryData(
+							"intent",
+							contribution,
+							reviewPushRemoteUrl,
+							currentHead,
+							publication,
+						);
+						api.appendEntry(CONTRIBUTION_PUBLICATION_ENTRY, intent);
+						await (ctx.sessionManager as SessionManager).flush();
+						authorizePublication();
+						ctx.ui.notify(
+							renderPublicationHandoff("Contribution publication plan (push outcome pending):", intent),
+							"info",
+						);
+						publicationOperation.phase = "pushing";
+					};
+
+					try {
+						let publication: PublishedContributionCandidate;
+						try {
+							publication = await publishContributionCandidate({
+								cwd: ctx.cwd,
+								remoteName: contribution.remoteName,
+								confirmedRemoteUrl: contribution.remoteUrl,
+								confirmedPushRemoteUrl: reviewPushRemoteUrl,
+								branchName: contribution.branch,
+								currentBranch,
+								currentHead,
+								baseProof: contribution.baseProof,
+								worktreeClean: statusOutput.length === 0,
+								currentSegment: runtime.state.currentSegment,
+								goal: contribution.goal,
+								candidate,
+								approvedDraft,
+								signal: publicationOperation.controller.signal,
+								authorizePush,
+								git: contributionPublicationGit,
+							});
+						} catch (error) {
+							ctx.ui.notify(`Contribution review failed: ${describeContributionError(error)}`, "error");
+							return;
+						}
+						publicationOperation.phase = "committed";
+						api.appendEntry(
+							CONTRIBUTION_PUBLICATION_ENTRY,
+							createPublicationEntryData("success", contribution, reviewPushRemoteUrl, currentHead, publication),
+						);
+						runtime.contribution = {
+							...contribution,
+							status: "review",
+							candidateHead: currentHead,
+							publication,
+						};
+						runtime.autoresearchMode = false;
+						runtime.autoResumeArmed = false;
+
+						const cleanupWarnings: string[] = [];
+						try {
+							await closeContributionSession(ctx, contribution);
+						} catch (error) {
+							cleanupWarnings.push(`session close: ${describeContributionError(error)}`);
+						}
+						try {
+							const experimentTools = new Set(EXPERIMENT_TOOL_NAMES);
+							await api.setActiveTools(api.getActiveTools().filter(name => !experimentTools.has(name)));
+						} catch (error) {
+							cleanupWarnings.push(`tool deactivation: ${describeContributionError(error)}`);
+						}
+						try {
+							dashboard.updateWidget(ctx, runtime);
+						} catch (error) {
+							cleanupWarnings.push(`dashboard update: ${describeContributionError(error)}`);
+						}
+						if (cleanupWarnings.length > 0) {
+							ctx.ui.notify(
+								`Contribution candidate was pushed, but cleanup needs attention: ${cleanupWarnings.join("; ")}`,
+								"warning",
+							);
+						}
+						ctx.ui.notify(
+							`Immutable SHA review: ${publication.reviewUrl}\nMutable branch compare: ${publication.compareUrl}\n\nPR draft (human sentence intentionally empty):\n${publication.prDraft.title}\n\n${publication.prDraft.body}`,
+							"info",
+						);
+					} finally {
+						if (contributionPublicationOperations.get(reviewSessionKey) === publicationOperation) {
+							contributionPublicationOperations.delete(reviewSessionKey);
+						}
+						publicationOperation.settlement.resolve();
+					}
+					return;
 				} finally {
 					releaseReviewAdmission();
 				}
@@ -1327,7 +1334,10 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 				return;
 			}
 			if (!ctx.sessionManager.getSessionFile()) {
-				ctx.ui.notify("Contribution mode requires a persistent session transcript for publication recovery.", "error");
+				ctx.ui.notify(
+					"Contribution mode requires a persistent session transcript for publication recovery.",
+					"error",
+				);
 				return;
 			}
 			const initialStartSessionKey = getSessionKey(ctx);

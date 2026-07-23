@@ -1511,9 +1511,7 @@ function createIntegrationHarness(cwd: string, options: IntegrationHarnessOption
 	const realWriteWorktreeTree = git.writeWorktreeTree;
 	const realWriteTree = git.writeTree;
 	vi.spyOn(git, "writeWorktreeTree").mockImplementation(async (workDir, signal) =>
-		(await Bun.file(`${workDir}/.git`).exists())
-			? realWriteWorktreeTree(workDir, signal)
-			: CANDIDATE_TREE_SHA,
+		(await Bun.file(`${workDir}/.git`).exists()) ? realWriteWorktreeTree(workDir, signal) : CANDIDATE_TREE_SHA,
 	);
 	vi.spyOn(git, "writeTree").mockImplementation(async (workDir, writeOptions) =>
 		(await Bun.file(`${workDir}/.git`).exists()) ? realWriteTree(workDir, writeOptions) : CANDIDATE_TREE_SHA,
@@ -2460,9 +2458,7 @@ describe("process-local contribution lifecycle", () => {
 			undefined,
 			harness.ctx as ExtensionContext,
 		);
-		const logText = logResult.content
-			.map(part => (part.type === "text" ? part.text : ""))
-			.join("\n");
+		const logText = logResult.content.map(part => (part.type === "text" ? part.text : "")).join("\n");
 
 		expect(logText).toContain("changed after the harness execution");
 		expect((await $`git -C ${cwd.path()} rev-parse HEAD`.quiet()).text().trim()).toBe(baseHead);

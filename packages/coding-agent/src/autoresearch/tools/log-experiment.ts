@@ -8,10 +8,7 @@ import type { Theme } from "../../modes/theme/theme";
 import { replaceTabs, truncateToWidth } from "../../tools/render-utils";
 import { throwIfAborted } from "../../tools/tool-errors";
 import * as git from "../../utils/git";
-import {
-	CONTRIBUTION_HARNESS_SHA256_ASI_KEY,
-	CONTRIBUTION_WORKTREE_TREE_ASI_KEY,
-} from "../contribution";
+import { CONTRIBUTION_HARNESS_SHA256_ASI_KEY, CONTRIBUTION_WORKTREE_TREE_ASI_KEY } from "../contribution";
 import { computeRunModifiedPaths, parseWorkDirDirtyPaths } from "../git";
 import {
 	ensureNumericMetricMap,
@@ -140,7 +137,9 @@ export function createLogExperimentTool(
 							!/^[0-9a-f]{64}$/.test(harnessProof)
 						) {
 							return {
-								content: [{ type: "text", text: "Error: the passing run has no valid contribution worktree proof." }],
+								content: [
+									{ type: "text", text: "Error: the passing run has no valid contribution worktree proof." },
+								],
 							};
 						}
 						const currentTree = await git.writeWorktreeTree(ctx.cwd, mutation.signal);
