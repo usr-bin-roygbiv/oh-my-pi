@@ -1,5 +1,7 @@
 import { Database, type SQLQueryBindings } from "bun:sqlite";
+import { Buffer } from "node:buffer";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { getAutoresearchDbPath, getAutoresearchProjectDir, logger } from "@oh-my-pi/pi-utils";
 import * as git from "../utils/git";
@@ -190,6 +192,7 @@ type RunDbRow = {
 };
 
 const SCHEMA_VERSION = 1;
+const SQLITE_FILE_HEADER = Buffer.from("SQLite format 3\0", "ascii");
 
 const SCHEMA_SQL = `
 PRAGMA journal_mode=WAL;
@@ -557,26 +560,51 @@ export async function hasActiveAutoresearchSession(cwd: string): Promise<boolean
 	if (cached) return cached.getActiveSession() !== null;
 	if (!(await Bun.file(dbPath).exists())) return false;
 
+	const probeDir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-autoresearch-probe-"));
+	const probePath = path.join(probeDir, "state.db");
 	let database: Database | null = null;
 	try {
-		database = new Database(dbPath, { readonly: true, create: false });
-		return database.query<{ active: number }, []>(
-			"SELECT 1 AS active FROM sessions WHERE closed_at IS NULL LIMIT 1",
-		).get() !== null;
+		fs.copyFileSync(dbPath, probePath);
+		const header = Buffer.allocUnsafe(SQLITE_FILE_HEADER.length);
+		const descriptor = fs.openSync(probePath, "r");
+		try {
+			const bytesRead = fs.readSync(descriptor, header, 0, header.length, 0);
+			if (bytesRead !== header.length || !header.equals(SQLITE_FILE_HEADER)) {
+				throw new Error("Existing autoresearch state is not a SQLite database.");
+			}
+		} finally {
+			fs.closeSync(descriptor);
+		}
+		const walPath = `${dbPath}-wal`;
+		if (fs.existsSync(walPath)) fs.copyFileSync(walPath, `${probePath}-wal`);
+		database = new Database(probePath, { readonly: true, create: false });
+		return (
+			database
+				.query<{ active: number }, []>("SELECT 1 AS active FROM sessions WHERE closed_at IS NULL LIMIT 1")
+				.get() !== null
+		);
 	} catch (error) {
 		throw new Error(
 			`Unable to inspect existing autoresearch state without modifying it: ${error instanceof Error ? error.message : String(error)}`,
 			{ cause: error },
 		);
 	} finally {
-		database?.close();
+		try {
+			database?.close();
+		} finally {
+			fs.rmSync(probeDir, { recursive: true, force: true });
+		}
 	}
 }
 
-export async function openAutoresearchStorage(cwd: string): Promise<AutoresearchStorage> {
+export async function openAutoresearchStorage(
+	cwd: string,
+	beforeCreate?: () => void | Promise<void>,
+): Promise<AutoresearchStorage> {
 	const { dbPath, projectDir } = await resolveAutoresearchPaths(cwd);
 	const cached = storageCache.get(dbPath);
 	if (cached) return cached;
+	await beforeCreate?.();
 	fs.mkdirSync(path.dirname(dbPath), { recursive: true });
 	const storage = new AutoresearchStorage(dbPath, projectDir);
 	storageCache.set(dbPath, storage);

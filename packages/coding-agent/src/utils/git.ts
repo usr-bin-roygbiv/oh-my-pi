@@ -1689,6 +1689,20 @@ export const revList = {
 	},
 };
 
+/** Return whether `ancestor` is reachable from `descendant`. */
+export async function isAncestor(
+	cwd: string,
+	ancestor: string,
+	descendant: string,
+	signal?: AbortSignal,
+): Promise<boolean> {
+	ensureAvailable();
+	const result = await git(cwd, ["merge-base", "--is-ancestor", ancestor, descendant], { readOnly: true, signal });
+	if (result.exitCode === 0) return true;
+	if (result.exitCode === 1) return false;
+	throw new GitCommandError(["merge-base", "--is-ancestor", ancestor, descendant], result);
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // API: branch
 // ════════════════════════════════════════════════════════════════════════════

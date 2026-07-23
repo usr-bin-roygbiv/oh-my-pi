@@ -5,9 +5,40 @@ import type { Api, Model } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { createAutoresearchExtension } from "@oh-my-pi/pi-coding-agent/autoresearch";
 import {
+	assertContributionGoalUnchanged,
+	buildContributionCompareUrl,
+	buildContributionPrDraft,
+	buildContributionReviewUrl,
+	CONTRIBUTION_GOAL_MAX_BYTES,
+	CONTRIBUTION_HUMAN_SUMMARY_PLACEHOLDER,
+	type ContributionBaseProof,
+	type ContributionCandidate,
+	type ContributionErrorCode,
+	type ContributionGitHubRequest,
+	type ContributionGitHubRequestSpec,
+	type ContributionGoal,
+	type ContributionPrDraft,
+	type ContributionPreflightGit,
+	type ContributionPublicationGit,
+	canonicalizeGitHubRemote,
+	createContributionBaseProof,
+	fetchOfficialContributionGoal,
+	OFFICIAL_CONTRIBUTION_GOAL_PATH,
+	OFFICIAL_CONTRIBUTION_HOST,
+	OFFICIAL_CONTRIBUTION_OWNER,
+	OFFICIAL_CONTRIBUTION_REF,
+	OFFICIAL_CONTRIBUTION_REPO,
+	OFFICIAL_CONTRIBUTION_REPOSITORY,
+	publishContributionCandidate,
+	validateContributionForkRemote,
+	verifyContributionBase,
+	verifyContributionFork,
+} from "@oh-my-pi/pi-coding-agent/autoresearch/contribution";
+import {
 	closeAllAutoresearchStorages,
 	hasActiveAutoresearchSession,
 	openAutoresearchStorage,
+	type SessionRow,
 } from "@oh-my-pi/pi-coding-agent/autoresearch/storage";
 import type {
 	AgentEndEvent,
@@ -22,33 +53,6 @@ import type {
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import * as git from "@oh-my-pi/pi-coding-agent/utils/git";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import {
-	buildContributionCompareUrl,
-	buildContributionPrDraft,
-	createContributionBaseProof,
-	canonicalizeGitHubRemote,
-	CONTRIBUTION_GOAL_MAX_BYTES,
-	CONTRIBUTION_HUMAN_SUMMARY_PLACEHOLDER,
-	fetchOfficialContributionGoal,
-	OFFICIAL_CONTRIBUTION_GOAL_PATH,
-	OFFICIAL_CONTRIBUTION_HOST,
-	OFFICIAL_CONTRIBUTION_OWNER,
-	OFFICIAL_CONTRIBUTION_REF,
-	OFFICIAL_CONTRIBUTION_REPO,
-	verifyContributionBase,
-	publishContributionCandidate,
-	validateContributionForkRemote,
-	verifyContributionFork,
-	type ContributionBaseProof,
-	type ContributionPreflightGit,
-	type ContributionPrDraft,
-	type ContributionCandidate,
-	type ContributionErrorCode,
-	type ContributionGitHubRequest,
-	type ContributionGitHubRequestSpec,
-	type ContributionGoal,
-	type ContributionPublicationGit,
-} from "@oh-my-pi/pi-coding-agent/autoresearch/contribution";
 
 afterEach(() => {
 	vi.restoreAllMocks();
@@ -117,7 +121,7 @@ function makeGoal(overrides: Partial<ContributionGoal> = {}): ContributionGoal {
 	const content = overrides.content ?? GOAL_CONTENT;
 	return {
 		owner: OFFICIAL_CONTRIBUTION_OWNER,
-		repository: OFFICIAL_CONTRIBUTION_REPO,
+		repository: OFFICIAL_CONTRIBUTION_REPOSITORY,
 		ref: OFFICIAL_CONTRIBUTION_REF,
 		path: OFFICIAL_CONTRIBUTION_GOAL_PATH,
 		commitSha: COMMIT_SHA,
@@ -162,6 +166,7 @@ function makePublicationGit(
 		readBranch: async () => CONTRIBUTION_BRANCH,
 		readHead: async () => CURRENT_HEAD,
 		readStatus: async () => "",
+		isAncestor: async () => true,
 		push: async () => {},
 		...overrides,
 	};
@@ -190,7 +195,7 @@ describe("official contribution goal loading", () => {
 		expect(fixture.calls.every(call => call.jq.trim().length > 0)).toBe(true);
 		expect(goal).toMatchObject({
 			owner: OFFICIAL_CONTRIBUTION_OWNER,
-			repository: OFFICIAL_CONTRIBUTION_REPO,
+			repository: OFFICIAL_CONTRIBUTION_REPOSITORY,
 			ref: OFFICIAL_CONTRIBUTION_REF,
 			path: OFFICIAL_CONTRIBUTION_GOAL_PATH,
 			commitSha: COMMIT_SHA,
@@ -200,6 +205,22 @@ describe("official contribution goal loading", () => {
 		});
 		const expectedDigest = new Bun.CryptoHasher("sha256").update(GOAL_CONTENT).digest("hex");
 		expect(goal.sha256).toBe(expectedDigest);
+	});
+
+	it("requires every approved goal identity and content field to remain exact", () => {
+		const approved = makeGoal();
+		const mismatches: ContributionGoal[] = [
+			makeGoal({ commitSha: "9".repeat(40) }),
+			makeGoal({ blobSha: "8".repeat(40) }),
+			makeGoal({ sha256: "7".repeat(64) }),
+			makeGoal({ title: "Changed title" }),
+			makeGoal({ content: `${GOAL_CONTENT}\nDrifted content.\n` }),
+		];
+		for (const current of mismatches) {
+			expect(() => assertContributionGoalUnchanged(approved, current)).toThrow(
+				expect.objectContaining({ code: "goal_changed" }),
+			);
+		}
 	});
 
 	it("rejects a ref that does not resolve to a commit before requesting a commit", async () => {
@@ -249,6 +270,10 @@ describe("official contribution goal loading", () => {
 
 	it("rejects malformed base64", async () => {
 		const fixture = makeGoalRequest({
+			tree: {
+				truncated: false,
+				entries: [{ path: OFFICIAL_CONTRIBUTION_GOAL_PATH, type: "blob", sha: BLOB_SHA, size: 12 }],
+			},
 			blob: { sha: BLOB_SHA, size: 12, encoding: "base64", content: "%%%not-base64%%%" },
 		});
 		await expectContributionError(
@@ -372,7 +397,6 @@ describe("read-only contribution storage preflight", () => {
 		const before = snapshotStorageArtifacts(dbDir.path());
 		await expect(hasActiveAutoresearchSession(cwd.path())).resolves.toBe(true);
 		expect(snapshotStorageArtifacts(dbDir.path())).toEqual(before);
-		expect(before.some(artifact => artifact.name.endsWith("-wal") || artifact.name.endsWith("-shm"))).toBe(false);
 	});
 
 	it("allows a historical database whose sessions are all closed, still without writes", async () => {
@@ -523,11 +547,16 @@ describe("contribution fork validation and publication", () => {
 		const candidate = makeCandidate();
 		const baseProof = makeBaseProof();
 		const compareUrl = buildContributionCompareUrl(remote, CONTRIBUTION_BRANCH);
+		const reviewUrl = buildContributionReviewUrl(remote, baseProof.baseSha, candidate.commit);
 		const draft = buildContributionPrDraft(goal, candidate, remote, CONTRIBUTION_BRANCH, baseProof);
 
 		expect(compareUrl).toBe(
 			`https://github.com/${OFFICIAL_CONTRIBUTION_OWNER}/${OFFICIAL_CONTRIBUTION_REPO}/compare/main...alice:${encodeURIComponent(CONTRIBUTION_BRANCH)}?expand=1`,
 		);
+		expect(reviewUrl).toBe(
+			`https://github.com/${OFFICIAL_CONTRIBUTION_OWNER}/${OFFICIAL_CONTRIBUTION_REPO}/compare/${baseProof.baseSha}...alice:${candidate.commit}?expand=1`,
+		);
+		expect(reviewUrl).not.toBe(compareUrl);
 		expect(draft).toMatchObject({
 			base: "main",
 			head: `alice:${CONTRIBUTION_BRANCH}`,
@@ -570,6 +599,10 @@ describe("contribution fork validation and publication", () => {
 				calls.push(`read:${cwd}:${remote}`);
 				return FORK_URL;
 			},
+			async isAncestor(cwd, ancestor, descendant) {
+				calls.push(`ancestor:${cwd}:${ancestor}:${descendant}`);
+				return true;
+			},
 			async push(cwd, options) {
 				calls.push("push");
 				pushes.push({
@@ -611,7 +644,11 @@ describe("contribution fork validation and publication", () => {
 			},
 		});
 
-		expect(calls).toEqual(["read:/work/repo:origin", "push"]);
+		expect(calls).toEqual([
+			"read:/work/repo:origin",
+			`ancestor:/work/repo:${COMMIT_SHA}:${CURRENT_HEAD}`,
+			"push",
+		]);
 		expect(requests.map(request => request.endpoint)).toEqual(["/repos/alice/oh-my-pi"]);
 		expect(pushes).toEqual([
 			{
@@ -623,8 +660,44 @@ describe("contribution fork validation and publication", () => {
 		]);
 		expect(published.refspec).toBe(`${CURRENT_HEAD}:refs/heads/${CONTRIBUTION_BRANCH}`);
 		expect(published.compareUrl).toContain("/compare/main...alice:");
+		expect(published.reviewUrl).toBe(
+			`https://github.com/${OFFICIAL_CONTRIBUTION_OWNER}/${OFFICIAL_CONTRIBUTION_REPO}/compare/${COMMIT_SHA}...alice:${CURRENT_HEAD}?expand=1`,
+		);
+		expect(published.reviewUrl).not.toBe(published.compareUrl);
 		expect(published.prDraft.body).toContain(CONTRIBUTION_HUMAN_SUMMARY_PLACEHOLDER);
 		expect(published.prDraft).toEqual(approvedDraft);
+	});
+
+	it("rechecks frozen-base ancestry immediately before push", async () => {
+		const calls: string[] = [];
+		await expectContributionError(
+			publishContributionCandidate({
+				cwd: "/work/repo",
+				remoteName: "origin",
+				confirmedRemoteUrl: FORK_URL,
+				branchName: CONTRIBUTION_BRANCH,
+				currentBranch: CONTRIBUTION_BRANCH,
+				worktreeClean: true,
+				goal: makeGoal(),
+				candidate: makeCandidate(),
+				currentSegment: 2,
+				currentHead: CURRENT_HEAD,
+				baseProof: makeBaseProof(),
+				approvedDraft: makeApprovedDraft(),
+				git: makePublicationGit({
+					isAncestor: async (_cwd, ancestor, descendant) => {
+						calls.push(`ancestor:${ancestor}:${descendant}`);
+						return false;
+					},
+					push: async () => {
+						calls.push("push");
+					},
+				}),
+				request: async () => ({ fork: true, parent: "can1357/oh-my-pi", source: "can1357/oh-my-pi" }),
+			}),
+			"candidate_not_descendant",
+		);
+		expect(calls).toEqual([`ancestor:${COMMIT_SHA}:${CURRENT_HEAD}`]);
 	});
 
 	it("refuses branch, HEAD, or worktree drift after exact draft approval", async () => {
@@ -931,14 +1004,15 @@ interface IntegrationHarnessOptions {
 	setActiveToolsFailureAt?: number;
 	checkoutFailure?: Error;
 	rollbackCheckoutFailure?: Error;
-	onGoalRefRequest?(signal?: AbortSignal): void;
 	branchDeleteFailure?: Error;
+	onGoalRefRequest?(signal?: AbortSignal): void | Promise<void>;
 	statusText?: string;
 	headSha?: string;
 	hasPendingMessages?: boolean;
 	initialTools?: string[];
 	sessionId?: string;
 	refExistsResults?: boolean[];
+	ancestryResults?: boolean[];
 }
 
 interface CapturedNotification {
@@ -978,6 +1052,8 @@ interface IntegrationHarness {
 	setStatusText(value: string): void;
 	setHeadSha(value: string): void;
 	setRefOccupied(value: boolean): void;
+	setNextStatusRequest(callback: () => void | Promise<void>): void;
+	setSessionId(value: string): void;
 	currentBranch(): string;
 	currentModel(): Model<Api> | undefined;
 }
@@ -993,8 +1069,10 @@ function optionLabel(option: string | { label: string }): string {
 }
 
 function defaultGoalVersions(): IntegrationGoalVersion[] {
+	const initial = { commitSha: COMMIT_SHA, treeSha: TREE_SHA, blobSha: BLOB_SHA, content: GOAL_CONTENT };
 	return [
-		{ commitSha: COMMIT_SHA, treeSha: TREE_SHA, blobSha: BLOB_SHA, content: GOAL_CONTENT },
+		initial,
+		{ ...initial },
 		{
 			commitSha: "6".repeat(40),
 			treeSha: "7".repeat(40),
@@ -1038,6 +1116,9 @@ function createIntegrationHarness(cwd: string, options: IntegrationHarnessOption
 	let currentBranch = "main";
 	let refOccupied = false;
 	const refExistsResults = [...(options.refExistsResults ?? [])];
+	const ancestryResults = [...(options.ancestryResults ?? [])];
+	let nextStatusRequest: (() => void | Promise<void>) | null = null;
+	let sessionId = options.sessionId ?? "contribution-session";
 	let setActiveToolsCallCount = 0;
 	const goals = options.goalVersions ?? defaultGoalVersions();
 	let activeGoal = goals[0];
@@ -1047,6 +1128,9 @@ function createIntegrationHarness(cwd: string, options: IntegrationHarnessOption
 	vi.spyOn(git.show, "prefix").mockResolvedValue("");
 	const statusMock = Object.assign(
 		async () => {
+			const callback = nextStatusRequest;
+			nextStatusRequest = null;
+			await callback?.();
 			gitEvents.push(`status:${statusText}`);
 			return statusText;
 		},
@@ -1058,6 +1142,10 @@ function createIntegrationHarness(cwd: string, options: IntegrationHarnessOption
 		return headSha;
 	});
 	vi.spyOn(git.branch, "current").mockImplementation(async () => currentBranch);
+	vi.spyOn(git, "isAncestor").mockImplementation(async (_workDir, ancestor, descendant) => {
+		gitEvents.push(`ancestor:${ancestor}:${descendant}`);
+		return ancestryResults.shift() ?? true;
+	});
 	vi.spyOn(git.ref, "exists").mockImplementation(async (_workDir, ref) => {
 		gitEvents.push(`exists:${ref}`);
 		return refExistsResults.shift() ?? refOccupied;
@@ -1105,7 +1193,7 @@ function createIntegrationHarness(cwd: string, options: IntegrationHarnessOption
 			return { fork: true, parent: "can1357/oh-my-pi", source: "can1357/oh-my-pi" };
 		}
 		if (endpoint.includes("/git/ref/heads/")) {
-			options.onGoalRefRequest?.(signal);
+			await options.onGoalRefRequest?.(signal);
 			activeGoal = goals[Math.min(goalLoadCount, goals.length - 1)] ?? goals[0];
 			goalLoadCount++;
 			return { sha: activeGoal.commitSha, type: "commit" };
@@ -1214,7 +1302,7 @@ function createIntegrationHarness(cwd: string, options: IntegrationHarnessOption
 		sessionManager: {
 			getBranch: () => [],
 			getEntries: () => [],
-			getSessionId: () => options.sessionId ?? "contribution-session",
+			getSessionId: () => sessionId,
 		},
 		shutdown(): void {},
 		switchSession: async () => ({ cancelled: false }),
@@ -1281,6 +1369,12 @@ function createIntegrationHarness(cwd: string, options: IntegrationHarnessOption
 		setRefOccupied(value: boolean): void {
 			refOccupied = value;
 		},
+		setNextStatusRequest(callback: () => void | Promise<void>): void {
+			nextStatusRequest = callback;
+		},
+		setSessionId(value: string): void {
+			sessionId = value;
+		},
 		currentBranch: () => currentBranch,
 		currentModel: () => selectedModel,
 	};
@@ -1323,6 +1417,56 @@ function terminalAgentEnd(stopReason: "stop" | "aborted" | "error", text = "done
 	} as AgentEndEvent;
 }
 
+async function prepareKeptContribution(harness: IntegrationHarness, cwd: string): Promise<SessionRow> {
+	await Bun.write(`${cwd}/autoresearch.sh`, "#!/usr/bin/env bash\necho METRIC runtime_ms=1\n");
+	const init = harness.tools.get("init_experiment");
+	if (!init) throw new Error("Expected init_experiment tool");
+	await init.execute(
+		"initial",
+		{ name: "candidate", primary_metric: "runtime_ms", metric_unit: "ms" },
+		undefined,
+		undefined,
+		harness.ctx as ExtensionContext,
+	);
+	const storage = await openAutoresearchStorage(cwd);
+	const session = storage.getActiveSessionForBranch(harness.currentBranch());
+	if (!session) throw new Error("Expected contribution session");
+	const now = Date.now();
+	const run = storage.insertRun({
+		sessionId: session.id,
+		segment: session.currentSegment,
+		command: "bash autoresearch.sh",
+		startedAt: now,
+		logPath: "",
+		preRunDirtyPaths: [],
+	});
+	storage.markRunCompleted({
+		runId: run.id,
+		completedAt: now + 1,
+		durationMs: 1,
+		exitCode: 0,
+		timedOut: false,
+		parsedPrimary: 1,
+		parsedMetrics: { runtime_ms: 1 },
+		parsedAsi: { hypothesis: "Ran the focused contribution scenario." },
+	});
+	storage.markRunLogged({
+		runId: run.id,
+		status: "keep",
+		description: "Observed the focused scenario pass at runtime_ms=1.",
+		metric: 1,
+		metrics: {},
+		asi: { hypothesis: "Ran the focused contribution scenario." },
+		commitHash: CURRENT_HEAD,
+		confidence: null,
+		modifiedPaths: [],
+		scopeDeviations: [],
+		justification: null,
+		loggedAt: now + 2,
+	});
+	harness.setHeadSha(CURRENT_HEAD);
+	return session;
+}
 describe("process-local contribution lifecycle", () => {
 	let cwd: TempDir;
 	let dbDir: TempDir;
@@ -1381,6 +1525,37 @@ describe("process-local contribution lifecycle", () => {
 		expect(snapshotStorageArtifacts(dbDir.path())).toEqual([]);
 	});
 
+	it("cancels post-confirm goal drift before model, branch, tool, runtime, or SQLite mutation", async () => {
+		const initial = defaultGoalVersions()[0]!;
+		const driftedContent = "# Drifted official goal\n\nChanged after approval.\n";
+		const harness = createIntegrationHarness(cwd.path(), {
+			goalVersions: [
+				initial,
+				{
+					commitSha: "9".repeat(40),
+					treeSha: "8".repeat(40),
+					blobSha: "7".repeat(40),
+					content: driftedContent,
+				},
+			],
+		});
+		const initialTools = [...harness.activeTools];
+
+		await startContribution(harness);
+
+		expect(harness.confirmCalls.map(call => call.title)).toEqual([
+			"Inspect official contribution prerequisites?",
+			"Start exact upstream contribution session?",
+		]);
+		expect(harness.githubEndpoints.filter(endpoint => endpoint.includes("/git/ref/heads/"))).toHaveLength(2);
+		expect(harness.notifications.at(-1)).toMatchObject({ type: "error", message: expect.stringContaining("goal_changed") });
+		expect(harness.setModelCalls).toEqual([]);
+		expect(harness.checkoutNewCalls).toEqual([]);
+		expect(harness.activeTools).toEqual(initialTools);
+		expect(harness.sentUserMessages).toEqual([]);
+		expect(snapshotStorageArtifacts(dbDir.path())).toEqual([]);
+	});
+
 	it("defaults to the current authenticated model and rechecks the exact base before fresh checkout", async () => {
 		const harness = createIntegrationHarness(cwd.path());
 		const priorModel = harness.currentModel();
@@ -1426,9 +1601,7 @@ describe("process-local contribution lifecycle", () => {
 		const postConfirmHeadIndex = harness.gitEvents.findIndex(
 			(event, index) => index > finalConfirmIndex && event.startsWith("head:"),
 		);
-		const checkoutIndex = harness.gitEvents.findIndex(
-			event => event === `checkoutNewAt:${branch}:${COMMIT_SHA}`,
-		);
+		const checkoutIndex = harness.gitEvents.indexOf(`checkoutNewAt:${branch}:${COMMIT_SHA}`);
 		expect(postConfirmStatusIndex).toBeGreaterThan(finalConfirmIndex);
 		expect(postConfirmHeadIndex).toBeGreaterThan(finalConfirmIndex);
 		expect(checkoutIndex).toBeGreaterThan(postConfirmStatusIndex);
@@ -1465,6 +1638,54 @@ describe("process-local contribution lifecycle", () => {
 		expect(session).not.toBeNull();
 		expect(session?.maxIterations).toBeNull();
 		expect(session?.goal).toBe(GOAL_CONTENT);
+	});
+
+	it("fails closed when contribution is stopped during initial init preparation", async () => {
+		const harness = createIntegrationHarness(cwd.path());
+		await startContribution(harness);
+		await Bun.write(`${cwd.path()}/autoresearch.sh`, "#!/usr/bin/env bash\necho METRIC runtime_ms=1\n");
+		const init = harness.tools.get("init_experiment");
+		if (!init) throw new Error("Expected init_experiment tool");
+		harness.setNextStatusRequest(async () => {
+			await commandRequired(harness, "contribute").handler("off", harness.ctx);
+		});
+
+		await expect(
+			init.execute(
+				"stopped-initial",
+				{ name: "initial", primary_metric: "runtime_ms" },
+				undefined,
+				undefined,
+				harness.ctx as ExtensionContext,
+			),
+		).rejects.toThrow("authorization changed");
+		expect(snapshotStorageArtifacts(dbDir.path())).toEqual([]);
+		expect(harness.activeTools).toEqual(["read", "bash"]);
+		await commandRequired(harness, "contribute").handler("status", harness.ctx);
+		expect(harness.notifications.at(-1)?.message).toBe("Contribution mode is off.");
+	});
+
+	it("fails closed when the process-local session switches during initial init preparation", async () => {
+		const harness = createIntegrationHarness(cwd.path());
+		await startContribution(harness);
+		await Bun.write(`${cwd.path()}/autoresearch.sh`, "#!/usr/bin/env bash\necho METRIC runtime_ms=1\n");
+		const init = harness.tools.get("init_experiment");
+		if (!init) throw new Error("Expected init_experiment tool");
+		harness.setNextStatusRequest(() => {
+			harness.setSessionId("switched-session");
+		});
+
+		await expect(
+			init.execute(
+				"switched-initial",
+				{ name: "initial", primary_metric: "runtime_ms" },
+				undefined,
+				undefined,
+				harness.ctx as ExtensionContext,
+			),
+		).rejects.toThrow("authorization changed");
+		expect(snapshotStorageArtifacts(dbDir.path())).toEqual([]);
+		expect(harness.sentUserMessages).toEqual(["Faster contributor loop"]);
 	});
 
 	it("allows selection only from authenticated models and cancels cleanly when none exist", async () => {
@@ -1536,6 +1757,42 @@ describe("process-local contribution lifecycle", () => {
 		expect(harness.notifications.some(note => note.type === "error")).toBe(true);
 	});
 
+	it("rejects an orphan candidate before displaying contribution review", async () => {
+		const harness = createIntegrationHarness(cwd.path(), { ancestryResults: [false] });
+		await startContribution(harness);
+		await prepareKeptContribution(harness, cwd.path());
+		const confirmationsBeforeReview = harness.confirmCalls.length;
+
+		await commandRequired(harness, "contribute").handler("review", harness.ctx);
+
+		expect(harness.confirmCalls).toHaveLength(confirmationsBeforeReview);
+		expect(harness.pushes).toEqual([]);
+		expect(harness.gitEvents).toContain(`ancestor:${COMMIT_SHA}:${CURRENT_HEAD}`);
+		expect(harness.notifications.at(-1)).toMatchObject({
+			type: "error",
+			message: expect.stringContaining("candidate_not_descendant"),
+		});
+	});
+
+	it("rechecks candidate ancestry after review approval and immediately before push", async () => {
+		const harness = createIntegrationHarness(cwd.path(), {
+			confirmAnswers: [true, true, true],
+			ancestryResults: [true, false],
+		});
+		await startContribution(harness);
+		await prepareKeptContribution(harness, cwd.path());
+
+		await commandRequired(harness, "contribute").handler("review", harness.ctx);
+
+		expect(harness.confirmCalls.at(-1)?.title).toBe("Push exact contribution candidate for review?");
+		expect(harness.pushes).toEqual([]);
+		expect(harness.gitEvents.filter(event => event === `ancestor:${COMMIT_SHA}:${CURRENT_HEAD}`)).toHaveLength(2);
+		expect(harness.notifications.at(-1)).toMatchObject({
+			type: "error",
+			message: expect.stringContaining("candidate_not_descendant"),
+		});
+	});
+
 	it("pushes one exact kept candidate and creates only a human review handoff", async () => {
 		const harness = createIntegrationHarness(cwd.path(), { confirmAnswers: [true, true, true] });
 		await startContribution(harness);
@@ -1604,9 +1861,17 @@ describe("process-local contribution lifecycle", () => {
 		expect(harness.activeTools).toEqual(["read", "bash"]);
 		expect(storage.getSessionById(session.id)?.closedAt).not.toBeNull();
 		expect(harness.githubEndpoints.every(endpoint => endpoint.startsWith("/repos/"))).toBe(true);
+		expect(harness.gitEvents.filter(event => event === `ancestor:${COMMIT_SHA}:${CURRENT_HEAD}`)).toHaveLength(2);
 
 		await commandRequired(harness, "contribute").handler("status", harness.ctx);
 		expect(harness.notifications.at(-1)?.message).toContain("Contribution review ready:");
+		const statusMessage = harness.notifications.at(-1)?.message ?? "";
+		expect(statusMessage).toContain(
+			`Immutable SHA review: https://github.com/${OFFICIAL_CONTRIBUTION_OWNER}/${OFFICIAL_CONTRIBUTION_REPO}/compare/${COMMIT_SHA}...alice:${CURRENT_HEAD}?expand=1`,
+		);
+		expect(statusMessage).toContain(
+			`Mutable branch compare: https://github.com/${OFFICIAL_CONTRIBUTION_OWNER}/${OFFICIAL_CONTRIBUTION_REPO}/compare/main...alice:${encodeURIComponent(branch)}?expand=1`,
+		);
 		await commandRequired(harness, "contribute").handler("", harness.ctx);
 		expect(harness.confirmCalls.at(-1)?.title).toBe("Inspect official contribution prerequisites?");
 	});
@@ -1685,6 +1950,87 @@ describe("process-local contribution lifecycle", () => {
 		]);
 	});
 
+	it("fails closed when contribution is stopped during new-segment goal preparation", async () => {
+		let refRequests = 0;
+		let harness!: IntegrationHarness;
+		harness = createIntegrationHarness(cwd.path(), {
+			async onGoalRefRequest(): Promise<void> {
+				refRequests++;
+				if (refRequests === 3) await commandRequired(harness, "contribute").handler("off", harness.ctx);
+			},
+		});
+		await startContribution(harness);
+		await Bun.write(`${cwd.path()}/autoresearch.sh`, "#!/usr/bin/env bash\necho METRIC runtime_ms=1\n");
+		const init = harness.tools.get("init_experiment");
+		if (!init) throw new Error("Expected init_experiment tool");
+		await init.execute(
+			"initial",
+			{ name: "initial", primary_metric: "runtime_ms" },
+			undefined,
+			undefined,
+			harness.ctx as ExtensionContext,
+		);
+		const storage = await openAutoresearchStorage(cwd.path());
+		const session = storage.getActiveSessionForBranch(harness.currentBranch());
+		if (!session) throw new Error("Expected contribution session");
+
+		await expect(
+			init.execute(
+				"stopped-segment",
+				{ name: "next", primary_metric: "runtime_ms", new_segment: true },
+				undefined,
+				undefined,
+				harness.ctx as ExtensionContext,
+			),
+		).rejects.toThrow("authorization changed");
+		const unchanged = storage.getSessionById(session.id);
+		expect(unchanged?.currentSegment).toBe(session.currentSegment);
+		expect(unchanged?.goal).toBe(session.goal);
+		expect(unchanged?.closedAt).not.toBeNull();
+	});
+
+	it("fails closed when the process-local session switches during new-segment goal preparation", async () => {
+		let refRequests = 0;
+		let harness!: IntegrationHarness;
+		harness = createIntegrationHarness(cwd.path(), {
+			onGoalRefRequest(): void {
+				refRequests++;
+				if (refRequests === 3) harness.setSessionId("switched-session");
+			},
+		});
+		await startContribution(harness);
+		await Bun.write(`${cwd.path()}/autoresearch.sh`, "#!/usr/bin/env bash\necho METRIC runtime_ms=1\n");
+		const init = harness.tools.get("init_experiment");
+		if (!init) throw new Error("Expected init_experiment tool");
+		await init.execute(
+			"initial",
+			{ name: "initial", primary_metric: "runtime_ms" },
+			undefined,
+			undefined,
+			harness.ctx as ExtensionContext,
+		);
+		const storage = await openAutoresearchStorage(cwd.path());
+		const session = storage.getActiveSessionForBranch(harness.currentBranch());
+		if (!session) throw new Error("Expected contribution session");
+		const beforeArtifacts = snapshotStorageArtifacts(dbDir.path());
+
+		await expect(
+			init.execute(
+				"switched-segment",
+				{ name: "next", primary_metric: "runtime_ms", new_segment: true },
+				undefined,
+				undefined,
+				harness.ctx as ExtensionContext,
+			),
+		).rejects.toThrow("authorization changed");
+		expect(snapshotStorageArtifacts(dbDir.path())).toEqual(beforeArtifacts);
+		expect(storage.getSessionById(session.id)).toMatchObject({
+			currentSegment: session.currentSegment,
+			goal: session.goal,
+			closedAt: null,
+		});
+	});
+
 	it("refuses a contribution segment boundary while any experiment is pending", async () => {
 		const harness = createIntegrationHarness(cwd.path());
 		await startContribution(harness);
@@ -1738,7 +2084,7 @@ describe("process-local contribution lifecycle", () => {
 			).rejects.toThrow("pending experiment to be logged");
 			expect(snapshotStorageArtifacts(dbDir.path())).toEqual(beforeArtifacts);
 		}
-		expect(harness.githubEndpoints.filter(endpoint => endpoint.includes("/git/ref/heads/"))).toHaveLength(1);
+		expect(harness.githubEndpoints.filter(endpoint => endpoint.includes("/git/ref/heads/"))).toHaveLength(2);
 		expect(storage.getPendingRun(session.id)?.id).toBe(run.id);
 	});
 
@@ -1750,7 +2096,7 @@ describe("process-local contribution lifecycle", () => {
 			content: "not an H1 goal\n",
 		};
 		const harness = createIntegrationHarness(cwd.path(), {
-			goalVersions: [defaultGoalVersions()[0]!, invalidRefresh],
+			goalVersions: [defaultGoalVersions()[0]!, defaultGoalVersions()[0]!, invalidRefresh],
 		});
 		await startContribution(harness);
 		await Bun.write(`${cwd.path()}/autoresearch.sh`, "#!/usr/bin/env bash\necho METRIC runtime_ms=1\n");
@@ -1775,7 +2121,7 @@ describe("process-local contribution lifecycle", () => {
 			),
 		).rejects.toThrow("Official contribution goal refresh failed before segment mutation");
 		expect(snapshotStorageArtifacts(dbDir.path())).toEqual(beforeArtifacts);
-		expect(harness.githubEndpoints.filter(endpoint => endpoint.includes("/git/ref/heads/"))).toHaveLength(2);
+		expect(harness.githubEndpoints.filter(endpoint => endpoint.includes("/git/ref/heads/"))).toHaveLength(3);
 	});
 
 	it("adopts a validated goal in the successful segment tool result with no post-bump fetch", async () => {
@@ -1786,7 +2132,7 @@ describe("process-local contribution lifecycle", () => {
 			content: "# Adopted segment goal\n\nNew bounded direction.\n",
 		};
 		const harness = createIntegrationHarness(cwd.path(), {
-			goalVersions: [defaultGoalVersions()[0]!, refreshed],
+			goalVersions: [defaultGoalVersions()[0]!, defaultGoalVersions()[0]!, refreshed],
 		});
 		await startContribution(harness);
 		await Bun.write(`${cwd.path()}/autoresearch.sh`, "#!/usr/bin/env bash\necho METRIC runtime_ms=1\n");

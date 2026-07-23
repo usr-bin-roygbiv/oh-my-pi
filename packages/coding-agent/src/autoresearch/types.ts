@@ -128,6 +128,7 @@ export interface ContributionModelSelection {
 
 export interface ContributionRunningState {
 	status: "running";
+	authorization: symbol;
 	goal: ContributionGoal;
 	baseProof: ContributionBaseProof;
 	branch: string;
@@ -140,6 +141,7 @@ export interface ContributionRunningState {
 
 export interface ContributionReviewState {
 	status: "review";
+	authorization: symbol;
 	goal: ContributionGoal;
 	baseProof: ContributionBaseProof;
 	branch: string;

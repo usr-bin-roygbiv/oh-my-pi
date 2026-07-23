@@ -10,7 +10,11 @@ import * as git from "../../utils/git";
 import { parseWorkDirDirtyPaths } from "../git";
 import { dedupeStrings, normalizePathSpec } from "../helpers";
 import { buildExperimentState } from "../state";
-import { openAutoresearchStorage, type SessionRow } from "../storage";
+import {
+	openAutoresearchStorage,
+	openAutoresearchStorageIfExists,
+	type SessionRow,
+} from "../storage";
 import type { AutoresearchToolFactoryOptions, ExperimentState } from "../types";
 
 export const HARNESS_FILENAME = "autoresearch.sh";
@@ -45,8 +49,14 @@ interface PreparedNewSegment {
 	complete(state: ExperimentState): string | null;
 }
 
+interface InitExperimentMutationAuthorization {
+	authorizeMutation(ctx: ExtensionContext, signal?: AbortSignal): Promise<void>;
+	assertRuntimeCurrent(ctx: ExtensionContext, signal?: AbortSignal): void;
+}
+
 interface InitExperimentToolFactoryOptions extends AutoresearchToolFactoryOptions {
 	forceUncapped?(ctx: ExtensionContext): boolean;
+	captureMutationAuthorization?(ctx: ExtensionContext): InitExperimentMutationAuthorization | null;
 	prepareNewSegment?(ctx: ExtensionContext, signal?: AbortSignal): Promise<PreparedNewSegment | null>;
 	onSessionUpdated?(ctx: ExtensionContext, state: ExperimentState): void;
 }
@@ -63,10 +73,17 @@ export function createInitExperimentTool(
 		defaultInactive: true,
 		concurrency: params => (params.new_segment === true ? "exclusive" : "shared"),
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			const mutationAuthorization = options.captureMutationAuthorization?.(ctx) ?? null;
+			const authorizeMutation = async (): Promise<void> => {
+				throwIfAborted(signal);
+				await mutationAuthorization?.authorizeMutation(ctx, signal);
+				throwIfAborted(signal);
+			};
 			const preparedNewSegment =
 				params.new_segment === true ? ((await options.prepareNewSegment?.(ctx, signal)) ?? null) : null;
 			if (preparedNewSegment) throwIfAborted(signal);
-			const storage = await openAutoresearchStorage(ctx.cwd);
+			await authorizeMutation();
+			let storage = await openAutoresearchStorageIfExists(ctx.cwd);
 			const runtime = options.getRuntime(ctx);
 			const direction = params.direction ?? "lower";
 			const metricUnit = params.metric_unit ?? "";
@@ -87,7 +104,7 @@ export function createInitExperimentTool(
 			const branch = (await git.branch.current(ctx.cwd)) ?? null;
 			const onAutoresearchBranch = branch?.startsWith("autoresearch/") ?? false;
 
-			const existing = storage.getActiveSessionForBranch(branch);
+			const existing = storage?.getActiveSessionForBranch(branch) ?? null;
 			const isNewSegmentInit = existing !== null && params.new_segment === true;
 			const requiresHarness = !existing || isNewSegmentInit;
 
@@ -110,9 +127,11 @@ export function createInitExperimentTool(
 			if (requiresHarness && onAutoresearchBranch) {
 				const dirty = await detectPendingChanges(ctx.cwd);
 				if (dirty) {
+					await authorizeMutation();
 					try {
 						await git.stage.files(ctx.cwd, []);
 						const message = buildHarnessCommitMessage(goal, params.name);
+						await authorizeMutation();
 						await git.commit(ctx.cwd, message);
 						harnessCommitted = true;
 					} catch (err) {
@@ -122,6 +141,11 @@ export function createInitExperimentTool(
 			}
 
 			const baselineCommit = await tryReadHeadSha(ctx.cwd);
+			await authorizeMutation();
+			if (!storage) {
+				storage = await openAutoresearchStorage(ctx.cwd, authorizeMutation);
+				await authorizeMutation();
+			}
 
 			let session: SessionRow;
 			let createdSession = false;
@@ -172,6 +196,9 @@ export function createInitExperimentTool(
 
 			const loggedRuns = storage.listLoggedRuns(session.id);
 			const state = buildExperimentState(session, loggedRuns);
+			throwIfAborted(signal);
+			mutationAuthorization?.assertRuntimeCurrent(ctx, signal);
+			throwIfAborted(signal);
 			runtime.state = state;
 			runtime.goal = session.goal;
 			runtime.autoresearchMode = true;

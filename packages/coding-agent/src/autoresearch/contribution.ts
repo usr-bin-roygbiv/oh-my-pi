@@ -38,6 +38,7 @@ export type ContributionErrorCode =
 	| "goal_base64_invalid"
 	| "goal_content_invalid"
 	| "goal_title_invalid"
+	| "goal_changed"
 	| "remote_invalid"
 	| "remote_not_fork"
 	| "remote_official"
@@ -48,6 +49,7 @@ export type ContributionErrorCode =
 	| "worktree_dirty"
 	| "candidate_invalid"
 	| "candidate_head_mismatch"
+	| "candidate_not_descendant"
 	| "fork_verification_failed"
 	| "base_inspection_failed"
 	| "base_worktree_dirty"
@@ -159,6 +161,7 @@ export interface ContributionPublicationGit {
 	readBranch(cwd: string, signal?: AbortSignal): Promise<string | null>;
 	readHead(cwd: string, signal?: AbortSignal): Promise<string | null>;
 	readStatus(cwd: string, signal?: AbortSignal): Promise<string>;
+	isAncestor(cwd: string, ancestor: string, descendant: string, signal?: AbortSignal): Promise<boolean>;
 	push(
 		cwd: string,
 		options: {
@@ -193,6 +196,7 @@ export interface PublishedContributionCandidate {
 	readonly branchName: string;
 	readonly refspec: string;
 	readonly compareUrl: string;
+	readonly reviewUrl: string;
 	readonly prDraft: ContributionPrDraft;
 }
 
@@ -232,16 +236,17 @@ export interface VerifyContributionForkOptions {
 }
 
 const DEFAULT_PUBLICATION_GIT: ContributionPublicationGit = {
-	readRemoteUrl: git.remote.url,
-	readBranch: git.branch.current,
-	readHead: git.head.sha,
+	readRemoteUrl: (cwd, remoteName, signal) => git.remote.url(cwd, remoteName, signal),
+	readBranch: (cwd, signal) => git.branch.current(cwd, signal),
+	readHead: (cwd, signal) => git.head.sha(cwd, signal),
 	readStatus: (cwd, signal) => git.status(cwd, { porcelainV1: true, untrackedFiles: "all", z: true, signal }),
-	push: git.push,
+	isAncestor: (cwd, ancestor, descendant, signal) => git.isAncestor(cwd, ancestor, descendant, signal),
+	push: (cwd, options) => git.push(cwd, options),
 };
 
 const DEFAULT_PREFLIGHT_GIT: ContributionPreflightGit = {
-	status: git.status,
-	headSha: git.head.sha,
+	status: (cwd, options) => git.status(cwd, options),
+	headSha: (cwd, signal) => git.head.sha(cwd, signal),
 };
 
 export async function fetchOfficialContributionGoal(
@@ -291,6 +296,21 @@ export async function fetchOfficialContributionGoal(
 		title,
 		content,
 	};
+}
+
+export function assertContributionGoalUnchanged(approved: ContributionGoal, current: ContributionGoal): void {
+	const unchanged =
+		current.commitSha === approved.commitSha &&
+		current.blobSha === approved.blobSha &&
+		current.sha256 === approved.sha256 &&
+		current.title === approved.title &&
+		current.content === approved.content;
+	if (!unchanged) {
+		throw new ContributionError(
+			"goal_changed",
+			"The official contribution goal changed after final confirmation; start cancelled.",
+		);
+	}
 }
 
 export function createContributionBaseProof(
@@ -422,6 +442,24 @@ export function buildContributionCompareUrl(remote: GitHubRemote, branchName: st
 	const base = encodeURIComponent(OFFICIAL_CONTRIBUTION_REF);
 	const owner = encodeURIComponent(remote.owner);
 	const head = encodeURIComponent(branchName);
+	return `https://github.com/${encodeURIComponent(OFFICIAL_CONTRIBUTION_OWNER)}/${encodeURIComponent(OFFICIAL_CONTRIBUTION_REPO)}/compare/${base}...${owner}:${head}?expand=1`;
+}
+
+export function buildContributionReviewUrl(
+	remote: GitHubRemote,
+	baseSha: string,
+	candidateSha: string,
+): string {
+	validateRemoteObject(remote);
+	if (!GIT_SHA_PATTERN.test(baseSha)) {
+		throw new ContributionError("base_head_mismatch", "Contribution review requires an immutable base SHA.");
+	}
+	if (!CANDIDATE_COMMIT_PATTERN.test(candidateSha)) {
+		throw new ContributionError("candidate_invalid", "Contribution review requires an immutable candidate SHA.");
+	}
+	const base = encodeURIComponent(baseSha.toLowerCase());
+	const owner = encodeURIComponent(remote.owner);
+	const head = encodeURIComponent(candidateSha.toLowerCase());
 	return `https://github.com/${encodeURIComponent(OFFICIAL_CONTRIBUTION_OWNER)}/${encodeURIComponent(OFFICIAL_CONTRIBUTION_REPO)}/compare/${base}...${owner}:${head}?expand=1`;
 }
 
@@ -559,6 +597,11 @@ export async function publishContributionCandidate(
 	const targetRef = `refs/heads/${options.branchName}`;
 	const refspec = `${options.candidate.commit}:${targetRef}`;
 	const compareUrl = buildContributionCompareUrl(currentRemote, options.branchName);
+	const reviewUrl = buildContributionReviewUrl(
+		currentRemote,
+		options.baseProof.baseSha,
+		options.candidate.commit,
+	);
 	const prDraft = buildContributionPrDraft(
 		options.goal,
 		options.candidate,
@@ -566,6 +609,19 @@ export async function publishContributionCandidate(
 		options.branchName,
 		options.baseProof,
 	);
+	if (
+		!(await publicationGit.isAncestor(
+			options.cwd,
+			options.baseProof.baseSha,
+			options.candidate.commit,
+			options.signal,
+		))
+	) {
+		throw new ContributionError(
+			"candidate_not_descendant",
+			"The contribution candidate does not descend from the frozen official base.",
+		);
+	}
 	try {
 		await publicationGit.push(options.cwd, {
 			remote: options.confirmedRemoteUrl,
@@ -584,6 +640,7 @@ export async function publishContributionCandidate(
 		branchName: options.branchName,
 		refspec,
 		compareUrl,
+		reviewUrl,
 		prDraft,
 	};
 }

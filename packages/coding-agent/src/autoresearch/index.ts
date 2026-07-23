@@ -4,21 +4,23 @@ import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AutocompleteItem } from "@oh-my-pi/pi-tui";
 import { logger, prompt } from "@oh-my-pi/pi-utils";
 import type { ExtensionContext, ExtensionFactory } from "../extensibility/extensions";
+import { throwIfAborted } from "../tools/tool-errors";
 import * as git from "../utils/git";
 import commandResumeTemplate from "./command-resume.md" with { type: "text" };
 import {
+	assertContributionGoalUnchanged,
 	buildContributionPrDraft,
-	ContributionError,
-	fetchOfficialContributionGoal,
-	publishContributionCandidate,
 	type ContributionCandidate,
+	ContributionError,
 	type ContributionGoal,
 	type ContributionPublicationGit,
-	type PublishedContributionCandidate,
+	fetchOfficialContributionGoal,
 	type GitHubRemote,
+	type PublishedContributionCandidate,
+	publishContributionCandidate,
 	validateContributionForkRemote,
-	verifyContributionFork,
 	verifyContributionBase,
+	verifyContributionFork,
 } from "./contribution";
 import contributionGoalRefreshTemplate from "./contribution-goal-refresh.md" with { type: "text" };
 import contributionPromptTemplate from "./contribution-prompt.md" with { type: "text" };
@@ -49,12 +51,7 @@ import { createInitExperimentTool } from "./tools/init-experiment";
 import { createLogExperimentTool } from "./tools/log-experiment";
 import { createRunExperimentTool } from "./tools/run-experiment";
 import { createUpdateNotesTool } from "./tools/update-notes";
-import type {
-	AutoresearchRuntime,
-	ContributionRunningState,
-	ExperimentResult,
-	PendingRunSummary,
-} from "./types";
+import type { AutoresearchRuntime, ContributionRunningState, ExperimentResult, PendingRunSummary } from "./types";
 
 const EXPERIMENT_TOOL_NAMES = ["init_experiment", "run_experiment", "log_experiment", "update_notes"];
 
@@ -66,13 +63,12 @@ interface ContributionRemoteChoice {
 	remote: GitHubRemote;
 }
 
-
 const contributionPublicationGit: ContributionPublicationGit = {
 	readRemoteUrl: (cwd, remote, signal) => git.remote.url(cwd, remote, signal),
 	readBranch: (cwd, signal) => git.branch.current(cwd, signal),
 	readHead: (cwd, signal) => git.head.sha(cwd, signal),
-	readStatus: (cwd, signal) =>
-		git.status(cwd, { porcelainV1: true, untrackedFiles: "all", z: true, signal }),
+	readStatus: (cwd, signal) => git.status(cwd, { porcelainV1: true, untrackedFiles: "all", z: true, signal }),
+	isAncestor: (cwd, ancestor, descendant, signal) => git.isAncestor(cwd, ancestor, descendant, signal),
 	push: (cwd, options) =>
 		git.push(cwd, {
 			remote: options.remote,
@@ -99,7 +95,7 @@ async function discoverContributionRemotes(cwd: string): Promise<ContributionRem
 function contributionEndMustPause(messages: AgentMessage[]): boolean {
 	for (let index = messages.length - 1; index >= 0; index -= 1) {
 		const message = messages[index];
-		if (!message || message.role !== "assistant") continue;
+		if (message?.role !== "assistant") continue;
 		if (message.stopReason === "aborted" || message.stopReason === "error") return true;
 		const text = message.content
 			.filter(part => part.type === "text")
@@ -255,17 +251,17 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 		runtime: AutoresearchRuntime,
 	): Promise<string[]> => {
 		if (runtime.contribution.status === "off") return [];
+		const contribution = runtime.contribution;
 		const warnings: string[] = [];
+		runtime.contribution = { status: "off" };
+		runtime.autoresearchMode = false;
+		runtime.autoResumeArmed = false;
+		runtime.state = createExperimentState();
+		runtime.goal = null;
 		try {
-			await closeContributionSession(ctx, runtime.contribution);
+			await closeContributionSession(ctx, contribution);
 		} catch (error) {
 			warnings.push(`session close: ${describeContributionError(error)}`);
-		} finally {
-			runtime.contribution = { status: "off" };
-			runtime.autoresearchMode = false;
-			runtime.autoResumeArmed = false;
-			runtime.state = createExperimentState();
-			runtime.goal = null;
 		}
 		try {
 			const experimentTools = new Set(EXPERIMENT_TOOL_NAMES);
@@ -281,6 +277,45 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 			dashboard,
 			getRuntime,
 			pi: api,
+			captureMutationAuthorization(ctx) {
+				const sessionKey = getSessionKey(ctx);
+				const captured = getRuntime(ctx).contribution;
+				if (captured.status !== "running") return null;
+				const { authorization, branch, sessionId } = captured;
+				const assertProcessIdentity = (currentCtx: ExtensionContext): void => {
+					const current = getRuntime(currentCtx).contribution;
+					if (
+						getSessionKey(currentCtx) !== sessionKey ||
+						current.status !== "running" ||
+						current.authorization !== authorization ||
+						current.branch !== branch ||
+						current.sessionId !== sessionId
+					) {
+						throw new Error("Contribution init authorization changed before mutation.");
+					}
+				};
+				return {
+					async authorizeMutation(currentCtx, signal): Promise<void> {
+						throwIfAborted(signal);
+						assertProcessIdentity(currentCtx);
+						const storage = await openAutoresearchStorageIfExists(currentCtx.cwd);
+						const currentBranch = await git.branch.current(currentCtx.cwd, signal);
+						const session = storage?.getActiveSessionForBranch(branch) ?? null;
+						if (
+							currentBranch !== branch ||
+							(sessionId === null ? session !== null : session?.id !== sessionId)
+						) {
+							throw new Error("Contribution branch or experiment session changed before mutation.");
+						}
+						assertProcessIdentity(currentCtx);
+						throwIfAborted(signal);
+					},
+					assertRuntimeCurrent(currentCtx, signal): void {
+						throwIfAborted(signal);
+						assertProcessIdentity(currentCtx);
+					},
+				};
+			},
 			forceUncapped: ctx => getRuntime(ctx).contribution.status === "running",
 			onSessionUpdated(ctx, state): void {
 				const runtime = getRuntime(ctx);
@@ -483,7 +518,7 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 					);
 				} else {
 					ctx.ui.notify(
-						`Contribution review ready: ${runtime.contribution.publication.compareUrl}\nCandidate: ${runtime.contribution.candidateHead}`,
+						`Contribution review ready:\nImmutable SHA review: ${runtime.contribution.publication.reviewUrl}\nMutable branch compare: ${runtime.contribution.publication.compareUrl}\nCandidate: ${runtime.contribution.candidateHead}`,
 						"info",
 					);
 				}
@@ -545,6 +580,17 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 				}
 				if (!currentHead) {
 					ctx.ui.notify("Unable to read the contribution candidate HEAD.", "error");
+					return;
+				}
+				try {
+					if (!(await git.isAncestor(ctx.cwd, contribution.baseProof.baseSha, currentHead))) {
+						throw new ContributionError(
+							"candidate_not_descendant",
+							"The contribution candidate does not descend from the frozen official base.",
+						);
+					}
+				} catch (error) {
+					ctx.ui.notify(`Contribution review failed: ${describeContributionError(error)}`, "error");
 					return;
 				}
 				const candidateResult = keptResultAtHead(
@@ -645,7 +691,7 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 					);
 				}
 				ctx.ui.notify(
-					`${publication.compareUrl}\n\nPR draft (human sentence intentionally empty):\n${publication.prDraft.title}\n\n${publication.prDraft.body}`,
+					`Immutable SHA review: ${publication.reviewUrl}\nMutable branch compare: ${publication.compareUrl}\n\nPR draft (human sentence intentionally empty):\n${publication.prDraft.title}\n\n${publication.prDraft.body}`,
 					"info",
 				);
 				return;
@@ -688,7 +734,7 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 					fetchOfficialContributionGoal(ctx.cwd),
 					discoverContributionRemotes(ctx.cwd),
 				]);
-				const baseProof = await verifyContributionBase(ctx.cwd, goal);
+				await verifyContributionBase(ctx.cwd, goal);
 				const priorBranch = await git.branch.current(ctx.cwd);
 				if (priorBranch?.startsWith("autoresearch/")) {
 					ctx.ui.notify("Contribution mode must start from the official base, not an existing autoresearch branch.", "error");
@@ -735,6 +781,9 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 					`Goal: ${goal.title}\nOfficial main commit/base: ${goal.commitSha}\nGoal blob: ${goal.blobSha}\nGoal SHA-256: ${goal.sha256}\nModel: ${selectedModel.provider}/${selectedModel.id}\nConfirmed fork: ${selectedRemote.name} (${selectedRemote.url})\nFresh local candidate branch: ${branchName}\n\nThis native OMP session continues indefinitely until /contribute off, an input/review gate, interruption, or session exit. It consumes model tokens, runs tests/commands under normal approval policy, and may create commits on the candidate branch. /contribute review requires another exact approval before an absent candidate branch is pushed to this fork; it never opens a pull request.\n\nOn confirmation only: recheck the official base and fork, switch model, create this exact branch from the frozen base commit, activate the existing autoresearch tools, then start the turn. Global approval policy is unchanged.`,
 				);
 				if (!finalConfirmed) return;
+
+				const recheckedGoal = await fetchOfficialContributionGoal(ctx.cwd);
+				assertContributionGoalUnchanged(goal, recheckedGoal);
 
 				const recheckedRemoteUrl = await git.remote.url(ctx.cwd, selectedRemote.name);
 				if (recheckedRemoteUrl !== selectedRemote.url) {
@@ -784,6 +833,7 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 					}
 					const contribution: ContributionRunningState = {
 						status: "running",
+						authorization: Symbol("contribution-authorization"),
 						goal,
 						baseProof: frozenBaseProof,
 						branch: branchName,
