@@ -188,9 +188,11 @@ Safe terminal turns continue automatically in the same native OMP process.
 Automatic continuation stops for queued human input, an explicit
 `[CONTRIBUTE_PAUSE]` gate, an interrupted/aborted turn, a provider/tool error,
 `/contribute review`, `/contribute off`, session or tree/branch switching, or
-session exit. After an interruption or input gate, inspect `/contribute status`,
-resolve the gate explicitly, then send a deliberate message or stop the flow.
-There is no background restart.
+session exit. A switch, branch, or tree transition attempted while contribution
+startup, mutation, shutdown, or publication work is settling is canceled
+immediately; wait for the stop to finish, inspect `/contribute status`, then retry
+the transition. After an interruption or input gate, resolve the gate explicitly,
+then send a deliberate message or stop the flow. There is no background restart.
 
 `/contribute off` closes the process-local experiment session and deactivates its
 tools. It does not reset or delete the candidate branch or restore the previous
@@ -223,14 +225,17 @@ base/goal commit and the current segment goal commit, blob, and SHA-256.
 ## Review and fork-only handoff
 
 Prepare an unflagged `keep` result in the current segment, with its commit at exact
-`HEAD` and a completely clean worktree. Then enter:
+`HEAD` and a completely clean worktree. Publication also requires executable TDD
+evidence for the fixed harness command: an earlier, completed, unflagged
+`checks_failed` run in the same segment that actually exited nonzero or timed out,
+followed by the completed kept run exiting zero without timeout. Then enter:
 
 ```text
 /contribute review
 ```
 
 Review revalidates the recorded branch, exact candidate `HEAD`, frozen-base
-ancestry, current-segment kept result, clean worktree, unchanged fetch and
+ancestry, executable red/green evidence, clean worktree, unchanged fetch and
 push-effective remote URLs, and GitHub fork metadata. It builds the exact PR
 title/body and asks for a second confirmation. That confirmation authorizes only
 this push:
@@ -242,13 +247,21 @@ this push:
 The destination is the verified push-effective URL for the previously confirmed
 fork. A unique command-scoped remote uses an explicit `pushurl` through a random,
 exact-match URL alias. This bypasses configured `pushurl`, `pushInsteadOf`, and
-ordinary `insteadOf` redirection while retaining the verified destination.
+ordinary `insteadOf` redirection while retaining the verified destination. The
+push also disables local push hooks and recursive submodule publication so the
+confirmed exact refspec is its only repository publication effect.
 A force-with-lease expecting an absent remote branch prevents overwriting an
 existing ref. Nothing is pushed to the official repository. The command never
 creates, approves, or merges a pull request.
-Once that immutable push begins, lifecycle commands drain it rather than canceling
-an ambiguously completed transport. A successful push always retains the review
-URLs and draft handoff before the transition completes.
+
+Immediately before transport, OMP records and displays the immutable candidate,
+destination ref, review URLs, and exact draft as a durable “push outcome pending”
+intent. Once that immutable push begins, lifecycle commands drain it rather than
+canceling an ambiguously completed transport. A successful push always retains the
+review URLs and draft handoff before the transition completes. If the process exits
+before recording success, `/contribute status` in the reopened session checks the
+exact fork ref and reports recovered success, a different SHA, or an unknown
+outcome; it never retries the push.
 
 After the push, OMP stops the research loop and prints:
 
