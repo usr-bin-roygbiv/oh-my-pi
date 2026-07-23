@@ -115,15 +115,12 @@ describe("git subprocess config", () => {
 		const spawnCalls: SpawnCall[] = [];
 		vi.spyOn(Bun, "spawn").mockImplementation(createSpawnMock(spawnCalls));
 
-		await git.push(
-			"/work/pi",
-			{
-				remote: "fork",
-				refspec: "0123456789abcdef0123456789abcdef01234567:refs/heads/feature",
-				noVerify: true,
-				recurseSubmodules: "no",
-			},
-		);
+		await git.push("/work/pi", {
+			remote: "fork",
+			refspec: "0123456789abcdef0123456789abcdef01234567:refs/heads/feature",
+			noVerify: true,
+			recurseSubmodules: "no",
+		});
 
 		expect(spawnCalls).toHaveLength(1);
 		expect(spawnCalls[0]?.cmd).toEqual([

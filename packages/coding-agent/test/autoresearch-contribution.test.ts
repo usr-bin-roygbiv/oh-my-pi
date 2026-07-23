@@ -785,17 +785,14 @@ describe("contribution fork validation and publication", () => {
 				push: async (cwd, options) => {
 					await $`git -C ${cwd} reset --hard ${movedSha}`.quiet();
 					const pushPolicy = options as unknown as Record<string, unknown>;
-					await git.push(
-						cwd,
-						{
-							remote: `file://${remote.path()}`,
-							refspec: options.refspec,
-							forceWithLease: options.forceWithLease,
-							signal: options.signal,
-							noVerify: pushPolicy.noVerify,
-							recurseSubmodules: pushPolicy.recurseSubmodules,
-						} as never,
-					);
+					await git.push(cwd, {
+						remote: `file://${remote.path()}`,
+						refspec: options.refspec,
+						forceWithLease: options.forceWithLease,
+						signal: options.signal,
+						noVerify: pushPolicy.noVerify,
+						recurseSubmodules: pushPolicy.recurseSubmodules,
+					} as never);
 				},
 			};
 
@@ -2446,7 +2443,11 @@ describe("process-local contribution lifecycle", () => {
 					: transition === "session_before_branch"
 						? Promise.resolve(
 								handlerRequired<SessionBeforeBranchEvent, { cancel?: boolean }>(harness, transition)(
-									{ type: "session_before_branch", transitionId: `${transition}-publication`, entryId: "publication-source" },
+									{
+										type: "session_before_branch",
+										transitionId: `${transition}-publication`,
+										entryId: "publication-source",
+									},
 									harness.ctx as ExtensionContext,
 								),
 							)
@@ -2718,10 +2719,7 @@ describe("process-local contribution lifecycle", () => {
 			async onSetModel(callNumber): Promise<void> {
 				if (callNumber === 1) {
 					transitionPromise = Promise.resolve(
-						handlerRequired<SessionBeforeSwitchEvent, { cancel?: boolean }>(
-							harness,
-							"session_before_switch",
-						)(
+						handlerRequired<SessionBeforeSwitchEvent, { cancel?: boolean }>(harness, "session_before_switch")(
 							{
 								type: "session_before_switch",
 								transitionId: "activation-switch",

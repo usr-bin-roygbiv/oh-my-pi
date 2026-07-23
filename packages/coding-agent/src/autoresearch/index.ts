@@ -126,7 +126,8 @@ function parsePublicationDraft(
 ): ContributionPrDraft | null {
 	if (!isRecord(value)) return null;
 	if (!boundedString(value.title, 500) || !boundedString(value.body, 32 * 1024)) return null;
-	if (value.humanSummary !== "" || value.base !== "main" || value.head !== `${remote.owner}:${branchName}`) return null;
+	if (value.humanSummary !== "" || value.base !== "main" || value.head !== `${remote.owner}:${branchName}`)
+		return null;
 	if (value.baseSha !== baseSha || value.candidateHead !== candidateHead) return null;
 	if (!boundedString(value.scenario, 500) || !boundedString(value.result, 500)) return null;
 	if (
@@ -366,8 +367,7 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 		};
 	};
 
-	const mutationAdmissionClosed = (sessionKey: string): boolean =>
-		(mutationAdmissionHolds.get(sessionKey) ?? 0) > 0;
+	const mutationAdmissionClosed = (sessionKey: string): boolean => (mutationAdmissionHolds.get(sessionKey) ?? 0) > 0;
 
 	const invalidateContributionOperations = (sessionKey: string): Promise<void> | undefined => {
 		const settlements: Promise<void>[] = [];
@@ -411,7 +411,16 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 			const endpoint = `/repos/${remote.slug}/git/ref/heads/${encodeURIComponent(publication.branchName)}`;
 			const response = await git.github.json<unknown>(
 				ctx.cwd,
-				["api", endpoint, "--hostname", "github.com", "--method", "GET", "--jq", "{sha: .object.sha, type: .object.type}"],
+				[
+					"api",
+					endpoint,
+					"--hostname",
+					"github.com",
+					"--method",
+					"GET",
+					"--jq",
+					"{sha: .object.sha, type: .object.type}",
+				],
 				undefined,
 				{ repoProvided: true },
 			);
@@ -1204,13 +1213,7 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 					publicationOperation.phase = "committed";
 					api.appendEntry(
 						CONTRIBUTION_PUBLICATION_ENTRY,
-						createPublicationEntryData(
-							"success",
-							contribution,
-							reviewPushRemoteUrl,
-							currentHead,
-							publication,
-						),
+						createPublicationEntryData("success", contribution, reviewPushRemoteUrl, currentHead, publication),
 					);
 					runtime.contribution = {
 						...contribution,

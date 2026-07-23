@@ -7329,7 +7329,6 @@ export class AgentSession {
 		leafId: string,
 		transition: SessionTransitionState,
 	): Promise<{ cancelled: boolean; sessionFile: string | undefined }> {
-
 		if (this.#extensionRunner?.hasHandlers("session_before_branch")) {
 			const result = (await this.#extensionRunner.emit({
 				type: "session_before_branch",
@@ -7529,15 +7528,7 @@ export class AgentSession {
 		};
 
 		return this.#runSessionTransition("tree", transition =>
-			this.#navigateTree(
-				targetId,
-				options,
-				oldLeafId,
-				targetEntry,
-				entriesToSummarize,
-				preparation,
-				transition,
-			),
+			this.#navigateTree(targetId, options, oldLeafId, targetEntry, entriesToSummarize, preparation, transition),
 		);
 	}
 
@@ -7555,7 +7546,6 @@ export class AgentSession {
 		preparation: TreePreparation,
 		transition: SessionTransitionState,
 	): Promise<TreeNavigationResult> {
-
 		// Set up abort controller for summarization
 		this.#branchSummaryAbortController = new AbortController();
 		let hookSummary: { summary: string; details?: unknown } | undefined;
