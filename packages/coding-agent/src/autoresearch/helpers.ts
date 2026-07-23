@@ -1,5 +1,5 @@
-import * as git from "../utils/git";
 import { throwIfAborted } from "../tools/tool-errors";
+import * as git from "../utils/git";
 import type { ASIData, ASIValue, MetricDirection, NumericMetricMap } from "./types";
 
 export const METRIC_LINE_PREFIX = "METRIC";
