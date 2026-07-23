@@ -168,13 +168,14 @@ function makeBaseProof(): ContributionBaseProof {
 function makePublicationGit(overrides: Partial<ContributionPublicationGit> = {}): ContributionPublicationGit {
 	return {
 		readRemoteUrl: async () => FORK_URL,
+		readPushRemoteUrl: async () => FORK_URL,
 		readBranch: async () => CONTRIBUTION_BRANCH,
 		readHead: async () => CURRENT_HEAD,
 		readStatus: async () => "",
 		isAncestor: async () => true,
 		push: async () => {},
 		...overrides,
-	};
+	} as ContributionPublicationGit;
 }
 
 function makeApprovedDraft(
@@ -665,7 +666,7 @@ describe("contribution fork validation and publication", () => {
 		expect(pushes).toEqual([
 			{
 				cwd: "/work/repo",
-				remote: FORK_URL,
+				remote: "origin",
 				refspec: `HEAD:refs/heads/${CONTRIBUTION_BRANCH}`,
 				forceWithLease: `refs/heads/${CONTRIBUTION_BRANCH}:`,
 			},
@@ -678,6 +679,38 @@ describe("contribution fork validation and publication", () => {
 		expect(published.reviewUrl).not.toBe(published.compareUrl);
 		expect(published.prDraft.body).toContain(CONTRIBUTION_HUMAN_SUMMARY_PLACEHOLDER);
 		expect(published.prDraft).toEqual(approvedDraft);
+	});
+
+	it("rejects a push-effective URL rewrite away from the confirmed fork", async () => {
+		let pushCalls = 0;
+		const publicationGit = {
+			...makePublicationGit({
+				push: async () => {
+					pushCalls++;
+				},
+			}),
+			readPushRemoteUrl: async () => "https://github.com/can1357/oh-my-pi.git",
+		} as ContributionPublicationGit;
+		await expectContributionError(
+			publishContributionCandidate({
+				cwd: "/work/repo",
+				remoteName: "origin",
+				confirmedRemoteUrl: FORK_URL,
+				branchName: CONTRIBUTION_BRANCH,
+				currentBranch: CONTRIBUTION_BRANCH,
+				worktreeClean: true,
+				goal: makeGoal(),
+				candidate: makeCandidate(),
+				currentSegment: 2,
+				currentHead: CURRENT_HEAD,
+				baseProof: makeBaseProof(),
+				approvedDraft: makeApprovedDraft(),
+				git: publicationGit,
+				request: async () => ({ fork: true, parent: "can1357/oh-my-pi", source: "can1357/oh-my-pi" }),
+			}),
+			"remote_official",
+		);
+		expect(pushCalls).toBe(0);
 	});
 
 	it("rechecks frozen-base ancestry immediately before push", async () => {
