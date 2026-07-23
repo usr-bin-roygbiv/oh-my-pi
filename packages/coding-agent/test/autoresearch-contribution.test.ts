@@ -2346,7 +2346,6 @@ describe("process-local contribution lifecycle", () => {
 		const startedTransition = transitionPromise as Promise<void> | null;
 		if (!startedTransition) throw new Error("Expected session transition to start during notes branch read");
 		const [transitionResult] = await Promise.allSettled([startedTransition]);
-		await commandRequired(harness, "contribute").handler("off", harness.ctx);
 
 		expect(branchSignal).toBeDefined();
 		expect(branchSignal?.aborted).toBe(true);
@@ -2354,6 +2353,7 @@ describe("process-local contribution lifecycle", () => {
 		expect(transitionResult.status).toBe("fulfilled");
 		expect(storage.getSessionById(session.id)?.notes).toBe(originalNotes);
 		expect(harness.widgetUpdates).toBe(widgetUpdatesBefore);
+		await commandRequired(harness, "contribute").handler("off", harness.ctx);
 		expect(harness.activeTools).toEqual(["read", "bash"]);
 	});
 
@@ -2468,7 +2468,7 @@ describe("process-local contribution lifecycle", () => {
 								),
 							)
 			).then(async result => {
-				transitionResult = result;
+				transitionResult = result ?? undefined;
 				const kind =
 					transition === "session_before_switch"
 						? "switch"
@@ -2666,7 +2666,7 @@ describe("process-local contribution lifecycle", () => {
 							},
 							harness.ctx as ExtensionContext,
 						),
-					);
+					).then(result => result ?? undefined);
 				},
 			});
 			const initialTools = [...harness.activeTools];
@@ -2728,7 +2728,7 @@ describe("process-local contribution lifecycle", () => {
 							harness.ctx as ExtensionContext,
 						),
 					).then(async result => {
-						transitionResult = result;
+						transitionResult = result ?? undefined;
 						await handlerRequired<{
 							type: "session_transition_end";
 							transitionId: string;
