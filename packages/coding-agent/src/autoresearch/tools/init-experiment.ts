@@ -91,200 +91,204 @@ export function createInitExperimentTool(
 						: null;
 				if (preparedNewSegment) throwIfAborted(operationSignal);
 				await authorizeMutation();
-			let storage = await openAutoresearchStorageIfExists(ctx.cwd);
-			const runtime = options.getRuntime(ctx);
-			const direction = params.direction ?? "lower";
-			const metricUnit = params.metric_unit ?? "";
-			const scopePaths = dedupeStrings((params.scope_paths ?? []).map(normalizePathSpec));
-			const offLimits = dedupeStrings((params.off_limits ?? []).map(normalizePathSpec));
-			const constraints = dedupeStrings(params.constraints ?? []);
-			const secondaryMetrics = dedupeStrings(params.secondary_metrics ?? []);
-			const goal =
-				preparedNewSegment?.goal ??
-				(runtime.contribution.status === "running"
-					? runtime.contribution.goal.content
-					: params.goal?.trim() || null);
-			const maxIterations = options.forceUncapped?.(ctx)
-				? null
-				: params.max_iterations !== undefined && Number.isFinite(params.max_iterations) && params.max_iterations > 0
-					? Math.floor(params.max_iterations)
-					: null;
-			const branch =
-				(await awaitAbortable(operationSignal, () => git.branch.current(ctx.cwd, operationSignal))) ?? null;
-			const onAutoresearchBranch = branch?.startsWith("autoresearch/") ?? false;
+				let storage = await openAutoresearchStorageIfExists(ctx.cwd);
+				const runtime = options.getRuntime(ctx);
+				const direction = params.direction ?? "lower";
+				const metricUnit = params.metric_unit ?? "";
+				const scopePaths = dedupeStrings((params.scope_paths ?? []).map(normalizePathSpec));
+				const offLimits = dedupeStrings((params.off_limits ?? []).map(normalizePathSpec));
+				const constraints = dedupeStrings(params.constraints ?? []);
+				const secondaryMetrics = dedupeStrings(params.secondary_metrics ?? []);
+				const goal =
+					preparedNewSegment?.goal ??
+					(runtime.contribution.status === "running"
+						? runtime.contribution.goal.content
+						: params.goal?.trim() || null);
+				const maxIterations = options.forceUncapped?.(ctx)
+					? null
+					: params.max_iterations !== undefined &&
+							Number.isFinite(params.max_iterations) &&
+							params.max_iterations > 0
+						? Math.floor(params.max_iterations)
+						: null;
+				const branch =
+					(await awaitAbortable(operationSignal, () => git.branch.current(ctx.cwd, operationSignal))) ?? null;
+				const onAutoresearchBranch = branch?.startsWith("autoresearch/") ?? false;
 
-			const existing = storage?.getActiveSessionForBranch(branch) ?? null;
-			const isNewSegmentInit = existing !== null && params.new_segment === true;
-			const requiresHarness = !existing || isNewSegmentInit;
+				const existing = storage?.getActiveSessionForBranch(branch) ?? null;
+				const isNewSegmentInit = existing !== null && params.new_segment === true;
+				const requiresHarness = !existing || isNewSegmentInit;
 
-			if (requiresHarness) {
-				const harnessExists = await Bun.file(path.join(ctx.cwd, HARNESS_FILENAME)).exists();
-				if (!harnessExists) {
-					return {
-						content: [
-							{
-								type: "text",
-								text: `Error: ./${HARNESS_FILENAME} does not exist. Phase 1 of autoresearch is harness setup — write \`./${HARNESS_FILENAME}\` so it exits 0 and prints \`METRIC <name>=<value>\`, validate it via \`bash ${HARNESS_FILENAME}\`, then call init_experiment again.`,
-							},
-						],
-					};
-				}
-			}
-
-			let harnessCommitted = false;
-			let commitWarning: string | null = null;
-			if (requiresHarness && onAutoresearchBranch) {
-				const dirty = await detectPendingChanges(ctx.cwd, operationSignal);
-				if (dirty) {
-					await authorizeMutation();
-					try {
-						await git.stage.files(ctx.cwd, [], operationSignal);
-						const message = buildHarnessCommitMessage(goal, params.name);
-						await authorizeMutation();
-						await git.commit(ctx.cwd, message, { signal: operationSignal });
-						harnessCommitted = true;
-					} catch (err) {
-						throwIfAborted(operationSignal);
-						commitWarning = `Failed to auto-commit harness changes: ${err instanceof Error ? err.message : String(err)}. Recording baseline at current HEAD; discard may not preserve uncommitted harness files.`;
+				if (requiresHarness) {
+					const harnessExists = await Bun.file(path.join(ctx.cwd, HARNESS_FILENAME)).exists();
+					if (!harnessExists) {
+						return {
+							content: [
+								{
+									type: "text",
+									text: `Error: ./${HARNESS_FILENAME} does not exist. Phase 1 of autoresearch is harness setup — write \`./${HARNESS_FILENAME}\` so it exits 0 and prints \`METRIC <name>=<value>\`, validate it via \`bash ${HARNESS_FILENAME}\`, then call init_experiment again.`,
+								},
+							],
+						};
 					}
 				}
-			}
 
-			const baselineCommit = await tryReadHeadSha(ctx.cwd, operationSignal);
-			await authorizeMutation();
-			if (!storage) {
-				storage = await openAutoresearchStorage(ctx.cwd, authorizeMutation);
+				let harnessCommitted = false;
+				let commitWarning: string | null = null;
+				if (requiresHarness && onAutoresearchBranch) {
+					const dirty = await detectPendingChanges(ctx.cwd, operationSignal);
+					if (dirty) {
+						await authorizeMutation();
+						try {
+							await git.stage.files(ctx.cwd, [], operationSignal);
+							const message = buildHarnessCommitMessage(goal, params.name);
+							await authorizeMutation();
+							await git.commit(ctx.cwd, message, { signal: operationSignal });
+							harnessCommitted = true;
+						} catch (err) {
+							throwIfAborted(operationSignal);
+							commitWarning = `Failed to auto-commit harness changes: ${err instanceof Error ? err.message : String(err)}. Recording baseline at current HEAD; discard may not preserve uncommitted harness files.`;
+						}
+					}
+				}
+
+				const baselineCommit = await tryReadHeadSha(ctx.cwd, operationSignal);
 				await authorizeMutation();
-			}
+				if (!storage) {
+					storage = await openAutoresearchStorage(ctx.cwd, authorizeMutation);
+					await authorizeMutation();
+				}
 
-			let session: SessionRow;
-			let createdSession = false;
-			let bumpedSegment = false;
-			let abandonedRuns = 0;
+				let session: SessionRow;
+				let createdSession = false;
+				let bumpedSegment = false;
+				let abandonedRuns = 0;
 
-			if (!existing) {
-				session = storage.openSession({
-					name: params.name,
-					goal,
-					primaryMetric: params.primary_metric,
-					metricUnit,
-					direction,
-					preferredCommand: DEFAULT_HARNESS_COMMAND,
-					branch,
-					baselineCommit,
-					maxIterations,
-					scopePaths,
-					offLimits,
-					constraints,
-					secondaryMetrics,
-				});
-				createdSession = true;
-			} else {
-				abandonedRuns = storage.abandonPendingRuns(existing.id);
-				const updates: Parameters<typeof storage.updateSession>[1] = {
-					goal,
-					maxIterations,
-					scopePaths,
-					offLimits,
-					constraints,
-					secondaryMetrics,
-					primaryMetric: params.primary_metric,
-					metricUnit,
-					direction,
-					branch,
+				if (!existing) {
+					session = storage.openSession({
+						name: params.name,
+						goal,
+						primaryMetric: params.primary_metric,
+						metricUnit,
+						direction,
+						preferredCommand: DEFAULT_HARNESS_COMMAND,
+						branch,
+						baselineCommit,
+						maxIterations,
+						scopePaths,
+						offLimits,
+						constraints,
+						secondaryMetrics,
+					});
+					createdSession = true;
+				} else {
+					abandonedRuns = storage.abandonPendingRuns(existing.id);
+					const updates: Parameters<typeof storage.updateSession>[1] = {
+						goal,
+						maxIterations,
+						scopePaths,
+						offLimits,
+						constraints,
+						secondaryMetrics,
+						primaryMetric: params.primary_metric,
+						metricUnit,
+						direction,
+						branch,
+					};
+					if (isNewSegmentInit) {
+						updates.baselineCommit = baselineCommit;
+					}
+					let updated = storage.updateSession(existing.id, updates);
+					if (isNewSegmentInit) {
+						updated = storage.bumpSegment(existing.id);
+						bumpedSegment = true;
+					}
+					session = updated;
+				}
+
+				const loggedRuns = storage.listLoggedRuns(session.id);
+				const state = buildExperimentState(session, loggedRuns);
+				throwIfAborted(operationSignal);
+				mutationAuthorization?.assertRuntimeCurrent(ctx, operationSignal);
+				throwIfAborted(operationSignal);
+				runtime.state = state;
+				runtime.goal = session.goal;
+				runtime.autoresearchMode = true;
+				runtime.autoResumeArmed = true;
+				runtime.lastAutoResumePendingRunNumber = null;
+				runtime.lastRunDuration = null;
+				runtime.lastRunAsi = null;
+				runtime.lastRunArtifactDir = null;
+				runtime.lastRunNumber = null;
+				runtime.lastRunSummary = null;
+				options.dashboard.updateWidget(ctx, runtime);
+				options.dashboard.requestRender();
+				options.onSessionUpdated?.(ctx, state);
+				const segmentResultText = bumpedSegment ? (preparedNewSegment?.complete(state) ?? null) : null;
+
+				const lines: string[] = [];
+				if (abandonedRuns > 0) {
+					lines.push(
+						`Abandoned ${abandonedRuns} pending run${abandonedRuns === 1 ? "" : "s"} before reconfiguring.`,
+					);
+				}
+				if (harnessCommitted && session.baselineCommit) {
+					lines.push(`Committed harness setup at ${session.baselineCommit.slice(0, 12)}.`);
+				}
+				if (commitWarning) {
+					lines.push(commitWarning);
+				}
+				if (createdSession) {
+					lines.push(`Started session #${session.id}: ${session.name}`);
+				} else if (bumpedSegment) {
+					lines.push(`Bumped segment to ${session.currentSegment} for session #${session.id}: ${session.name}`);
+				} else {
+					lines.push(`Updated session #${session.id} (segment ${session.currentSegment}): ${session.name}`);
+				}
+				lines.push(
+					`Metric: ${session.primaryMetric} (${session.metricUnit || "unitless"}, ${session.direction} is better)`,
+				);
+				lines.push(`Benchmark entrypoint: ${DEFAULT_HARNESS_COMMAND}`);
+				if (session.scopePaths.length > 0) {
+					lines.push(`Files in scope: ${session.scopePaths.join(", ")}`);
+				}
+				if (session.offLimits.length > 0) {
+					lines.push(`Off limits: ${session.offLimits.join(", ")}`);
+				}
+				if (session.maxIterations !== null) {
+					lines.push(`Max iterations per segment: ${session.maxIterations}`);
+				}
+				if (session.branch) {
+					lines.push(`Active branch: ${session.branch}`);
+				}
+				if (session.baselineCommit) {
+					lines.push(`Baseline commit: ${session.baselineCommit.slice(0, 12)}`);
+				}
+				if (createdSession) {
+					lines.push(
+						"Phase 2: iteration loop is active. Run the baseline experiment with `run_experiment` and log it.",
+					);
+				} else if (bumpedSegment) {
+					lines.push("Run a fresh baseline for the new segment.");
+				}
+				if (requiresHarness && !onAutoresearchBranch) {
+					lines.push(
+						"Note: not on a dedicated `autoresearch/*` branch — `log_experiment discard` will only revert run-modified files, not reset to baseline.",
+					);
+				}
+
+				if (segmentResultText) lines.push(segmentResultText);
+				return {
+					content: [{ type: "text", text: lines.join("\n") }],
+					details: {
+						state,
+						createdSession,
+						bumpedSegment,
+						abandonedRuns,
+						harnessCommitted,
+						baselineCommit: session.baselineCommit,
+					},
 				};
-				if (isNewSegmentInit) {
-					updates.baselineCommit = baselineCommit;
-				}
-				let updated = storage.updateSession(existing.id, updates);
-				if (isNewSegmentInit) {
-					updated = storage.bumpSegment(existing.id);
-					bumpedSegment = true;
-				}
-				session = updated;
-			}
-
-			const loggedRuns = storage.listLoggedRuns(session.id);
-			const state = buildExperimentState(session, loggedRuns);
-			throwIfAborted(operationSignal);
-			mutationAuthorization?.assertRuntimeCurrent(ctx, operationSignal);
-			throwIfAborted(operationSignal);
-			runtime.state = state;
-			runtime.goal = session.goal;
-			runtime.autoresearchMode = true;
-			runtime.autoResumeArmed = true;
-			runtime.lastAutoResumePendingRunNumber = null;
-			runtime.lastRunDuration = null;
-			runtime.lastRunAsi = null;
-			runtime.lastRunArtifactDir = null;
-			runtime.lastRunNumber = null;
-			runtime.lastRunSummary = null;
-			options.dashboard.updateWidget(ctx, runtime);
-			options.dashboard.requestRender();
-			options.onSessionUpdated?.(ctx, state);
-			const segmentResultText = bumpedSegment ? (preparedNewSegment?.complete(state) ?? null) : null;
-
-			const lines: string[] = [];
-			if (abandonedRuns > 0) {
-				lines.push(`Abandoned ${abandonedRuns} pending run${abandonedRuns === 1 ? "" : "s"} before reconfiguring.`);
-			}
-			if (harnessCommitted && session.baselineCommit) {
-				lines.push(`Committed harness setup at ${session.baselineCommit.slice(0, 12)}.`);
-			}
-			if (commitWarning) {
-				lines.push(commitWarning);
-			}
-			if (createdSession) {
-				lines.push(`Started session #${session.id}: ${session.name}`);
-			} else if (bumpedSegment) {
-				lines.push(`Bumped segment to ${session.currentSegment} for session #${session.id}: ${session.name}`);
-			} else {
-				lines.push(`Updated session #${session.id} (segment ${session.currentSegment}): ${session.name}`);
-			}
-			lines.push(
-				`Metric: ${session.primaryMetric} (${session.metricUnit || "unitless"}, ${session.direction} is better)`,
-			);
-			lines.push(`Benchmark entrypoint: ${DEFAULT_HARNESS_COMMAND}`);
-			if (session.scopePaths.length > 0) {
-				lines.push(`Files in scope: ${session.scopePaths.join(", ")}`);
-			}
-			if (session.offLimits.length > 0) {
-				lines.push(`Off limits: ${session.offLimits.join(", ")}`);
-			}
-			if (session.maxIterations !== null) {
-				lines.push(`Max iterations per segment: ${session.maxIterations}`);
-			}
-			if (session.branch) {
-				lines.push(`Active branch: ${session.branch}`);
-			}
-			if (session.baselineCommit) {
-				lines.push(`Baseline commit: ${session.baselineCommit.slice(0, 12)}`);
-			}
-			if (createdSession) {
-				lines.push(
-					"Phase 2: iteration loop is active. Run the baseline experiment with `run_experiment` and log it.",
-				);
-			} else if (bumpedSegment) {
-				lines.push("Run a fresh baseline for the new segment.");
-			}
-			if (requiresHarness && !onAutoresearchBranch) {
-				lines.push(
-					"Note: not on a dedicated `autoresearch/*` branch — `log_experiment discard` will only revert run-modified files, not reset to baseline.",
-				);
-			}
-
-			if (segmentResultText) lines.push(segmentResultText);
-			return {
-				content: [{ type: "text", text: lines.join("\n") }],
-				details: {
-					state,
-					createdSession,
-					bumpedSegment,
-					abandonedRuns,
-					harnessCommitted,
-					baselineCommit: session.baselineCommit,
-				},
-			};
 			} finally {
 				mutationAuthorization?.settle();
 			}
