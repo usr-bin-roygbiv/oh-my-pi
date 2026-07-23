@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import { Buffer } from "node:buffer";
 import * as fs from "node:fs";
 import type { Api, Model } from "@oh-my-pi/pi-ai";
-import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { type GeneratedProvider, getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { createAutoresearchExtension } from "@oh-my-pi/pi-coding-agent/autoresearch";
 import {
 	assertContributionGoalUnchanged,
@@ -1052,7 +1052,7 @@ interface IntegrationHarness {
 	currentModel(): Model<Api> | undefined;
 }
 
-function requiredBundledModel(provider: string, id: string): Model<Api> {
+function requiredBundledModel(provider: GeneratedProvider, id: string): Model<Api> {
 	const model = getBundledModel(provider, id);
 	if (!model) throw new Error(`Expected bundled model ${provider}/${id}`);
 	return model;
@@ -1173,9 +1173,9 @@ function createIntegrationHarness(cwd: string, options: IntegrationHarnessOption
 	);
 	vi.spyOn(git, "push").mockImplementation(async (_workDir, pushOptions) => {
 		pushes.push({
-			remote: pushOptions.remote,
-			refspec: pushOptions.refspec,
-			forceWithLease: pushOptions.forceWithLease,
+			remote: pushOptions?.remote,
+			refspec: pushOptions?.refspec,
+			forceWithLease: pushOptions?.forceWithLease,
 		});
 	});
 	vi.spyOn(git.github, "json").mockImplementation(async (_workDir, args, signal) => {
@@ -1184,16 +1184,16 @@ function createIntegrationHarness(cwd: string, options: IntegrationHarnessOption
 		if (!endpoint) throw new Error(`Missing GitHub API endpoint in ${args.join(" ")}`);
 		githubEndpoints.push(endpoint);
 		if (endpoint === "/repos/alice/oh-my-pi") {
-			return { fork: true, parent: "can1357/oh-my-pi", source: "can1357/oh-my-pi" };
+			return { fork: true, parent: "can1357/oh-my-pi", source: "can1357/oh-my-pi" } as never;
 		}
 		if (endpoint.includes("/git/ref/heads/")) {
 			await options.onGoalRefRequest?.(signal);
 			activeGoal = goals[Math.min(goalLoadCount, goals.length - 1)] ?? goals[0];
 			goalLoadCount++;
-			return { sha: activeGoal.commitSha, type: "commit" };
+			return { sha: activeGoal.commitSha, type: "commit" } as never;
 		}
 		if (endpoint.includes("/git/commits/")) {
-			return { sha: activeGoal.commitSha, treeSha: activeGoal.treeSha };
+			return { sha: activeGoal.commitSha, treeSha: activeGoal.treeSha } as never;
 		}
 		if (endpoint.includes("/git/trees/")) {
 			return {
@@ -1206,7 +1206,7 @@ function createIntegrationHarness(cwd: string, options: IntegrationHarnessOption
 						size: Buffer.byteLength(activeGoal.content),
 					},
 				],
-			};
+			} as never;
 		}
 		if (endpoint.includes("/git/blobs/")) {
 			return {
@@ -1214,7 +1214,7 @@ function createIntegrationHarness(cwd: string, options: IntegrationHarnessOption
 				size: Buffer.byteLength(activeGoal.content),
 				encoding: "base64",
 				content: Buffer.from(activeGoal.content).toString("base64"),
-			};
+			} as never;
 		}
 		throw new Error(`Unexpected GitHub API endpoint ${endpoint}`);
 	});

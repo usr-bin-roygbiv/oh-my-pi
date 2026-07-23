@@ -329,7 +329,7 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 				const expectedSessionId = runtime.contribution.sessionId;
 				const storage = await openAutoresearchStorageIfExists(ctx.cwd);
 				const session = storage?.getActiveSessionForBranch(expectedBranch) ?? null;
-				if (!session || session.id !== expectedSessionId) {
+				if (storage === null || !session || session.id !== expectedSessionId) {
 					throw new Error("Contribution session changed before the next segment could be prepared.");
 				}
 				if (storage.getPendingRun(expectedSessionId)) {
