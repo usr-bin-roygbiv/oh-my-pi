@@ -208,6 +208,30 @@ describe("FileSessionStorage writer durability", () => {
 			await writer.close();
 		}
 	});
+
+	it("propagates sync errors from an explicitly durable flush", async () => {
+		const syncError = new Error("session fdatasync failed");
+		const fdatasync = vi.spyOn(fs, "fdatasyncSync").mockImplementation(() => {
+			throw syncError;
+		});
+		const fsync = vi.spyOn(fs, "fsyncSync").mockImplementation(() => {
+			throw syncError;
+		});
+		const sessionPath = path.join(tempDir, "sync-error.jsonl");
+		const writer = new FileSessionStorage().openWriter(sessionPath, { flags: "w" });
+		const flush = writer.flush.bind(writer) as (options?: { durable?: boolean }) => Promise<void>;
+		try {
+			await writer.append('{"type":"session"}\n');
+			await expect(flush()).resolves.toBeUndefined();
+			expect(fdatasync).not.toHaveBeenCalled();
+			expect(fsync).not.toHaveBeenCalled();
+
+			await expect(flush({ durable: true })).rejects.toBe(syncError);
+			expect(fdatasync.mock.calls.length + fsync.mock.calls.length).toBe(1);
+		} finally {
+			await writer.close();
+		}
+	});
 });
 
 describe("FileSessionStorage.updateSessionTitle", () => {

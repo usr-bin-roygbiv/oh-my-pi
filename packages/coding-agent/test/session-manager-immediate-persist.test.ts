@@ -3,6 +3,11 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
+import {
+	MemorySessionStorage,
+	type SessionStorageWriter,
+} from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
 const tempDirs: TempDir[] = [];
@@ -37,6 +42,42 @@ function assistantMessage(text: string) {
 		stopReason: "stop" as const,
 		timestamp: Date.now(),
 	};
+}
+type FlushOptions = { durable?: boolean };
+
+class FlushObservingStorage extends MemorySessionStorage {
+	readonly flushCalls: Array<FlushOptions | undefined> = [];
+	durableFlushError: Error | undefined;
+
+	override openWriter(
+		writerPath: string,
+		options?: Parameters<MemorySessionStorage["openWriter"]>[1],
+	): SessionStorageWriter {
+		const writer = super.openWriter(writerPath, options);
+		const storage = this;
+		return {
+			append: line => writer.append(line),
+			async flush(flushOptions?: FlushOptions) {
+				storage.flushCalls.push(flushOptions);
+				if (flushOptions?.durable && storage.durableFlushError) throw storage.durableFlushError;
+				await writer.flush();
+			},
+			isOpen: () => writer.isOpen(),
+			close: () => writer.close(),
+			getError: () => writer.getError(),
+		};
+	}
+}
+
+function createManagerWithOpenWriter(storage: FlushObservingStorage): SessionManager {
+	const manager = SessionManager.create("/cwd", "/sessions", storage);
+	manager.appendMessage(assistantMessage("persisted"));
+	manager.appendMessage({ role: "user", content: "opens append writer", timestamp: 1 });
+	return manager;
+}
+
+function flushExtensionSessionDurably(context: Pick<ExtensionContext, "sessionManager">): Promise<void> {
+	return context.sessionManager.flush({ durable: true });
 }
 
 function readJsonl(file: string): Array<Record<string, unknown>> {
@@ -124,5 +165,35 @@ describe("SessionManager immediate JSONL persistence", () => {
 		expect(entries).toHaveLength(2);
 		expect(messageRole(entries[1] ?? {})).toBe("user");
 		expect(messageContent(entries[1] ?? {})).toBe("persist me");
+	});
+});
+
+describe("SessionManager flush durability", () => {
+	it("keeps an ordinary flush non-durable", async () => {
+		const storage = new FlushObservingStorage();
+		const manager = createManagerWithOpenWriter(storage);
+
+		await manager.flush();
+
+		expect(storage.flushCalls).toEqual([undefined]);
+	});
+
+	it("exposes an extension-visible durable flush and forwards the durable option", async () => {
+		const storage = new FlushObservingStorage();
+		const manager = createManagerWithOpenWriter(storage);
+
+		await flushExtensionSessionDurably({ sessionManager: manager });
+
+		expect(storage.flushCalls).toEqual([{ durable: true }]);
+	});
+
+	it("propagates a durable writer sync error to the extension caller", async () => {
+		const storage = new FlushObservingStorage();
+		const manager = createManagerWithOpenWriter(storage);
+		const syncError = new Error("session sync failed");
+		storage.durableFlushError = syncError;
+
+		await expect(flushExtensionSessionDurably({ sessionManager: manager })).rejects.toBe(syncError);
+		expect(storage.flushCalls).toEqual([{ durable: true }]);
 	});
 });
