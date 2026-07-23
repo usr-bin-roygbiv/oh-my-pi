@@ -1827,15 +1827,13 @@ describe("process-local contribution lifecycle", () => {
 			.finally(() => {
 				offSettled = true;
 			});
-		const offBeforeRelease = await Promise.race([
-			offPromise.then(() => "settled" as const),
-			Promise.resolve("pending" as const),
-		]);
+		for (let turn = 0; turn < 4; turn++) await Promise.resolve();
+		const offSettledBeforeRelease = offSettled;
 
 		releaseRollback.resolve();
 		const [startResult, offResult] = await Promise.allSettled([startPromise, offPromise]);
 
-		expect(offBeforeRelease).toBe("pending");
+		expect(offSettledBeforeRelease).toBe(false);
 		expect(offSettled).toBe(true);
 		expect(startResult.status).toBe("fulfilled");
 		expect(offResult.status).toBe("fulfilled");
