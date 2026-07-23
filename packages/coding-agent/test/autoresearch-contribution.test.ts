@@ -70,6 +70,11 @@ const CURRENT_HEAD = "4".repeat(40);
 const GOAL_CONTENT = "\n# Faster contributor loop\n\nReduce latency without weakening validation.\n";
 const FORK_URL = "git@github.com:alice/oh-my-pi.git";
 const CONTRIBUTION_BRANCH = "autoresearch/faster-contributor-loop-20260723";
+const CONTRIBUTION_HARNESS_SHA256_ASI_KEY = "_omp_contribution_harness_sha256";
+const CONTRIBUTION_WORKTREE_TREE_ASI_KEY = "_omp_contribution_worktree_tree";
+const HARNESS_SHA256 = "a".repeat(64);
+const CHANGED_HARNESS_SHA256 = "b".repeat(64);
+const CANDIDATE_TREE_SHA = "c".repeat(40);
 
 interface GoalRequestFixture {
 	request: ContributionGitHubRequest;
@@ -824,6 +829,33 @@ describe("contribution fork validation and publication", () => {
 		}
 	});
 
+	it("ignores replacement refs and legacy grafts for ancestry proof", async () => {
+		const source = TempDir.createSync("@pi-contribution-ancestry-source-");
+		try {
+			await $`git -C ${source.path()} init -b main`.quiet();
+			await Bun.write(`${source.path()}/proof.txt`, "base\n");
+			await $`git -C ${source.path()} add proof.txt`.quiet();
+			await $`git -C ${source.path()} -c user.name=OMP -c user.email=omp@example.invalid commit -m base`.quiet();
+			const baseSha = (await $`git -C ${source.path()} rev-parse HEAD`.quiet()).text().trim();
+			await $`git -C ${source.path()} checkout --orphan unrelated`.quiet();
+			await $`git -C ${source.path()} rm -rf .`.quiet();
+			await Bun.write(`${source.path()}/unrelated.txt`, "unrelated\n");
+			await $`git -C ${source.path()} add unrelated.txt`.quiet();
+			await $`git -C ${source.path()} -c user.name=OMP -c user.email=omp@example.invalid commit -m unrelated`.quiet();
+			const unrelatedSha = (await $`git -C ${source.path()} rev-parse HEAD`.quiet()).text().trim();
+
+			await $`git -C ${source.path()} replace --graft ${unrelatedSha} ${baseSha}`.quiet();
+			expect(await git.isAncestor(source.path(), baseSha, unrelatedSha)).toBe(false);
+
+			await $`git -C ${source.path()} replace -d ${unrelatedSha}`.quiet();
+			await fs.promises.mkdir(`${source.path()}/.git/info`, { recursive: true });
+			await Bun.write(`${source.path()}/.git/info/grafts`, `${unrelatedSha} ${baseSha}\n`);
+			expect(await git.isAncestor(source.path(), baseSha, unrelatedSha)).toBe(false);
+		} finally {
+			source.removeSync();
+		}
+	});
+
 	it("rejects a push-effective URL rewrite away from the confirmed fork", async () => {
 		let pushCalls = 0;
 		const publicationGit = {
@@ -1343,6 +1375,8 @@ interface IntegrationHarnessOptions {
 	refExistsResults?: boolean[];
 	ancestryResults?: boolean[];
 	publishedRefSha?: string;
+	flushFailureAt?: number;
+	sessionFile?: string | null;
 }
 
 interface CapturedNotification {
@@ -1467,6 +1501,7 @@ function createIntegrationHarness(cwd: string, options: IntegrationHarnessOption
 	let sessionId = options.sessionId ?? "contribution-session";
 	let sessionBranch: unknown[] = [];
 	let setActiveToolsCallCount = 0;
+	let flushCallCount = 0;
 	const goals = options.goalVersions ?? defaultGoalVersions();
 	let activeGoal = goals[0];
 	let goalLoadCount = 0;
@@ -1671,6 +1706,11 @@ function createIntegrationHarness(cwd: string, options: IntegrationHarnessOption
 			getBranch: () => sessionBranch as never,
 			getEntries: () => [],
 			getSessionId: () => sessionId,
+			flush: async (): Promise<void> => {
+				flushCallCount++;
+				if (options.flushFailureAt === flushCallCount) throw new Error("session persistence failed");
+			},
+			getSessionFile: () => (options.sessionFile === null ? undefined : (options.sessionFile ?? "/tmp/omp.jsonl")),
 		},
 		shutdown(): void {},
 		switchSession: async () => ({ cancelled: false }),
@@ -1807,6 +1847,7 @@ interface KeptContributionOptions {
 	candidateExitCode?: number;
 	candidateTimedOut?: boolean;
 	redProof?: "valid" | "missing" | "passing" | "flagged";
+	harnessProof?: "valid" | "missing" | "changed";
 }
 
 async function prepareKeptContribution(
@@ -1845,7 +1886,13 @@ async function prepareKeptContribution(
 			timedOut: false,
 			parsedPrimary: null,
 			parsedMetrics: null,
-			parsedAsi: { hypothesis: "The focused contribution scenario should fail before the fix." },
+			parsedAsi:
+				options.harnessProof === "missing"
+					? { hypothesis: "The focused contribution scenario should fail before the fix." }
+					: {
+							hypothesis: "The focused contribution scenario should fail before the fix.",
+							[CONTRIBUTION_HARNESS_SHA256_ASI_KEY]: HARNESS_SHA256,
+						},
 		});
 		storage.markRunLogged({
 			runId: redRun.id,
@@ -1879,7 +1926,15 @@ async function prepareKeptContribution(
 		timedOut: options.candidateTimedOut ?? false,
 		parsedPrimary: 1,
 		parsedMetrics: { runtime_ms: 1 },
-		parsedAsi: { hypothesis: "Ran the focused contribution scenario." },
+		parsedAsi:
+			options.harnessProof === "missing"
+				? { hypothesis: "Ran the focused contribution scenario." }
+				: {
+						hypothesis: "Ran the focused contribution scenario.",
+						[CONTRIBUTION_HARNESS_SHA256_ASI_KEY]:
+							options.harnessProof === "changed" ? CHANGED_HARNESS_SHA256 : HARNESS_SHA256,
+						[CONTRIBUTION_WORKTREE_TREE_ASI_KEY]: CANDIDATE_TREE_SHA,
+					},
 	});
 	storage.markRunLogged({
 		runId: run.id,
@@ -2056,6 +2111,56 @@ describe("process-local contribution lifecycle", () => {
 		expect(mutationResult).toMatchObject({ status: "rejected", reason: { name: "ToolAbortError" } });
 		expect(secondResult.status).toBe("fulfilled");
 		expect(snapshotStorageArtifacts(dbDir.path())).toEqual([]);
+	});
+
+	it("waits for in-flight rehydrate before contribution startup", async () => {
+		const harness = createIntegrationHarness(cwd.path());
+		harness.setSessionBranch([
+			{
+				type: "custom",
+				customType: "autoresearch-control",
+				id: "startup-rehydrate",
+				parentId: null,
+				timestamp: new Date(0).toISOString(),
+				data: { mode: "off" },
+			},
+		]);
+		const branchEntered = Promise.withResolvers<void>();
+		const releaseBranch = Promise.withResolvers<void>();
+		let branchReadCount = 0;
+		vi.spyOn(git.branch, "current").mockImplementation(async () => {
+			branchReadCount++;
+			if (branchReadCount === 1) {
+				branchEntered.resolve();
+				await releaseBranch.promise;
+			}
+			return "main";
+		});
+		const sessionStart = handlerRequired<SessionStartEvent>(harness, "session_start");
+		const rehydratePromise = Promise.resolve(
+			sessionStart({ type: "session_start" } as SessionStartEvent, harness.ctx as ExtensionContext),
+		);
+		await branchEntered.promise;
+		const startPromise = startContribution(harness);
+		for (let turn = 0; turn < 4; turn++) await Promise.resolve();
+		const confirmationsBeforeRehydrate = harness.confirmCalls.length;
+
+		releaseBranch.resolve();
+		const [rehydrateResult, startResult] = await Promise.allSettled([rehydratePromise, startPromise]);
+
+		expect(confirmationsBeforeRehydrate).toBe(0);
+		expect(rehydrateResult.status).toBe("fulfilled");
+		expect(startResult.status).toBe("fulfilled");
+		await commandRequired(harness, "contribute").handler("status", harness.ctx);
+		expect(harness.notifications.at(-1)?.message).toStartWith("Contribution running on ");
+		expect(harness.activeTools).toEqual([
+			"read",
+			"bash",
+			"init_experiment",
+			"run_experiment",
+			"log_experiment",
+			"update_notes",
+		]);
 	});
 
 	it("does not wedge ordinary autoresearch when a tree transition never commits", async () => {
@@ -2305,6 +2410,51 @@ describe("process-local contribution lifecycle", () => {
 		expect(pendingRun?.completedAt).toBeNull();
 		expect(storage.listLoggedRuns(session.id)).toEqual([]);
 		expect(harness.activeTools).toEqual(["read", "bash"]);
+	});
+
+	it("refuses to keep files changed after the passing harness execution", async () => {
+		await $`git -C ${cwd.path()} init -b main`.quiet();
+		await $`git -C ${cwd.path()} config user.name OMP`.quiet();
+		await $`git -C ${cwd.path()} config user.email omp@example.invalid`.quiet();
+		await Bun.write(`${cwd.path()}/autoresearch.sh`, "#!/usr/bin/env bash\necho METRIC runtime_ms=1\n");
+		await $`git -C ${cwd.path()} add autoresearch.sh`.quiet();
+		await $`git -C ${cwd.path()} commit -m baseline`.quiet();
+		const baseHead = (await $`git -C ${cwd.path()} rev-parse HEAD`.quiet()).text().trim();
+		const harness = createIntegrationHarness(cwd.path());
+		await startContribution(harness);
+		const { session, storage } = await prepareInitializedContribution(harness, cwd.path());
+		vi.spyOn(bashExecutor, "executeBash").mockResolvedValue({
+			output: "METRIC runtime_ms=1",
+			exitCode: 0,
+			cancelled: false,
+			truncated: false,
+			totalLines: 1,
+			totalBytes: 19,
+			outputLines: 1,
+			outputBytes: 19,
+		});
+		const run = harness.tools.get("run_experiment");
+		const log = harness.tools.get("log_experiment");
+		if (!run || !log) throw new Error("Expected contribution run and log tools");
+		await run.execute("passing-tree", {}, undefined, undefined, harness.ctx as ExtensionContext);
+
+		await Bun.write(`${cwd.path()}/untested.ts`, "export const untested = true;\n");
+		harness.setStatusText("?? untested.ts\0");
+		const logResult = await log.execute(
+			"keep-untested-tree",
+			{ status: "keep", metric: 1, description: "must not keep untested bytes" },
+			undefined,
+			undefined,
+			harness.ctx as ExtensionContext,
+		);
+		const logText = logResult.content
+			.map(part => (part.type === "text" ? part.text : ""))
+			.join("\n");
+
+		expect(logText).toContain("changed after the harness execution");
+		expect((await $`git -C ${cwd.path()} rev-parse HEAD`.quiet()).text().trim()).toBe(baseHead);
+		expect(storage.getPendingRun(session.id)).not.toBeNull();
+		expect(storage.listLoggedRuns(session.id)).toEqual([]);
 	});
 
 	it("aborts and drains update_notes before SQLite and runtime mutation on session transition", async () => {
@@ -2565,7 +2715,7 @@ describe("process-local contribution lifecycle", () => {
 		const harness = createIntegrationHarness(cwd.path(), { publishedRefSha: CURRENT_HEAD });
 		const remote = validateContributionForkRemote(FORK_URL);
 		const goal = makeGoal();
-		const candidate = makeCandidate();
+		const candidate = makeCandidate({ scenario: "", description: "" });
 		const baseProof = makeBaseProof();
 		const prDraft = buildContributionPrDraft(goal, candidate, remote, CONTRIBUTION_BRANCH, baseProof);
 		const reviewUrl = buildContributionReviewUrl(remote, baseProof.baseSha, candidate.commit);
@@ -2621,6 +2771,40 @@ describe("process-local contribution lifecycle", () => {
 		expect(harness.appendEntries).toEqual([]);
 		expect(harness.sentUserMessages).toEqual([]);
 		expect(snapshotStorageArtifacts(dbDir.path())).toEqual([]);
+	});
+
+	it("rejects contribution mode when the transcript is not persistent", async () => {
+		const harness = createIntegrationHarness(cwd.path(), {
+			confirmAnswers: [true, true],
+			sessionFile: null,
+		});
+
+		await startContribution(harness);
+
+		expect(harness.confirmCalls).toEqual([]);
+		expect(harness.githubEndpoints).toEqual([]);
+		expect(harness.checkoutNewCalls).toEqual([]);
+		expect(harness.notifications.at(-1)).toMatchObject({
+			type: "error",
+			message: expect.stringContaining("persistent session"),
+		});
+	});
+
+	it("refuses publication when the durable intent cannot be flushed", async () => {
+		const harness = createIntegrationHarness(cwd.path(), {
+			confirmAnswers: [true, true, true],
+			flushFailureAt: 1,
+		});
+		await startContribution(harness);
+		await prepareKeptContribution(harness, cwd.path());
+
+		await commandRequired(harness, "contribute").handler("review", harness.ctx);
+
+		expect(harness.pushes).toEqual([]);
+		expect(harness.notifications.at(-1)).toMatchObject({
+			type: "error",
+			message: expect.stringContaining("persistence failed"),
+		});
 	});
 
 	it("final cancellation shows exact frozen provenance and branch but performs no mutation", async () => {
@@ -3178,6 +3362,8 @@ describe("process-local contribution lifecycle", () => {
 		{ name: "the prior failing proof is missing", options: { redProof: "missing" as const } },
 		{ name: "the prior checks_failed proof actually passed", options: { redProof: "passing" as const } },
 		{ name: "the prior failing proof is flagged", options: { redProof: "flagged" as const } },
+		{ name: "the proof harness identity is missing", options: { harnessProof: "missing" as const } },
+		{ name: "the proof harness changed between red and green", options: { harnessProof: "changed" as const } },
 	] as const) {
 		it(`rejects publication when ${testCase.name}`, async () => {
 			const harness = createIntegrationHarness(cwd.path(), { confirmAnswers: [true, true, true] });
