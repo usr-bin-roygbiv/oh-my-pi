@@ -2161,7 +2161,7 @@ describe("process-local contribution lifecycle", () => {
 			stageSignal = signal;
 		});
 		vi.spyOn(git, "commit").mockImplementation(async (_workDir, _message, options) => {
-			commitSignal = options.signal;
+			commitSignal = options?.signal;
 			offPromise = commandRequired(harness, "contribute")
 				.handler("off", harness.ctx)
 				.finally(() => {
