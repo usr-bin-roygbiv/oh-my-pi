@@ -67,6 +67,25 @@ describe("OAuthCallbackFlow callback security", () => {
 		}
 	});
 
+	it("surfaces provider denials that carry the expected state instead of waiting for the timeout", async () => {
+		const { info, abort, login } = await startFlow();
+		const authUrl = new URL(info.url);
+		const redirectUri = authUrl.searchParams.get("redirect_uri");
+		const state = authUrl.searchParams.get("state");
+		if (!redirectUri || !state) throw new Error("OAuth test flow did not advertise its callback parameters");
+
+		try {
+			const response = await fetch(
+				`${redirectUri}?error=access_denied&error_description=User%20denied&state=${encodeURIComponent(state)}`,
+			);
+			expect(response.status).toBe(500);
+			await expect(login).rejects.toThrow("Authorization failed: User denied");
+		} finally {
+			abort.abort("test cleanup");
+			await login.catch(() => undefined);
+		}
+	});
+
 	it("binds localhost callback URLs to the IPv4 loopback interface", async () => {
 		const serve = Bun.serve;
 		let hostname: string | undefined;

@@ -64,6 +64,7 @@ export abstract class OAuthCallbackFlow {
 	allowPortFallback: boolean;
 	#manualInputOnly: boolean;
 	#callbackResolve?: (result: CallbackResult) => void;
+	#callbackReject?: (error: Error) => void;
 	/**
 	 * Authorization URL the `/launch` route currently redirects to. Set by
 	 * {@link login} after {@link generateAuthUrl} and before {@link OAuthController.onAuth}
@@ -338,6 +339,17 @@ export abstract class OAuthCallbackFlow {
 			queueMicrotask(() => {
 				resolve?.({ code: resultState.code, state: resultState.state });
 			});
+		} else if (error && (!expectedState || state === expectedState)) {
+			// The redirect carries our state nonce, so it came from the genuine
+			// authorization flow (e.g. the user denied the consent screen).
+			// Surface the denial now instead of leaving the login waiting for
+			// the 5-minute timeout. Errors WITHOUT the expected state stay
+			// ignored — any local process can forge those (#4106).
+			const reject = this.#callbackReject;
+			const message = resultState.error ?? `Authorization failed: ${errorDescription}`;
+			queueMicrotask(() => {
+				reject?.(new AIError.OAuthError(message, { kind: "device-auth" }));
+			});
 		}
 
 		return new Response(
@@ -359,9 +371,11 @@ export abstract class OAuthCallbackFlow {
 
 		const callback = Promise.withResolvers<CallbackResult>();
 		this.#callbackResolve = callback.resolve;
+		this.#callbackReject = callback.reject;
 
 		signal.addEventListener("abort", () => {
 			this.#callbackResolve = undefined;
+			this.#callbackReject = undefined;
 			callback.reject(new AIError.LoginCancelledError(`OAuth callback cancelled: ${signal.reason}`));
 		});
 		const callbackPromise = callback.promise;
