@@ -893,7 +893,7 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 				};
 				const startContribution = runtime.contribution;
 				const startState = runtime.state;
-				let ownedContribution = startContribution;
+				let ownedContribution: AutoresearchRuntime["contribution"] = startContribution;
 				let ownedState = startState;
 				contributionStartSessionKey = startSessionKey;
 				contributionStartTransaction = startTransaction;
