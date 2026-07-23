@@ -59,6 +59,7 @@ import type {
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import * as git from "@oh-my-pi/pi-coding-agent/utils/git";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { $ } from "bun";
 
 afterEach(() => {
 	vi.restoreAllMocks();
@@ -711,6 +712,43 @@ describe("contribution fork validation and publication", () => {
 			"remote_official",
 		);
 		expect(pushCalls).toBe(0);
+	});
+
+	it("uses an explicit command-scoped pushurl that ignores pushInsteadOf", async () => {
+		const source = TempDir.createSync("@pi-contribution-push-source-");
+		const intended = TempDir.createSync("@pi-contribution-push-intended-");
+		const redirected = TempDir.createSync("@pi-contribution-push-redirected-");
+		try {
+			const intendedUrl = `file://${intended.path()}`;
+			const redirectedUrl = `file://${redirected.path()}`;
+			await $`git init --bare ${intended.path()}`.quiet();
+			await $`git init --bare ${redirected.path()}`.quiet();
+			await $`git -C ${source.path()} init -b main`.quiet();
+			await Bun.write(`${source.path()}/proof.txt`, "verified fork only\n");
+			await $`git -C ${source.path()} add proof.txt`.quiet();
+			await $`git -C ${source.path()} -c user.name=OMP -c user.email=omp@example.invalid commit -m proof`.quiet();
+			await $`git -C ${source.path()} remote add origin ${intendedUrl}`.quiet();
+			const rewriteKey = `url.${redirectedUrl}.pushInsteadOf`;
+			await $`git -C ${source.path()} config ${rewriteKey} ${intendedUrl}`.quiet();
+
+			await git.push(source.path(), {
+				remote: "origin",
+				verifiedRemoteUrl: intendedUrl,
+				refspec: "HEAD:refs/heads/candidate",
+			});
+
+			const intendedRef = await $`git --git-dir ${intended.path()} show-ref --verify --quiet refs/heads/candidate`
+				.quiet()
+				.nothrow();
+			const redirectedRef =
+				await $`git --git-dir ${redirected.path()} show-ref --verify --quiet refs/heads/candidate`.quiet().nothrow();
+			expect(intendedRef.exitCode).toBe(0);
+			expect(redirectedRef.exitCode).not.toBe(0);
+		} finally {
+			source.removeSync();
+			intended.removeSync();
+			redirected.removeSync();
+		}
 	});
 
 	it("rechecks frozen-base ancestry immediately before push", async () => {
