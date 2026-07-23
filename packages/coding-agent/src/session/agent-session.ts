@@ -219,7 +219,6 @@ import {
 import { disposeRubyKernelSessionsByOwner } from "../eval/rb/executor";
 import { defaultEvalSessionId } from "../eval/session-id";
 import { type BashResult, executeBash as executeBashCommand } from "../exec/bash-executor";
-import { exportSessionToHtml } from "../export/html";
 import type { TtsrManager, TtsrMatchContext } from "../export/ttsr";
 import type { LoadedCustomCommand } from "../extensibility/custom-commands";
 import type { CustomTool, CustomToolContext } from "../extensibility/custom-tools/types";
@@ -18258,6 +18257,9 @@ export class AgentSession {
 	 * @param useUserThemes Bundle the dark and light TUI themes selected in settings
 	 */
 	async exportToHtml(outputPath?: string, useUserThemes = false): Promise<string> {
+		// Lazy import: the export module embeds the HTML template and pre-built
+		// tool renderers as text; only `/export` should pay that load.
+		const { exportSessionToHtml } = await import("../export/html");
 		return exportSessionToHtml(this.sessionManager, this.state, {
 			outputPath,
 			palette: useUserThemes ? "theme" : "web",

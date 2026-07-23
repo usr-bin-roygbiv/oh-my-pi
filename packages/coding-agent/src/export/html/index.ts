@@ -6,6 +6,7 @@ import { getResolvedThemeColors, getThemeExportColors } from "../../modes/theme/
 import type { SessionEntry, SessionHeader } from "../../session/session-entries";
 import { loadEntriesFromFile } from "../../session/session-loader";
 import { SessionManager } from "../../session/session-manager";
+import type { ExportThemeNames } from "./args";
 import templateCss from "./template.css" with { type: "text" };
 import templateHtml from "./template.html" with { type: "text" };
 import templateJs from "./template.js" with { type: "text" };
@@ -13,6 +14,8 @@ import templateJs from "./template.js" with { type: "text" };
 // run automatically by root `prepare` on install and by `prepack` at publish.
 import toolViewsJs from "./tool-views.generated.js" with { type: "text" };
 import { webExportThemeVars } from "./web-palette";
+
+export { parseExportArgs, type ExportThemeNames } from "./args";
 
 let cachedTemplate: string | undefined;
 
@@ -33,20 +36,6 @@ export function getTemplate(): string {
 		.replace("<template-tool-views/>", () => `<script>${toolViewsJs}</script>`)
 		.replace("<template-js/>", () => `<script>${templateJs}</script>`);
 	return cachedTemplate;
-}
-
-export interface ExportThemeNames {
-	dark: string;
-	light: string;
-}
-
-/** Parse `/export [--themes] [path]`; paths containing spaces were never supported. */
-export function parseExportArgs(args: string): { outputPath?: string; useUserThemes: boolean } {
-	const parts = args.trim().split(/\s+/).filter(Boolean);
-	const useUserThemes = parts.includes("--themes");
-	const paths = parts.filter(part => part !== "--themes");
-	if (paths.length > 1) throw new Error("Usage: /export [--themes] [path]");
-	return { outputPath: paths[0], useUserThemes };
 }
 
 export interface ExportOptions {

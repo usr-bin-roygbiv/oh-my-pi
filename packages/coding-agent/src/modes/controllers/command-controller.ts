@@ -15,7 +15,7 @@ import { formatDuration, Snowflake, sanitizeText } from "@oh-my-pi/pi-utils";
 import { shouldEnableAppendOnlyContext } from "../../config/append-only-context-mode";
 import { type BashResult, isPersistentShellCdCommand } from "../../exec/bash-executor";
 import { type LoadedCustomShare, loadCustomShare } from "../../export/custom-share";
-import { parseExportArgs } from "../../export/html";
+import { parseExportArgs } from "../../export/html/args";
 import { shareSession } from "../../export/share";
 import type { CompactOptions } from "../../extensibility/extensions/types";
 import {

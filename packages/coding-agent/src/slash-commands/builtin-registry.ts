@@ -16,7 +16,7 @@ import {
 	resolveActiveProjectRegistryPath,
 	resolveOrDefaultProjectRegistryPath,
 } from "../discovery/helpers.js";
-import { parseExportArgs } from "../export/html";
+import { parseExportArgs } from "../export/html/args";
 import { shareSession } from "../export/share";
 import { PluginManager } from "../extensibility/plugins";
 import {
