@@ -614,6 +614,23 @@ export async function publishContributionCandidate(
 			"The contribution candidate does not descend from the frozen official base.",
 		);
 	}
+	const [finalBranch, finalHead, finalStatusOutput] = await Promise.all([
+		publicationGit.readBranch(options.cwd, options.signal),
+		publicationGit.readHead(options.cwd, options.signal),
+		publicationGit.readStatus(options.cwd, options.signal),
+	]);
+	if (finalBranch !== options.branchName) {
+		throw new ContributionError(
+			"branch_mismatch",
+			`Contribution review requires the recorded branch ${options.branchName} to remain checked out.`,
+		);
+	}
+	if (finalHead !== options.candidate.commit) {
+		throw new ContributionError("candidate_head_mismatch", "The approved contribution candidate is no longer HEAD.");
+	}
+	if (finalStatusOutput.length > 0) {
+		throw new ContributionError("worktree_dirty", "The contribution worktree changed after approval.");
+	}
 	options.authorizePush?.();
 	try {
 		await publicationGit.push(options.cwd, {

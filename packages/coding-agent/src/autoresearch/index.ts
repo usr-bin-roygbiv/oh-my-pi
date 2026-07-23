@@ -63,6 +63,12 @@ interface ContributionRemoteChoice {
 	remote: GitHubRemote;
 }
 
+interface ContributionStartTransaction {
+	token: symbol | null;
+	phase: "confirming" | "activating";
+	readonly settlement: PromiseWithResolvers<void>;
+}
+
 const contributionPublicationGit: ContributionPublicationGit = {
 	readRemoteUrl: (cwd, remote, signal) => git.remote.url(cwd, remote, signal),
 	readBranch: (cwd, signal) => git.branch.current(cwd, signal),
@@ -143,15 +149,18 @@ function describeContributionError(error: unknown): string {
 export const createAutoresearchExtension: ExtensionFactory = api => {
 	const runtimeStore = createRuntimeStore();
 	const dashboard = createDashboardController();
-	const contributionStartAuthorizations = new Map<string, symbol>();
+	const contributionStartTransactions = new Map<string, ContributionStartTransaction>();
 	const contributionPublicationControllers = new Map<string, AbortController>();
 
-	const invalidateContributionOperations = (sessionKey: string): void => {
-		contributionStartAuthorizations.delete(sessionKey);
+	const invalidateContributionOperations = (sessionKey: string): Promise<void> | undefined => {
+		const startTransaction = contributionStartTransactions.get(sessionKey);
+		if (startTransaction) startTransaction.token = null;
 		const controller = contributionPublicationControllers.get(sessionKey);
-		if (!controller) return;
-		contributionPublicationControllers.delete(sessionKey);
-		controller.abort();
+		if (controller) {
+			contributionPublicationControllers.delete(sessionKey);
+			controller.abort();
+		}
+		return startTransaction?.phase === "activating" ? startTransaction.settlement.promise : undefined;
 	};
 
 	const getSessionKey = (ctx: ExtensionContext): string => ctx.sessionManager.getSessionId();
@@ -160,12 +169,13 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 		ctx: ExtensionContext,
 		runtime: AutoresearchRuntime,
 		sessionKey: string,
-		token: symbol,
+		transaction: ContributionStartTransaction,
 	): void => {
 		if (
 			getSessionKey(ctx) !== sessionKey ||
 			getRuntime(ctx) !== runtime ||
-			contributionStartAuthorizations.get(sessionKey) !== token
+			contributionStartTransactions.get(sessionKey) !== transaction ||
+			transaction.token === null
 		) {
 			throw new Error("Contribution start authorization changed.");
 		}
@@ -174,11 +184,11 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 		ctx: ExtensionContext,
 		runtime: AutoresearchRuntime,
 		sessionKey: string,
-		token: symbol,
+		transaction: ContributionStartTransaction,
 		contribution: AutoresearchRuntime["contribution"],
 		state: AutoresearchRuntime["state"],
 	): void => {
-		assertContributionStartIdentity(ctx, runtime, sessionKey, token);
+		assertContributionStartIdentity(ctx, runtime, sessionKey, transaction);
 		if (
 			runtime.contribution !== contribution ||
 			runtime.state !== state ||
@@ -200,7 +210,8 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 	};
 
 	const rehydrate = async (ctx: ExtensionContext): Promise<void> => {
-		invalidateContributionOperations(getSessionKey(ctx));
+		const activationSettlement = invalidateContributionOperations(getSessionKey(ctx));
+		if (activationSettlement) await activationSettlement;
 		const runtime = getRuntime(ctx);
 		const control = reconstructControlState(ctx.sessionManager.getBranch());
 		const contributionRunning = runtime.contribution.status === "running";
@@ -291,8 +302,13 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 		}
 	};
 
-	const stopContributionRuntime = async (ctx: ExtensionContext, runtime: AutoresearchRuntime): Promise<string[]> => {
-		invalidateContributionOperations(getSessionKey(ctx));
+	const stopContributionRuntime = async (
+		ctx: ExtensionContext,
+		runtime: AutoresearchRuntime,
+		awaitActivationRollback = false,
+	): Promise<string[]> => {
+		const activationSettlement = invalidateContributionOperations(getSessionKey(ctx));
+		if (awaitActivationRollback && activationSettlement) await activationSettlement;
 		if (runtime.contribution.status === "off") return [];
 		const contribution = runtime.contribution;
 		const warnings: string[] = [];
@@ -795,7 +811,7 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 			if (!preflightConfirmed) return;
 
 			let contributionStartSessionKey: string | null = null;
-			let contributionStartToken: symbol | null = null;
+			let contributionStartTransaction: ContributionStartTransaction | null = null;
 			try {
 				const control = reconstructControlState(ctx.sessionManager.getBranch());
 				const resumingAfterReview = runtime.contribution.status === "review";
@@ -870,19 +886,25 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 				await verifyContributionFork(ctx.cwd, selectedRemote.remote);
 				const branchName = await allocateAutoresearchBranchName(api, ctx.cwd, `contribute-${goal.title}`);
 				const startSessionKey = getSessionKey(ctx);
-				const startToken = Symbol("contribution-start-authorization");
+				const startTransaction: ContributionStartTransaction = {
+					token: Symbol("contribution-start-authorization"),
+					phase: "confirming",
+					settlement: Promise.withResolvers<void>(),
+				};
 				const startContribution = runtime.contribution;
 				const startState = runtime.state;
+				let ownedContribution = startContribution;
+				let ownedState = startState;
 				contributionStartSessionKey = startSessionKey;
-				contributionStartToken = startToken;
-				contributionStartAuthorizations.set(startSessionKey, startToken);
-				assertContributionStartFresh(ctx, runtime, startSessionKey, startToken, startContribution, startState);
+				contributionStartTransaction = startTransaction;
+				contributionStartTransactions.set(startSessionKey, startTransaction);
+				assertContributionStartFresh(ctx, runtime, startSessionKey, startTransaction, startContribution, startState);
 				const finalConfirmed = await ctx.ui.confirm(
 					"Start exact upstream contribution session?",
 					`Goal: ${goal.title}\nOfficial main commit/base: ${goal.commitSha}\nGoal blob: ${goal.blobSha}\nGoal SHA-256: ${goal.sha256}\nModel: ${selectedModel.provider}/${selectedModel.id}\nConfirmed fork: ${selectedRemote.name} (${selectedRemote.url})\nFresh local candidate branch: ${branchName}\n\nThis native OMP session continues indefinitely until /contribute off, an input/review gate, interruption, or session exit. It consumes model tokens, runs tests/commands under normal approval policy, and may create commits on the candidate branch. /contribute review requires another exact approval before an absent candidate branch is pushed to this fork; it never opens a pull request.\n\nOn confirmation only: recheck the official base and fork, switch model, create this exact branch from the frozen base commit, activate the existing autoresearch tools, then start the turn. Global approval policy is unchanged.`,
 				);
 				if (!finalConfirmed) return;
-				assertContributionStartFresh(ctx, runtime, startSessionKey, startToken, startContribution, startState);
+				assertContributionStartFresh(ctx, runtime, startSessionKey, startTransaction, startContribution, startState);
 
 				const recheckedGoal = await fetchOfficialContributionGoal(ctx.cwd);
 				assertContributionGoalUnchanged(goal, recheckedGoal);
@@ -920,30 +942,31 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 				let branchCreated = false;
 				let toolsTouched = false;
 				try {
-					assertContributionStartFresh(ctx, runtime, startSessionKey, startToken, startContribution, startState);
+					assertContributionStartFresh(ctx, runtime, startSessionKey, startTransaction, startContribution, startState);
+					startTransaction.phase = "activating";
 					modelChanged = true;
 					const modelAccepted = await api.setModel(selectedModel);
-					assertContributionStartFresh(ctx, runtime, startSessionKey, startToken, startContribution, startState);
+					assertContributionStartFresh(ctx, runtime, startSessionKey, startTransaction, startContribution, startState);
 					if (!modelAccepted) {
 						throw new Error(`Authenticated model switch failed: ${selectedModel.provider}/${selectedModel.id}`);
 					}
-					assertContributionStartFresh(ctx, runtime, startSessionKey, startToken, startContribution, startState);
+					assertContributionStartFresh(ctx, runtime, startSessionKey, startTransaction, startContribution, startState);
 					await git.branch.checkoutNewAt(ctx.cwd, branchName, frozenBaseProof.baseSha);
 					branchCreated = true;
-					assertContributionStartFresh(ctx, runtime, startSessionKey, startToken, startContribution, startState);
+					assertContributionStartFresh(ctx, runtime, startSessionKey, startTransaction, startContribution, startState);
 					await verifyContributionBase(ctx.cwd, goal);
 					if ((await git.branch.current(ctx.cwd)) !== branchName) {
 						throw new Error("Contribution checkout did not land on the frozen candidate branch.");
 					}
-					assertContributionStartFresh(ctx, runtime, startSessionKey, startToken, startContribution, startState);
+					assertContributionStartFresh(ctx, runtime, startSessionKey, startTransaction, startContribution, startState);
 					toolsTouched = true;
 					await api.setActiveTools([...new Set([...previousTools, ...EXPERIMENT_TOOL_NAMES])]);
-					assertContributionStartFresh(ctx, runtime, startSessionKey, startToken, startContribution, startState);
+					assertContributionStartFresh(ctx, runtime, startSessionKey, startTransaction, startContribution, startState);
 					await verifyContributionBase(ctx.cwd, goal);
 					if ((await git.branch.current(ctx.cwd)) !== branchName) {
 						throw new Error("Contribution checkout changed during tool activation.");
 					}
-					assertContributionStartFresh(ctx, runtime, startSessionKey, startToken, startContribution, startState);
+					assertContributionStartFresh(ctx, runtime, startSessionKey, startTransaction, startContribution, startState);
 					const contribution: ContributionRunningState = {
 						status: "running",
 						authorization: Symbol("contribution-authorization"),
@@ -956,14 +979,17 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 						currentSegment: null,
 						sessionId: null,
 					};
-					runtime.state = createExperimentState();
+					const contributionState = createExperimentState();
+					ownedContribution = contribution;
+					ownedState = contributionState;
+					runtime.state = contributionState;
 					runtime.goal = goal.content;
 					runtime.contribution = contribution;
 					runtime.autoresearchMode = true;
 					runtime.autoResumeArmed = true;
 					runtime.lastAutoResumePendingRunNumber = null;
 					dashboard.updateWidget(ctx, runtime);
-					assertContributionStartIdentity(ctx, runtime, startSessionKey, startToken);
+					assertContributionStartIdentity(ctx, runtime, startSessionKey, startTransaction);
 					if (runtime.contribution !== contribution) {
 						throw new Error("Contribution start state changed before the initial turn.");
 					}
@@ -992,24 +1018,32 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 							rollbackErrors.push(`model: ${describeContributionError(rollbackError)}`);
 						}
 					}
-					runtime.contribution = { status: "off" };
-					runtime.autoresearchMode = false;
-					runtime.autoResumeArmed = false;
-					runtime.goal = null;
-					runtime.state = createExperimentState();
-					dashboard.updateWidget(ctx, runtime);
+					if (
+						getSessionKey(ctx) === startSessionKey &&
+						getRuntime(ctx) === runtime &&
+						runtime.contribution === ownedContribution &&
+						runtime.state === ownedState
+					) {
+						runtime.contribution = { status: "off" };
+						runtime.autoresearchMode = false;
+						runtime.autoResumeArmed = false;
+						runtime.goal = null;
+						runtime.state = createExperimentState();
+						dashboard.updateWidget(ctx, runtime);
+					}
 					const rollback = rollbackErrors.length > 0 ? ` Rollback errors: ${rollbackErrors.join("; ")}` : "";
 					ctx.ui.notify(`Contribution start failed: ${describeContributionError(error)}.${rollback}`, "error");
 				}
 			} catch (error) {
 				ctx.ui.notify(`Contribution preflight failed: ${describeContributionError(error)}`, "error");
 			} finally {
-				if (
-					contributionStartSessionKey !== null &&
-					contributionStartToken !== null &&
-					contributionStartAuthorizations.get(contributionStartSessionKey) === contributionStartToken
-				) {
-					contributionStartAuthorizations.delete(contributionStartSessionKey);
+				if (contributionStartSessionKey !== null && contributionStartTransaction !== null) {
+					if (
+						contributionStartTransactions.get(contributionStartSessionKey) === contributionStartTransaction
+					) {
+						contributionStartTransactions.delete(contributionStartSessionKey);
+					}
+					contributionStartTransaction.settlement.resolve();
 				}
 			}
 		},
@@ -1037,20 +1071,20 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 
 	api.on("session_start", (_event, ctx) => rehydrate(ctx));
 	api.on("session_before_switch", async (_event, ctx) => {
-		await stopContributionRuntime(ctx, getRuntime(ctx));
+		await stopContributionRuntime(ctx, getRuntime(ctx), true);
 	});
 	api.on("session_before_branch", async (_event, ctx) => {
-		await stopContributionRuntime(ctx, getRuntime(ctx));
+		await stopContributionRuntime(ctx, getRuntime(ctx), true);
 	});
 	api.on("session_before_tree", async (_event, ctx) => {
-		await stopContributionRuntime(ctx, getRuntime(ctx));
+		await stopContributionRuntime(ctx, getRuntime(ctx), true);
 	});
 	api.on("session_switch", (_event, ctx) => rehydrate(ctx));
 	api.on("session_branch", (_event, ctx) => rehydrate(ctx));
 	api.on("session_tree", (_event, ctx) => rehydrate(ctx));
 	api.on("session_shutdown", async (_event, ctx) => {
 		try {
-			await stopContributionRuntime(ctx, getRuntime(ctx));
+			await stopContributionRuntime(ctx, getRuntime(ctx), true);
 		} finally {
 			try {
 				const experimentTools = new Set(EXPERIMENT_TOOL_NAMES);
