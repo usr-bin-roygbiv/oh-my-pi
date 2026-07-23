@@ -82,22 +82,10 @@ export class EventController {
 	#lastVisibleBlockCount = 0;
 	#renderedCustomMessages = new Set<string>();
 	#lastIntent: string | undefined = undefined;
-1: 	#backgroundTaskCallIds = new Set<string>();
+	#backgroundTaskCallIds = new Set<string>();
 	/** Tool calls whose approval prompt drove the title into `attention`; cleared
 	 *  at their tool_execution_end so the title returns to `working`. */
 	#approvalAttentionToolCallIds = new Set<string>();
-2: 		this.#toolTimelineComponents.clear();
-		this.#postToolAssistantComponents.clear();
-		this.#backgroundTaskCallIds.clear();
-		this.#approvalAttentionToolCallIds.clear();
-3: import {
-	disposeTerminalTitleState,
-	popTerminalTitle,
-	pushTerminalTitle,
-	setSessionTerminalTitle,
-	setTerminalTitleStateEnabled,
-} from "../utils/title-generator";
-import { aggregateVibeWorkerTokensPerSecond, VibeSessionRegistry } from "../vibe/runtime";
 	#readToolCallArgs = new Map<string, Record<string, unknown>>();
 	#readToolCallAssistantComponents = new Map<string, AssistantMessageComponent>();
 	#toolTimelineComponents = new Map<string, Component>();
@@ -336,22 +324,10 @@ import { aggregateVibeWorkerTokensPerSecond, VibeSessionRegistry } from "../vibe
 		this.#lastVisibleBlockCount = 0;
 		this.#renderedCustomMessages.clear();
 		this.#lastIntent = undefined;
-1: 	#backgroundTaskCallIds = new Set<string>();
-	/** Tool calls whose approval prompt drove the title into `attention`; cleared
-	 *  at their tool_execution_end so the title returns to `working`. */
-	#approvalAttentionToolCallIds = new Set<string>();
-2: 		this.#toolTimelineComponents.clear();
+		this.#toolTimelineComponents.clear();
 		this.#postToolAssistantComponents.clear();
 		this.#backgroundTaskCallIds.clear();
 		this.#approvalAttentionToolCallIds.clear();
-3: import {
-	disposeTerminalTitleState,
-	popTerminalTitle,
-	pushTerminalTitle,
-	setSessionTerminalTitle,
-	setTerminalTitleStateEnabled,
-} from "../utils/title-generator";
-import { aggregateVibeWorkerTokensPerSecond, VibeSessionRegistry } from "../vibe/runtime";
 		this.#readToolCallArgs.clear();
 		this.#readToolCallAssistantComponents.clear();
 		this.#lastAssistantComponent = undefined;

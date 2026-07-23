@@ -130,15 +130,7 @@ import type { EventBus } from "../utils/event-bus";
 import { getEditorCommand, openInEditor } from "../utils/external-editor";
 import { getSessionAccentAnsi, getSessionAccentHex } from "../utils/session-color";
 import { messageHasDisplayableThinking } from "../utils/thinking-display";
-1: 	#backgroundTaskCallIds = new Set<string>();
-	/** Tool calls whose approval prompt drove the title into `attention`; cleared
-	 *  at their tool_execution_end so the title returns to `working`. */
-	#approvalAttentionToolCallIds = new Set<string>();
-2: 		this.#toolTimelineComponents.clear();
-		this.#postToolAssistantComponents.clear();
-		this.#backgroundTaskCallIds.clear();
-		this.#approvalAttentionToolCallIds.clear();
-3: import {
+import {
 	disposeTerminalTitleState,
 	popTerminalTitle,
 	pushTerminalTitle,
