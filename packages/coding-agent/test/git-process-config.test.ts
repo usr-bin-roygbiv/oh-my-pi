@@ -175,4 +175,21 @@ describe("git subprocess config", () => {
 		expect(spawnCalls).toHaveLength(1);
 		expect(spawnCalls[0]?.options.env).not.toHaveProperty("GPG_TTY");
 	});
+
+	it("propagates branch cancellation through head resolution", async () => {
+		const controller = new AbortController();
+		const reason = new Error("branch lookup cancelled");
+		controller.abort(reason);
+		let observedSignal: AbortSignal | undefined;
+		vi.spyOn(git.head, "resolve").mockImplementation(async (_cwd, signal) => {
+			observedSignal = signal;
+			signal?.throwIfAborted();
+			return null;
+		});
+
+		await expect(git.branch.current("/work/pi", controller.signal)).rejects.toThrow("branch lookup cancelled");
+		expect(observedSignal).toBeDefined();
+		expect(observedSignal?.aborted).toBe(true);
+		expect(observedSignal?.reason).toBe(reason);
+	});
 });
