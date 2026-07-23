@@ -54,7 +54,7 @@ jobs:
         run: bun run build:native
       - name: Focused contribution contract
         if: inputs.suite == 'contract'
-        run: bun test packages/coding-agent/test/autoresearch-contribution.test.ts packages/coding-agent/test/agent-session-btw-branch.test.ts packages/coding-agent/test/git-process-config.test.ts packages/coding-agent/test/session-storage.test.ts
+        run: bun test packages/coding-agent/test/autoresearch-contribution.test.ts packages/coding-agent/test/agent-session-btw-branch.test.ts packages/coding-agent/test/git-process-config.test.ts packages/coding-agent/test/session-storage.test.ts packages/coding-agent/test/session-manager-immediate-persist.test.ts
       - name: Workspace type and format checks
         if: inputs.suite == 'check'
         run: bun run ci:check:full
