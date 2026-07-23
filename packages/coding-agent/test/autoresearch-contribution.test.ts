@@ -1940,6 +1940,66 @@ describe("process-local contribution lifecycle", () => {
 		expect(harness.sentUserMessages).toEqual([]);
 	});
 
+	it("keeps mutation admission closed across overlapping rehydrate handlers", async () => {
+		const harness = createIntegrationHarness(cwd.path());
+		harness.setSessionBranch([
+			{
+				type: "custom",
+				customType: "autoresearch-control",
+				id: "overlapping-rehydrate",
+				parentId: null,
+				timestamp: new Date(0).toISOString(),
+				data: { mode: "on", goal: "ordinary autoresearch goal" },
+			},
+		]);
+		const firstBranchEntered = Promise.withResolvers<void>();
+		const secondBranchEntered = Promise.withResolvers<void>();
+		const releaseFirstBranch = Promise.withResolvers<void>();
+		const releaseSecondBranch = Promise.withResolvers<void>();
+		let branchReadCount = 0;
+		vi.spyOn(git.branch, "current").mockImplementation(async () => {
+			branchReadCount++;
+			if (branchReadCount === 1) {
+				firstBranchEntered.resolve();
+				await releaseFirstBranch.promise;
+			} else if (branchReadCount === 2) {
+				secondBranchEntered.resolve();
+				await releaseSecondBranch.promise;
+			}
+			return "main";
+		});
+		const sessionStart = handlerRequired<SessionStartEvent>(harness, "session_start");
+		const firstRehydrate = Promise.resolve(
+			sessionStart({ type: "session_start" } as SessionStartEvent, harness.ctx as ExtensionContext),
+		);
+		await firstBranchEntered.promise;
+		const secondRehydrate = Promise.resolve(
+			sessionStart({ type: "session_start" } as SessionStartEvent, harness.ctx as ExtensionContext),
+		);
+
+		releaseFirstBranch.resolve();
+		const [firstResult] = await Promise.allSettled([firstRehydrate]);
+		await secondBranchEntered.promise;
+		const updateNotes = harness.tools.get("update_notes");
+		if (!updateNotes) throw new Error("Expected update_notes tool");
+		const [mutationResult] = await Promise.allSettled([
+			updateNotes.execute(
+				"notes-during-overlapping-rehydrate",
+				{ body: "must not publish" },
+				undefined,
+				undefined,
+				harness.ctx as ExtensionContext,
+			),
+		]);
+		releaseSecondBranch.resolve();
+		const [secondResult] = await Promise.allSettled([secondRehydrate]);
+
+		expect(firstResult.status).toBe("fulfilled");
+		expect(mutationResult).toMatchObject({ status: "rejected", reason: { name: "ToolAbortError" } });
+		expect(secondResult.status).toBe("fulfilled");
+		expect(snapshotStorageArtifacts(dbDir.path())).toEqual([]);
+	});
+
 	it("aborts and drains a kept log commit before contribution off", async () => {
 		const harness = createIntegrationHarness(cwd.path());
 		await startContribution(harness);
