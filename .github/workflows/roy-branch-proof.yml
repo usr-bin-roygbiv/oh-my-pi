@@ -48,6 +48,9 @@ jobs:
           echo "checked_out_sha=$actual"
           test "$actual" = "$TARGET_SHA"
       - uses: ./.github/actions/bun-install
+      - name: Build native addon
+        if: inputs.suite != 'check'
+        run: bun run build:native
       - name: Focused contribution contract
         if: inputs.suite == 'contract'
         run: bun test packages/coding-agent/test/autoresearch-contribution.test.ts
@@ -57,6 +60,6 @@ jobs:
       - name: Coding-agent runtime tests
         if: inputs.suite == 'coding-agent-runtime'
         run: bun run ci:test:coding-agent:runtime
-      - name: Build native addon and run CLI smoke
+      - name: Run CLI smoke
         if: inputs.suite == 'smoke'
-        run: bun run build:native && bun run ci:test:smoke
+        run: bun run ci:test:smoke
