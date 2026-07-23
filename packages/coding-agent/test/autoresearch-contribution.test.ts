@@ -1199,7 +1199,12 @@ interface IntegrationHarness {
 	githubEndpoints: string[];
 	githubArgumentVectors: string[][];
 	gitEvents: string[];
-	pushes: Array<{ remote?: string; refspec?: string; forceWithLease?: boolean | string }>;
+	pushes: Array<{
+		remote?: string;
+		verifiedRemoteUrl?: string;
+		refspec?: string;
+		forceWithLease?: boolean | string;
+	}>;
 	approvalModeMutations: string[];
 	setPendingMessages(value: boolean): void;
 	setStatusText(value: string): void;
