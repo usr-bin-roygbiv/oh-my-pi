@@ -2143,13 +2143,15 @@ describe("process-local contribution lifecycle", () => {
 	});
 
 	it("aborts and drains an in-flight harness commit before contribution off", async () => {
+		let contributionStarted = false;
 		const offDeactivationEntered = Promise.withResolvers<void>();
 		const harness = createIntegrationHarness(cwd.path(), {
-			onSetActiveTools(callCount) {
-				if (callCount === 2) offDeactivationEntered.resolve();
+			onSetActiveTools() {
+				if (contributionStarted) offDeactivationEntered.resolve();
 			},
 		});
 		await startContribution(harness);
+		contributionStarted = true;
 		await Bun.write(`${cwd.path()}/autoresearch.sh`, "#!/usr/bin/env bash\necho METRIC runtime_ms=1\n");
 		harness.setStatusText(" M autoresearch.sh");
 		const init = harness.tools.get("init_experiment");
