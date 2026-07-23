@@ -47,7 +47,12 @@ import type {
 	ExtensionContext,
 	ExtensionHandler,
 	RegisteredCommand,
+	SessionBeforeBranchEvent,
 	SessionBeforeSwitchEvent,
+	SessionBeforeTreeEvent,
+	SessionBranchEvent,
+	SessionSwitchEvent,
+	SessionTreeEvent,
 	SessionShutdownEvent,
 	SessionStartEvent,
 	ToolDefinition,
@@ -103,6 +108,11 @@ function makeGoalRequest(
 
 async function expectContributionError(promise: Promise<unknown>, code: ContributionErrorCode): Promise<void> {
 	await expect(promise).rejects.toMatchObject({ name: "ContributionError", code });
+}
+
+function contributionErrorCode(error: unknown): unknown {
+	if (error === null || typeof error !== "object" || !("code" in error)) return undefined;
+	return error.code;
 }
 
 function expectedGoalEndpoints(): string[] {
@@ -702,6 +712,56 @@ describe("contribution fork validation and publication", () => {
 		expect(calls).toEqual([`ancestor:${COMMIT_SHA}:${CURRENT_HEAD}`]);
 	});
 
+	it("rejects HEAD or clean-worktree drift during the awaited final ancestry check before literal-HEAD push", async () => {
+		for (const drift of ["HEAD", "worktree"] as const) {
+			let currentHead = CURRENT_HEAD;
+			let statusOutput = "";
+			let firstHeadRead = false;
+			let pushCalls = 0;
+			const git = makePublicationGit({
+				readHead: async () => {
+					firstHeadRead = true;
+					return currentHead;
+				},
+				readStatus: async () => statusOutput,
+				isAncestor: async () => {
+					if (!firstHeadRead) throw new Error("Expected candidate HEAD validation before ancestry");
+					await Promise.resolve();
+					if (drift === "HEAD") currentHead = "9".repeat(40);
+					else statusOutput = " M changed-during-ancestry.ts\0";
+					return true;
+				},
+				push: async () => {
+					pushCalls++;
+				},
+			});
+			const outcome = await publishContributionCandidate({
+				cwd: "/work/repo",
+				remoteName: "origin",
+				confirmedRemoteUrl: FORK_URL,
+				branchName: CONTRIBUTION_BRANCH,
+				currentBranch: CONTRIBUTION_BRANCH,
+				worktreeClean: true,
+				goal: makeGoal(),
+				candidate: makeCandidate(),
+				currentSegment: 2,
+				currentHead: CURRENT_HEAD,
+				baseProof: makeBaseProof(),
+				approvedDraft: makeApprovedDraft(),
+				git,
+				request: async () => ({ fork: true, parent: "can1357/oh-my-pi", source: "can1357/oh-my-pi" }),
+			}).then(
+				() => ({ rejectionCode: undefined }),
+				(error: unknown) => ({ rejectionCode: contributionErrorCode(error) }),
+			);
+
+			expect({ pushCalls, rejectionCode: outcome.rejectionCode }, drift).toEqual({
+				pushCalls: 0,
+				rejectionCode: drift === "HEAD" ? "candidate_head_mismatch" : "worktree_dirty",
+			});
+		}
+	});
+
 	it("refuses branch, HEAD, or worktree drift after exact draft approval", async () => {
 		const cases: Array<{
 			name: string;
@@ -1055,6 +1115,10 @@ interface IntegrationHarness {
 	setRefOccupied(value: boolean): void;
 	setNextStatusRequest(callback: () => void | Promise<void>): void;
 	setSessionId(value: string): void;
+	setActiveToolState(names: string[]): void;
+	setCurrentBranch(value: string): void;
+	setCurrentModel(value: Model<Api>): void;
+	setSessionBranch(entries: unknown[]): void;
 	currentBranch(): string;
 	currentModel(): Model<Api> | undefined;
 }
@@ -1120,6 +1184,7 @@ function createIntegrationHarness(cwd: string, options: IntegrationHarnessOption
 	const ancestryResults = [...(options.ancestryResults ?? [])];
 	let nextStatusRequest: (() => void | Promise<void>) | null = null;
 	let sessionId = options.sessionId ?? "contribution-session";
+	let sessionBranch: unknown[] = [];
 	let setActiveToolsCallCount = 0;
 	const goals = options.goalVersions ?? defaultGoalVersions();
 	let activeGoal = goals[0];
@@ -1266,6 +1331,7 @@ function createIntegrationHarness(cwd: string, options: IntegrationHarnessOption
 			await options.onSetActiveTools?.(setActiveToolsCallCount);
 			if (options.setActiveToolsFailureAt === setActiveToolsCallCount) throw new Error("setActiveTools failed");
 			activeTools.splice(0, activeTools.length, ...names);
+			gitEvents.push(`tools:${names.join(",")}`);
 		},
 		setModel: async (model: Model<Api>): Promise<boolean> => {
 			setModelCalls.push(model);
@@ -1275,7 +1341,10 @@ function createIntegrationHarness(cwd: string, options: IntegrationHarnessOption
 				throw new Error("setModel synchronization failed");
 			}
 			const accepted = setModelResults.shift() ?? true;
-			if (accepted) selectedModel = model;
+			if (accepted) {
+				selectedModel = model;
+				gitEvents.push(`model:${model.provider}/${model.id}`);
+			}
 			return accepted;
 		},
 		setSessionName: async () => {},
@@ -1310,7 +1379,7 @@ function createIntegrationHarness(cwd: string, options: IntegrationHarnessOption
 		newSession: async () => ({ cancelled: false }),
 		reload: async () => {},
 		sessionManager: {
-			getBranch: () => [],
+			getBranch: () => sessionBranch as never,
 			getEntries: () => [],
 			getSessionId: () => sessionId,
 		},
@@ -1388,6 +1457,18 @@ function createIntegrationHarness(cwd: string, options: IntegrationHarnessOption
 		},
 		currentBranch: () => currentBranch,
 		currentModel: () => selectedModel,
+		setActiveToolState(names: string[]): void {
+			activeTools.splice(0, activeTools.length, ...names);
+		},
+		setCurrentBranch(value: string): void {
+			currentBranch = value;
+		},
+		setCurrentModel(value: Model<Api>): void {
+			selectedModel = value;
+		},
+		setSessionBranch(entries: unknown[]): void {
+			sessionBranch = entries;
+		},
 	};
 }
 
@@ -1538,6 +1619,7 @@ describe("process-local contribution lifecycle", () => {
 	for (const invalidation of ["off", "session switch"] as const) {
 		it(`invalidates a confirmed start during final confirmation on ${invalidation} without mutation`, async () => {
 			let harness!: IntegrationHarness;
+			let beforeSwitch: Promise<void> | undefined;
 			harness = createIntegrationHarness(cwd.path(), {
 				async onConfirm(callNumber): Promise<void> {
 					if (callNumber !== 2) return;
@@ -1545,17 +1627,27 @@ describe("process-local contribution lifecycle", () => {
 						await commandRequired(harness, "contribute").handler("off", harness.ctx);
 						return;
 					}
-					await handlerRequired<SessionBeforeSwitchEvent>(harness, "session_before_switch")(
-						{ type: "session_before_switch", reason: "resume", targetSessionFile: "/tmp/switched.jsonl" },
-						harness.ctx as ExtensionContext,
+					beforeSwitch = Promise.resolve(
+						handlerRequired<SessionBeforeSwitchEvent>(harness, "session_before_switch")(
+							{ type: "session_before_switch", reason: "resume", targetSessionFile: "/tmp/switched.jsonl" },
+							harness.ctx as ExtensionContext,
+						),
 					);
-					harness.setSessionId("switched-session");
 				},
 			});
 			const initialTools = [...harness.activeTools];
 			const initialModel = harness.currentModel();
 
 			await startContribution(harness);
+			if (invalidation === "session switch") {
+				if (!beforeSwitch) throw new Error("Expected session-before-switch handler to start");
+				await beforeSwitch;
+				harness.setSessionId("switched-session");
+				await handlerRequired<SessionSwitchEvent>(harness, "session_switch")(
+					{ type: "session_switch", reason: "resume", previousSessionFile: "/tmp/original.jsonl" },
+					harness.ctx as ExtensionContext,
+				);
+			}
 
 			expect(harness.confirmCalls.at(-1)?.title).toBe("Start exact upstream contribution session?");
 			expect(harness.setModelCalls).toEqual([]);
@@ -1563,6 +1655,171 @@ describe("process-local contribution lifecycle", () => {
 			expect(harness.currentBranch()).toBe("main");
 			expect(harness.currentModel()).toBe(initialModel);
 			expect(harness.activeTools).toEqual(initialTools);
+			expect(harness.sentUserMessages).toEqual([]);
+			expect(snapshotStorageArtifacts(dbDir.path())).toEqual([]);
+		});
+	}
+
+	const partialStartTransitions = [
+		{
+			point: "setModel",
+			beforeName: "session_before_switch",
+			afterName: "session_switch",
+			changesSession: true,
+			beginBefore(harness: IntegrationHarness): Promise<void> {
+				return Promise.resolve(
+					handlerRequired<SessionBeforeSwitchEvent>(harness, "session_before_switch")(
+						{ type: "session_before_switch", reason: "resume", targetSessionFile: "/tmp/target.jsonl" },
+						harness.ctx as ExtensionContext,
+					),
+				);
+			},
+			rehydrate(harness: IntegrationHarness): Promise<void> {
+				return Promise.resolve(
+					handlerRequired<SessionSwitchEvent>(harness, "session_switch")(
+						{ type: "session_switch", reason: "resume", previousSessionFile: "/tmp/source.jsonl" },
+						harness.ctx as ExtensionContext,
+					),
+				);
+			},
+		},
+		{
+			point: "checkoutNewAt",
+			beforeName: "session_before_branch",
+			afterName: "session_branch",
+			changesSession: true,
+			beginBefore(harness: IntegrationHarness): Promise<void> {
+				return Promise.resolve(
+					handlerRequired<SessionBeforeBranchEvent>(harness, "session_before_branch")(
+						{ type: "session_before_branch", entryId: "source-entry" },
+						harness.ctx as ExtensionContext,
+					),
+				);
+			},
+			rehydrate(harness: IntegrationHarness): Promise<void> {
+				return Promise.resolve(
+					handlerRequired<SessionBranchEvent>(harness, "session_branch")(
+						{ type: "session_branch", previousSessionFile: "/tmp/source.jsonl" },
+						harness.ctx as ExtensionContext,
+					),
+				);
+			},
+		},
+		{
+			point: "setActiveTools",
+			beforeName: "session_before_tree",
+			afterName: "session_tree",
+			changesSession: false,
+			beginBefore(harness: IntegrationHarness): Promise<void> {
+				return Promise.resolve(
+					handlerRequired<SessionBeforeTreeEvent>(harness, "session_before_tree")(
+						{
+							type: "session_before_tree",
+							preparation: {
+								targetId: "target-leaf",
+								oldLeafId: "source-leaf",
+								commonAncestorId: "root",
+								entriesToSummarize: [],
+								userWantsSummary: false,
+							},
+							signal: new AbortController().signal,
+						},
+						harness.ctx as ExtensionContext,
+					),
+				);
+			},
+			rehydrate(harness: IntegrationHarness): Promise<void> {
+				return Promise.resolve(
+					handlerRequired<SessionTreeEvent>(harness, "session_tree")(
+						{ type: "session_tree", newLeafId: "target-leaf", oldLeafId: "source-leaf" },
+						harness.ctx as ExtensionContext,
+					),
+				);
+			},
+		},
+	] as const;
+
+	for (const transition of partialStartTransitions) {
+		it(`waits for ${transition.beforeName} rollback before ${transition.afterName} rehydrate during ${transition.point}`, async () => {
+			const priorModel = requiredBundledModel("anthropic", "claude-sonnet-4-5");
+			const targetModel = requiredBundledModel("anthropic", "claude-sonnet-4-6");
+			const targetBranch = "autoresearch/rehydrated-target";
+			const targetGoal = "rehydrated target goal";
+			let harness!: IntegrationHarness;
+			let transitionTask: Promise<void> | undefined;
+			const beginTransition = (): void => {
+				if (transitionTask) return;
+				const beforeHandler = transition.beginBefore(harness);
+				transitionTask = (async () => {
+					await beforeHandler;
+					harness.gitEvents.push(`${transition.beforeName}:settled`);
+					if (transition.changesSession) harness.setSessionId(`target-${transition.afterName}`);
+					harness.setCurrentModel(targetModel);
+					harness.setCurrentBranch(targetBranch);
+					harness.setActiveToolState(["read", "target-tool"]);
+					harness.setSessionBranch([
+						{
+							type: "custom",
+							customType: "autoresearch-control",
+							id: `target-${transition.afterName}`,
+							parentId: null,
+							timestamp: new Date(0).toISOString(),
+							data: { mode: "on", goal: targetGoal },
+						},
+					]);
+					await transition.rehydrate(harness);
+					harness.gitEvents.push(`${transition.afterName}:rehydrated`);
+				})();
+			};
+			const options: IntegrationHarnessOptions = {
+				currentModel: priorModel,
+				selectedModelId: targetModel.id,
+			};
+			if (transition.point === "setModel") {
+				options.onSetModel = callNumber => {
+					if (callNumber === 1) beginTransition();
+				};
+			} else if (transition.point === "checkoutNewAt") {
+				options.onCheckoutNewAt = callNumber => {
+					if (callNumber === 1) beginTransition();
+				};
+			} else {
+				options.onSetActiveTools = callNumber => {
+					if (callNumber === 1) beginTransition();
+				};
+			}
+			harness = createIntegrationHarness(cwd.path(), options);
+
+			await startContribution(harness);
+			if (!transitionTask) throw new Error(`Expected ${transition.beforeName} handler to start`);
+			await transitionTask;
+
+			const rollbackModelEvent = `model:${priorModel.provider}/${priorModel.id}`;
+			const rollbackIndex = harness.gitEvents.lastIndexOf(rollbackModelEvent);
+			const beforeSettledIndex = harness.gitEvents.indexOf(`${transition.beforeName}:settled`);
+			expect(rollbackIndex).toBeGreaterThanOrEqual(0);
+			expect(beforeSettledIndex).toBeGreaterThan(rollbackIndex);
+			expect(harness.currentModel()).toBe(targetModel);
+			expect(harness.currentBranch()).toBe(targetBranch);
+			expect(harness.activeTools).toEqual([
+				"read",
+				"target-tool",
+				"init_experiment",
+				"run_experiment",
+				"log_experiment",
+				"update_notes",
+			]);
+			const beforeAgentStart = await handlerRequired<
+				{ type: "before_agent_start"; systemPrompt: string[] },
+				{ systemPrompt: string[] }
+			>(harness, "before_agent_start")(
+				{ type: "before_agent_start", systemPrompt: [] },
+				harness.ctx as ExtensionContext,
+			);
+			expect(beforeAgentStart?.systemPrompt.join("\n")).toContain(targetGoal);
+			await commandRequired(harness, "contribute").handler("status", harness.ctx);
+			expect(harness.notifications.at(-1)?.message).toBe("Contribution mode is off.");
+			expect(harness.appendEntries).toEqual([]);
 			expect(harness.sentUserMessages).toEqual([]);
 			expect(snapshotStorageArtifacts(dbDir.path())).toEqual([]);
 		});
