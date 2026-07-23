@@ -165,6 +165,51 @@ describe("FileSessionStorage.writeTextSync", () => {
 	});
 });
 
+describe("FileSessionStorage writer durability", () => {
+	let tempDir: string;
+
+	beforeEach(async () => {
+		tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), "omp-session-storage-durable-"));
+	});
+
+	afterEach(async () => {
+		vi.restoreAllMocks();
+		await fsp.rm(tempDir, { recursive: true, force: true });
+	});
+
+	it("syncs file data only for an explicitly durable flush", async () => {
+		const fdatasync = vi.spyOn(fs, "fdatasyncSync").mockImplementation(() => {});
+		const fsync = vi.spyOn(fs, "fsyncSync").mockImplementation(() => {});
+		const sessionPath = path.join(tempDir, "session.jsonl");
+		const writer = new FileSessionStorage().openWriter(sessionPath, { flags: "w" });
+		const flush = writer.flush.bind(writer) as (options?: { durable?: boolean }) => Promise<void>;
+		try {
+			await writer.append('{"type":"session"}\n');
+			await flush();
+			const syncCallsAfterOrdinaryFlush = fdatasync.mock.calls.length + fsync.mock.calls.length;
+
+			await flush({ durable: true });
+			const syncCallsAfterDurableFlush = fdatasync.mock.calls.length + fsync.mock.calls.length;
+
+			await flush();
+			const syncCallsAfterSecondOrdinaryFlush = fdatasync.mock.calls.length + fsync.mock.calls.length;
+			expect({
+				syncCallsAfterOrdinaryFlush,
+				syncCallsAfterDurableFlush,
+				syncCallsAfterSecondOrdinaryFlush,
+				content: await Bun.file(sessionPath).text(),
+			}).toEqual({
+				syncCallsAfterOrdinaryFlush: 0,
+				syncCallsAfterDurableFlush: 1,
+				syncCallsAfterSecondOrdinaryFlush: 1,
+				content: '{"type":"session"}\n',
+			});
+		} finally {
+			await writer.close();
+		}
+	});
+});
+
 describe("FileSessionStorage.updateSessionTitle", () => {
 	let tempDir: string;
 	let storage: FileSessionStorage;

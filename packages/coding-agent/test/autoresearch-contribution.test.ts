@@ -40,9 +40,11 @@ import {
 	openAutoresearchStorage,
 	type SessionRow,
 } from "@oh-my-pi/pi-coding-agent/autoresearch/storage";
+import * as autoresearchStorage from "@oh-my-pi/pi-coding-agent/autoresearch/storage";
 import * as bashExecutor from "@oh-my-pi/pi-coding-agent/exec/bash-executor";
 import type {
 	AgentEndEvent,
+	BeforeAgentStartEvent,
 	ExtensionAPI,
 	ExtensionCommandContext,
 	ExtensionContext,
@@ -75,6 +77,20 @@ const CONTRIBUTION_WORKTREE_TREE_ASI_KEY = "_omp_contribution_worktree_tree";
 const HARNESS_SHA256 = "a".repeat(64);
 const CHANGED_HARNESS_SHA256 = "b".repeat(64);
 const CANDIDATE_TREE_SHA = "c".repeat(40);
+
+function snapshotFileSizes(root: string): string[] {
+	if (!fs.existsSync(root)) return [];
+	const files: string[] = [];
+	const visit = (directory: string): void => {
+		for (const entry of fs.readdirSync(directory, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+			const entryPath = `${directory}/${entry.name}`;
+			if (entry.isDirectory()) visit(entryPath);
+			else if (entry.isFile()) files.push(`${entryPath.slice(root.length + 1)}:${fs.statSync(entryPath).size}`);
+		}
+	};
+	visit(root);
+	return files;
+}
 
 interface GoalRequestFixture {
 	request: ContributionGitHubRequest;
@@ -144,7 +160,9 @@ function makeGoal(overrides: Partial<ContributionGoal> = {}): ContributionGoal {
 	};
 }
 
-function makeCandidate(overrides: Partial<ContributionCandidate> = {}): ContributionCandidate {
+function makeCandidate(
+	overrides: Partial<ContributionCandidate> & { treeSha?: string } = {},
+): ContributionCandidate {
 	return {
 		status: "keep",
 		runNumber: 7,
@@ -156,8 +174,9 @@ function makeCandidate(overrides: Partial<ContributionCandidate> = {}): Contribu
 		metricUnit: "ms",
 		flagged: false,
 		segment: 2,
+		treeSha: CANDIDATE_TREE_SHA,
 		...overrides,
-	};
+	} as ContributionCandidate;
 }
 
 function makeBaseProof(): ContributionBaseProof {
@@ -495,6 +514,50 @@ describe("contribution base proof", () => {
 			"base_inspection_failed",
 		);
 	});
+
+	it("rejects an official-base HEAD whose replacement ref materializes a different tree", async () => {
+		const repo = TempDir.createSync("@pi-contribution-replaced-base-");
+		try {
+			await $`git -C ${repo.path()} init -b main`.quiet();
+			await Bun.write(`${repo.path()}/official.txt`, "official base bytes\n");
+			await $`git -C ${repo.path()} add official.txt`.quiet();
+			await $`git -C ${repo.path()} -c user.name=OMP -c user.email=omp@example.invalid commit -m official`.quiet();
+			const officialSha = (await $`git -C ${repo.path()} rev-parse HEAD`.quiet()).text().trim();
+			const officialTree = (await $`git -C ${repo.path()} show -s --format=%T HEAD`.quiet()).text().trim();
+
+			await $`git -C ${repo.path()} checkout --orphan replacement-materialization`.quiet();
+			await $`git -C ${repo.path()} rm -rf .`.quiet();
+			await Bun.write(`${repo.path()}/replacement.txt`, "replacement-only bytes\n");
+			await $`git -C ${repo.path()} add replacement.txt`.quiet();
+			await $`git -C ${repo.path()} -c user.name=OMP -c user.email=omp@example.invalid commit -m replacement`.quiet();
+			const replacementSha = (await $`git -C ${repo.path()} rev-parse HEAD`.quiet()).text().trim();
+			const replacementTree = (await $`git -C ${repo.path()} show -s --format=%T HEAD`.quiet()).text().trim();
+
+			await $`git -C ${repo.path()} checkout main`.quiet();
+			await $`git -C ${repo.path()} replace ${officialSha} ${replacementSha}`.quiet();
+			await $`git -C ${repo.path()} reset --hard ${officialSha}`.quiet();
+			const rawHead = (await $`git -C ${repo.path()} --no-replace-objects rev-parse HEAD`.quiet()).text().trim();
+			const rawHeadTree = (await $`git -C ${repo.path()} --no-replace-objects show -s --format=%T HEAD`.quiet())
+				.text()
+				.trim();
+			const materializedHeadTree = (await $`git -C ${repo.path()} show -s --format=%T HEAD`.quiet()).text().trim();
+			const status = await git.status(repo.path(), { porcelainV1: true, untrackedFiles: "all", z: true });
+			const outcome = await verifyContributionBase(repo.path(), makeGoal({ commitSha: officialSha })).then(
+				() => "accepted" as const,
+				() => "rejected" as const,
+			);
+
+			expect({ rawHead, rawHeadTree, materializedHeadTree, status, outcome }).toEqual({
+				rawHead: officialSha,
+				rawHeadTree: officialTree,
+				materializedHeadTree: replacementTree,
+				status: "",
+				outcome: "rejected",
+			});
+		} finally {
+			repo.removeSync();
+		}
+	});
 });
 
 describe("contribution fork validation and publication", () => {
@@ -694,6 +757,51 @@ describe("contribution fork validation and publication", () => {
 		expect(published.prDraft).toEqual(approvedDraft);
 	});
 
+	it("rejects a candidate whose raw commit tree differs from the stored passing tree before push", async () => {
+		const passingTree = "a".repeat(40);
+		const rawCommitTree = "b".repeat(40);
+		const candidate = makeCandidate({ treeSha: passingTree }) as ContributionCandidate & { treeSha: string };
+		const treeReads: Array<{ cwd: string; commit: string }> = [];
+		let pushCalls = 0;
+		const publicationGit = {
+			...makePublicationGit(),
+			async readRawCommitTree(cwd: string, commit: string): Promise<string | null> {
+				treeReads.push({ cwd, commit });
+				return rawCommitTree;
+			},
+			async push(): Promise<void> {
+				pushCalls++;
+			},
+		} as ContributionPublicationGit & {
+			readRawCommitTree(cwd: string, commit: string, signal?: AbortSignal): Promise<string | null>;
+		};
+		const outcome = await publishContributionCandidate({
+			cwd: "/work/repo",
+			remoteName: "origin",
+			confirmedRemoteUrl: FORK_URL,
+			confirmedPushRemoteUrl: FORK_URL,
+			branchName: CONTRIBUTION_BRANCH,
+			currentBranch: CONTRIBUTION_BRANCH,
+			worktreeClean: true,
+			goal: makeGoal(),
+			candidate,
+			currentSegment: 2,
+			currentHead: CURRENT_HEAD,
+			baseProof: makeBaseProof(),
+			approvedDraft: makeApprovedDraft(makeGoal(), candidate),
+			git: publicationGit,
+			request: async () => ({ fork: true, parent: "can1357/oh-my-pi", source: "can1357/oh-my-pi" }),
+		}).then(
+			() => "published" as const,
+			() => "rejected" as const,
+		);
+
+		expect({ outcome, treeReads, pushCalls }).toEqual({
+			outcome: "rejected",
+			treeReads: [{ cwd: "/work/repo", commit: CURRENT_HEAD }],
+			pushCalls: 0,
+		});
+	});
 	it("publishes only the frozen candidate when HEAD moves after push URL verification", async () => {
 		const movedHead = "5".repeat(40);
 		let head = CURRENT_HEAD;
@@ -851,6 +959,74 @@ describe("contribution fork validation and publication", () => {
 			await fs.promises.mkdir(`${source.path()}/.git/info`, { recursive: true });
 			await Bun.write(`${source.path()}/.git/info/grafts`, `${unrelatedSha} ${baseSha}\n`);
 			expect(await git.isAncestor(source.path(), baseSha, unrelatedSha)).toBe(false);
+		} finally {
+			source.removeSync();
+		}
+	});
+
+	it("rejects a graft installed after the preliminary graft read but before raw ancestry runs", async () => {
+		const source = TempDir.createSync("@pi-contribution-graft-race-");
+		try {
+			await $`git -C ${source.path()} init -b main`.quiet();
+			await Bun.write(`${source.path()}/base.txt`, "base\n");
+			await $`git -C ${source.path()} add base.txt`.quiet();
+			await $`git -C ${source.path()} -c user.name=OMP -c user.email=omp@example.invalid commit -m base`.quiet();
+			const baseSha = (await $`git -C ${source.path()} rev-parse HEAD`.quiet()).text().trim();
+			await $`git -C ${source.path()} checkout --orphan unrelated`.quiet();
+			await $`git -C ${source.path()} rm -rf .`.quiet();
+			await Bun.write(`${source.path()}/unrelated.txt`, "unrelated\n");
+			await $`git -C ${source.path()} add unrelated.txt`.quiet();
+			await $`git -C ${source.path()} -c user.name=OMP -c user.email=omp@example.invalid commit -m unrelated`.quiet();
+			const unrelatedSha = (await $`git -C ${source.path()} rev-parse HEAD`.quiet()).text().trim();
+			const graftPath = `${source.path()}/.git/info/grafts`;
+			const callBunFile = Bun.file as unknown as (input: unknown) => unknown;
+			let graftRead = false;
+			let graftInstalled = false;
+			vi.spyOn(Bun, "file").mockImplementation(
+				((input: unknown) => {
+					if (String(input) !== graftPath) return callBunFile(input) as never;
+					return {
+						text: () =>
+							new Promise<string>(resolve => {
+								graftRead = true;
+								resolve("");
+								fs.mkdirSync(`${source.path()}/.git/info`, { recursive: true });
+								fs.writeFileSync(graftPath, `${unrelatedSha} ${baseSha}\n`);
+								graftInstalled = true;
+							}),
+					} as never;
+				}) as typeof Bun.file,
+			);
+
+			const isRawAncestor = await git.isAncestor(source.path(), baseSha, unrelatedSha);
+
+			expect({ graftRead, graftInstalled, isRawAncestor }).toEqual({
+				graftRead: true,
+				graftInstalled: true,
+				isRawAncestor: false,
+			});
+		} finally {
+			source.removeSync();
+		}
+	});
+
+	it("snapshots changed and untracked bytes without writing the real object database", async () => {
+		const source = TempDir.createSync("@pi-contribution-tree-objects-");
+		try {
+			await $`git -C ${source.path()} init -b main`.quiet();
+			await Bun.write(`${source.path()}/tracked.txt`, "baseline\n");
+			await $`git -C ${source.path()} add tracked.txt`.quiet();
+			await $`git -C ${source.path()} -c user.name=OMP -c user.email=omp@example.invalid commit -m baseline`.quiet();
+			const objectDirectory = `${source.path()}/.git/objects`;
+			const beforeObjects = snapshotFileSizes(objectDirectory);
+
+			await Bun.write(`${source.path()}/tracked.txt`, "changed bytes unique to snapshot\n");
+			await Bun.write(`${source.path()}/untracked.txt`, "untracked bytes unique to snapshot\n");
+			const tree = await git.writeWorktreeTree(source.path());
+			const afterObjects = snapshotFileSizes(objectDirectory);
+
+			expect(tree).toMatch(/^[0-9a-f]{40}$/);
+			expect(afterObjects).toEqual(beforeObjects);
 		} finally {
 			source.removeSync();
 		}
@@ -1410,6 +1586,7 @@ interface IntegrationHarness {
 	githubEndpoints: string[];
 	githubArgumentVectors: string[][];
 	gitEvents: string[];
+	flushRequests: Array<{ durable?: boolean } | undefined>;
 	pushes: Array<{
 		remote?: string;
 		verifiedRemoteUrl?: string;
@@ -1475,6 +1652,7 @@ function createIntegrationHarness(cwd: string, options: IntegrationHarnessOption
 	const githubEndpoints: string[] = [];
 	const githubArgumentVectors: string[][] = [];
 	const gitEvents: string[] = [];
+	const flushRequests: Array<{ durable?: boolean } | undefined> = [];
 	const pushes: Array<{
 		remote?: string;
 		verifiedRemoteUrl?: string;
@@ -1511,10 +1689,10 @@ function createIntegrationHarness(cwd: string, options: IntegrationHarnessOption
 	const realWriteWorktreeTree = git.writeWorktreeTree;
 	const realWriteTree = git.writeTree;
 	vi.spyOn(git, "writeWorktreeTree").mockImplementation(async (workDir, signal) =>
-		(await Bun.file(`${workDir}/.git`).exists()) ? realWriteWorktreeTree(workDir, signal) : CANDIDATE_TREE_SHA,
+		fs.existsSync(`${workDir}/.git`) ? realWriteWorktreeTree(workDir, signal) : CANDIDATE_TREE_SHA,
 	);
 	vi.spyOn(git, "writeTree").mockImplementation(async (workDir, writeOptions) =>
-		(await Bun.file(`${workDir}/.git`).exists()) ? realWriteTree(workDir, writeOptions) : CANDIDATE_TREE_SHA,
+		fs.existsSync(`${workDir}/.git`) ? realWriteTree(workDir, writeOptions) : CANDIDATE_TREE_SHA,
 	);
 	vi.spyOn(git.repo, "root").mockResolvedValue(cwd);
 	vi.spyOn(git.show, "prefix").mockResolvedValue("");
@@ -1577,6 +1755,7 @@ function createIntegrationHarness(cwd: string, options: IntegrationHarnessOption
 		remote === "origin" ? FORK_URL : "https://github.com/can1357/oh-my-pi.git",
 	);
 	vi.spyOn(git, "push").mockImplementation(async (_workDir, pushOptions) => {
+		gitEvents.push("push");
 		pushes.push({
 			remote: pushOptions?.remote,
 			verifiedRemoteUrl: pushOptions?.verifiedRemoteUrl,
@@ -1714,8 +1893,10 @@ function createIntegrationHarness(cwd: string, options: IntegrationHarnessOption
 			getBranch: () => sessionBranch as never,
 			getEntries: () => [],
 			getSessionId: () => sessionId,
-			flush: async (): Promise<void> => {
+			flush: async (flushOptions?: { durable?: boolean }): Promise<void> => {
 				flushCallCount++;
+				flushRequests.push(flushOptions);
+				gitEvents.push(`flush:${flushOptions?.durable === true ? "durable" : "ordinary"}`);
 				if (options.flushFailureAt === flushCallCount) throw new Error("session persistence failed");
 			},
 			getSessionFile: () => (options.sessionFile === null ? undefined : (options.sessionFile ?? "/tmp/omp.jsonl")),
@@ -1775,6 +1956,7 @@ function createIntegrationHarness(cwd: string, options: IntegrationHarnessOption
 		githubArgumentVectors,
 		gitEvents,
 		pushes,
+		flushRequests,
 		approvalModeMutations,
 		get widgetUpdates(): number {
 			return widgetUpdates;
@@ -2006,6 +2188,16 @@ async function preparePendingContribution(harness: IntegrationHarness, cwd: stri
 	return { run, session, storage };
 }
 
+async function initializeRealContributionRepository(cwd: string): Promise<void> {
+	await $`git -C ${cwd} init -b main`.quiet();
+	await $`git -C ${cwd} config user.name OMP`.quiet();
+	await $`git -C ${cwd} config user.email omp@example.invalid`.quiet();
+	await Bun.write(`${cwd}/autoresearch.sh`, "#!/usr/bin/env bash\necho METRIC runtime_ms=1\n");
+	await Bun.write(`${cwd}/source.ts`, "export const value = 'baseline';\n");
+	await $`git -C ${cwd} add autoresearch.sh source.ts`.quiet();
+	await $`git -C ${cwd} commit -m baseline`.quiet();
+}
+
 describe("process-local contribution lifecycle", () => {
 	let cwd: TempDir;
 	let dbDir: TempDir;
@@ -2061,6 +2253,42 @@ describe("process-local contribution lifecycle", () => {
 		expect(harness.currentBranch()).toBe("main");
 		expect(harness.activeTools).toEqual(initialTools);
 		expect(harness.sentUserMessages).toEqual([]);
+	});
+
+	it("rejects ordinary autoresearch while confirmed contribution activation awaits its model", async () => {
+		const modelActivationEntered = Promise.withResolvers<void>();
+		const releaseModelActivation = Promise.withResolvers<void>();
+		const harness = createIntegrationHarness(cwd.path(), {
+			onSetModel(callNumber) {
+				if (callNumber !== 1) return;
+				modelActivationEntered.resolve();
+				return releaseModelActivation.promise;
+			},
+		});
+		const initialBranch = harness.currentBranch();
+		const startPromise = startContribution(harness);
+		await modelActivationEntered.promise;
+
+		await commandRequired(harness, "autoresearch").handler("ordinary goal", harness.ctx);
+
+		expect(harness.notifications.at(-1)).toEqual({
+			message: "Stop contribution mode with `/contribute off` before using `/autoresearch`.",
+			type: "error",
+		});
+		expect(harness.appendEntries).toEqual([]);
+		expect(harness.sentUserMessages).toEqual([]);
+		expect(harness.checkoutNewCalls).toEqual([]);
+		expect(harness.currentBranch()).toBe(initialBranch);
+
+		releaseModelActivation.resolve();
+		await startPromise;
+
+		expect(harness.appendEntries).toEqual([]);
+		expect(harness.sentUserMessages).toEqual(["Faster contributor loop"]);
+		expect(harness.checkoutNewCalls).toHaveLength(1);
+		expect(harness.currentBranch()).toBe(harness.checkoutNewCalls[0]);
+		await commandRequired(harness, "contribute").handler("status", harness.ctx);
+		expect(harness.notifications.at(-1)?.message).toStartWith("Contribution running on ");
 	});
 
 	it("keeps mutation admission closed across overlapping rehydrate handlers", async () => {
@@ -2145,7 +2373,7 @@ describe("process-local contribution lifecycle", () => {
 				branchEntered.resolve();
 				await releaseBranch.promise;
 			}
-			return "main";
+			return harness.currentBranch();
 		});
 		const sessionStart = handlerRequired<SessionStartEvent>(harness, "session_start");
 		const rehydratePromise = Promise.resolve(
@@ -2423,6 +2651,178 @@ describe("process-local contribution lifecycle", () => {
 		expect(harness.activeTools).toEqual(["read", "bash"]);
 	});
 
+	it("does not complete or publish a passing run whose harness mutates source during execution", async () => {
+		await initializeRealContributionRepository(cwd.path());
+		const harness = createIntegrationHarness(cwd.path());
+		await startContribution(harness);
+		const { session, storage } = await prepareInitializedContribution(harness, cwd.path());
+		const run = harness.tools.get("run_experiment");
+		if (!run) throw new Error("Expected contribution run tool");
+		let executionCalls = 0;
+		vi.spyOn(bashExecutor, "executeBash").mockImplementation(async () => {
+			executionCalls++;
+			await Bun.write(`${cwd.path()}/source.ts`, "export const value = 'mutated by harness';\n");
+			harness.setStatusText(" M source.ts\0");
+			return {
+				output: "METRIC runtime_ms=1",
+				exitCode: 0,
+				cancelled: false,
+				truncated: false,
+				totalLines: 1,
+				totalBytes: 19,
+				outputLines: 1,
+				outputBytes: 19,
+			};
+		});
+
+		await Promise.allSettled([run.execute("self-mutating-harness", {}, undefined, undefined, harness.ctx as ExtensionContext)]);
+		const pending = storage.getPendingRun(session.id);
+
+		expect({ executionCalls, completedAt: pending?.completedAt, logged: storage.listLoggedRuns(session.id) }).toEqual({
+			executionCalls: 1,
+			completedAt: null,
+			logged: [],
+		});
+	});
+
+	it("streams the contribution harness hash without materializing its whole ArrayBuffer", async () => {
+		const harness = createIntegrationHarness(cwd.path());
+		await startContribution(harness);
+		const { session, storage } = await prepareInitializedContribution(harness, cwd.path());
+		const run = harness.tools.get("run_experiment");
+		if (!run) throw new Error("Expected contribution run tool");
+		const harnessPath = `${cwd.path()}/autoresearch.sh`;
+		const realHarnessFile = Bun.file(harnessPath);
+		const expectedHash = new Bun.CryptoHasher("sha256")
+			.update(await realHarnessFile.arrayBuffer())
+			.digest("hex");
+		const callBunFile = Bun.file as unknown as (input: unknown) => unknown;
+		let arrayBufferCalls = 0;
+		let streamCalls = 0;
+		let executionCalls = 0;
+		const guardedHarnessFile = new Proxy(realHarnessFile, {
+			get(target, property) {
+				if (property === "arrayBuffer") {
+					return async () => {
+						arrayBufferCalls++;
+						throw new Error("contribution harness arrayBuffer is forbidden");
+					};
+				}
+				if (property === "stream") {
+					return () => {
+						streamCalls++;
+						return target.stream();
+					};
+				}
+				const value = Reflect.get(target, property, target);
+				return typeof value === "function" ? value.bind(target) : value;
+			},
+		});
+		vi.spyOn(Bun, "file").mockImplementation(
+			((input: unknown) => (String(input) === harnessPath ? guardedHarnessFile : (callBunFile(input) as never))) as typeof Bun.file,
+		);
+		vi.spyOn(bashExecutor, "executeBash").mockImplementation(async () => {
+			executionCalls++;
+			return {
+				output: "METRIC runtime_ms=1",
+				exitCode: 0,
+				cancelled: false,
+				truncated: false,
+				totalLines: 1,
+				totalBytes: 19,
+				outputLines: 1,
+				outputBytes: 19,
+			};
+		});
+
+		const [runOutcome] = await Promise.allSettled([
+			run.execute("stream-harness-hash", {}, undefined, undefined, harness.ctx as ExtensionContext),
+		]);
+		const pending = storage.getPendingRun(session.id);
+
+		expect({
+			outcome: runOutcome?.status,
+			arrayBufferCalls,
+			streamCalls,
+			executionCalls,
+			completed: pending?.completedAt !== null && pending?.completedAt !== undefined,
+			harnessHash: pending?.parsedAsi?.[CONTRIBUTION_HARNESS_SHA256_ASI_KEY],
+			worktreeTree: pending?.parsedAsi?.[CONTRIBUTION_WORKTREE_TREE_ASI_KEY],
+		}).toEqual({
+			outcome: "fulfilled",
+			arrayBufferCalls: 0,
+			streamCalls: 1,
+			executionCalls: 1,
+			completed: true,
+			harnessHash: expectedHash,
+			worktreeTree: CANDIDATE_TREE_SHA,
+		});
+	});
+
+	it("bypasses prepare-commit-msg and post-commit hooks and commits the exact passing tree", async () => {
+		await initializeRealContributionRepository(cwd.path());
+		const harness = createIntegrationHarness(cwd.path());
+		await startContribution(harness);
+		const { session, storage } = await prepareInitializedContribution(harness, cwd.path());
+		await Bun.write(`${cwd.path()}/source.ts`, "export const value = 'candidate';\n");
+		harness.setStatusText(" M source.ts\0");
+		vi.spyOn(bashExecutor, "executeBash").mockResolvedValue({
+			output: "METRIC runtime_ms=1",
+			exitCode: 0,
+			cancelled: false,
+			truncated: false,
+			totalLines: 1,
+			totalBytes: 19,
+			outputLines: 1,
+			outputBytes: 19,
+		});
+		const run = harness.tools.get("run_experiment");
+		const log = harness.tools.get("log_experiment");
+		if (!run || !log) throw new Error("Expected contribution run and log tools");
+		await run.execute("passing-tree-before-hooks", {}, undefined, undefined, harness.ctx as ExtensionContext);
+		const passingTree = storage.getPendingRun(session.id)?.parsedAsi?.[CONTRIBUTION_WORKTREE_TREE_ASI_KEY];
+
+		const prepareMarker = `${cwd.path()}/.git/prepare-commit-msg-ran`;
+		const postMarker = `${cwd.path()}/.git/post-commit-ran`;
+		const prepareHook = `${cwd.path()}/.git/hooks/prepare-commit-msg`;
+		const postHook = `${cwd.path()}/.git/hooks/post-commit`;
+		await Bun.write(
+			prepareHook,
+			`#!/bin/sh
+printf prepare > .git/prepare-commit-msg-ran
+printf "%s\\n" "export const value = 'hook-mutated';" > source.ts
+git add -- source.ts
+`,
+		);
+		await Bun.write(postHook, "#!/bin/sh\nprintf post > .git/post-commit-ran\n");
+		fs.chmodSync(prepareHook, 0o755);
+		fs.chmodSync(postHook, 0o755);
+
+		await log.execute(
+			"keep-with-hostile-hooks",
+			{ status: "keep", metric: 1, description: "candidate whose tested bytes must be committed" },
+			undefined,
+			undefined,
+			harness.ctx as ExtensionContext,
+		);
+		const rawCommitTree = (await $`git -C ${cwd.path()} --no-replace-objects show -s --format=%T HEAD`.quiet())
+			.text()
+			.trim();
+
+		expect({
+			prepareHookRan: fs.existsSync(prepareMarker),
+			postHookRan: fs.existsSync(postMarker),
+			rawCommitTree,
+			passingTree,
+			loggedRuns: storage.listLoggedRuns(session.id).length,
+		}).toEqual({
+			prepareHookRan: false,
+			postHookRan: false,
+			rawCommitTree: passingTree,
+			passingTree: expect.stringMatching(/^[0-9a-f]{40}$/),
+			loggedRuns: 1,
+		});
+	});
 	it("refuses to keep files changed after the passing harness execution", async () => {
 		await $`git -C ${cwd.path()} init -b main`.quiet();
 		await $`git -C ${cwd.path()} config user.name OMP`.quiet();
@@ -2814,6 +3214,23 @@ describe("process-local contribution lifecycle", () => {
 			type: "error",
 			message: expect.stringContaining("persistence failed"),
 		});
+	});
+
+	it("requests an explicit durable session flush after recording intent and before push", async () => {
+		const harness = createIntegrationHarness(cwd.path(), { confirmAnswers: [true, true, true] });
+		await startContribution(harness);
+		await prepareKeptContribution(harness, cwd.path());
+
+		await commandRequired(harness, "contribute").handler("review", harness.ctx);
+
+		const durableFlushIndex = harness.gitEvents.indexOf("flush:durable");
+		const pushIndex = harness.gitEvents.indexOf("push");
+		expect(harness.appendEntries.some(entry => entry.customType === "autoresearch-contribution-publication")).toBe(
+			true,
+		);
+		expect(harness.flushRequests).toEqual([{ durable: true }]);
+		expect(durableFlushIndex).toBeGreaterThanOrEqual(0);
+		expect(pushIndex).toBeGreaterThan(durableFlushIndex);
 	});
 
 	it("final cancellation shows exact frozen provenance and branch but performs no mutation", async () => {
@@ -3556,6 +3973,85 @@ describe("process-local contribution lifecycle", () => {
 		expect(harness.sentMessages).toHaveLength(2);
 		expect(harness.appendEntries).toEqual([]);
 		expect(harness.approvalModeMutations).toEqual([]);
+	});
+
+	it("does not resume contribution after off wins an awaited agent-end branch lookup", async () => {
+		const harness = createIntegrationHarness(cwd.path());
+		await startContribution(harness);
+		await preparePendingContribution(harness, cwd.path());
+		harness.sentMessages.length = 0;
+		const contributionBranch = harness.currentBranch();
+		const branchLookupEntered = Promise.withResolvers<void>();
+		const releaseBranchLookup = Promise.withResolvers<void>();
+		let branchLookupCount = 0;
+		vi.spyOn(git.branch, "current").mockImplementation(async () => {
+			branchLookupCount++;
+			if (branchLookupCount === 2) {
+				branchLookupEntered.resolve();
+				await releaseBranchLookup.promise;
+			}
+			return contributionBranch;
+		});
+		const agentEndPromise = handlerRequired<AgentEndEvent>(harness, "agent_end")(
+			terminalAgentEnd("stop"),
+			harness.ctx as ExtensionContext,
+		);
+		await branchLookupEntered.promise;
+
+		await commandRequired(harness, "contribute").handler("off", harness.ctx);
+		const toolUpdatesAfterOff = harness.setActiveToolsCalls.length;
+		const widgetUpdatesAfterOff = harness.widgetUpdates;
+		releaseBranchLookup.resolve();
+		await agentEndPromise;
+
+		expect(harness.sentMessages).toEqual([]);
+		expect(harness.setActiveToolsCalls).toHaveLength(toolUpdatesAfterOff);
+		expect(harness.widgetUpdates).toBe(widgetUpdatesAfterOff);
+	});
+
+	it("does not rebuild a stopped contribution from an in-flight before-agent-start lookup", async () => {
+		const harness = createIntegrationHarness(cwd.path());
+		await startContribution(harness);
+		const { storage } = await preparePendingContribution(harness, cwd.path());
+		const listLoggedRuns = vi.spyOn(storage, "listLoggedRuns");
+		const storageLookupEntered = Promise.withResolvers<void>();
+		const releaseStorageLookup = Promise.withResolvers<void>();
+		const realOpenAutoresearchStorageIfExists = autoresearchStorage.openAutoresearchStorageIfExists;
+		let storageLookupCount = 0;
+		vi.spyOn(autoresearchStorage, "openAutoresearchStorageIfExists").mockImplementation(async workDir => {
+			const openedStorage = await realOpenAutoresearchStorageIfExists(workDir);
+			storageLookupCount++;
+			if (storageLookupCount === 2) {
+				storageLookupEntered.resolve();
+				await releaseStorageLookup.promise;
+			}
+			return openedStorage;
+		});
+		const beforeAgentStartPromise = handlerRequired<BeforeAgentStartEvent, { systemPrompt?: string[] }>(
+			harness,
+			"before_agent_start",
+		)(
+			{
+				type: "before_agent_start",
+				prompt: "continue",
+				systemPrompt: ["base prompt"],
+			},
+			harness.ctx as ExtensionContext,
+		);
+		await storageLookupEntered.promise;
+
+		await commandRequired(harness, "contribute").handler("off", harness.ctx);
+		const runtimeReadsAfterOff = listLoggedRuns.mock.calls.length;
+		const toolUpdatesAfterOff = harness.setActiveToolsCalls.length;
+		const widgetUpdatesAfterOff = harness.widgetUpdates;
+		releaseStorageLookup.resolve();
+		const beforeAgentStartResult = await beforeAgentStartPromise;
+
+		expect(beforeAgentStartResult).toBeUndefined();
+		expect(listLoggedRuns).toHaveBeenCalledTimes(runtimeReadsAfterOff);
+		expect(harness.setActiveToolsCalls).toHaveLength(toolUpdatesAfterOff);
+		expect(harness.widgetUpdates).toBe(widgetUpdatesAfterOff);
+		expect(harness.activeTools).toEqual(["read", "bash"]);
 	});
 
 	it("drops process-local authentication and running state on shutdown/reopen", async () => {
