@@ -10,11 +10,11 @@ import * as git from "../utils/git";
 import commandResumeTemplate from "./command-resume.md" with { type: "text" };
 import {
 	assertContributionGoalUnchanged,
-	CONTRIBUTION_HARNESS_SHA256_ASI_KEY,
-	CONTRIBUTION_WORKTREE_TREE_ASI_KEY,
 	buildContributionCompareUrl,
 	buildContributionPrDraft,
 	buildContributionReviewUrl,
+	CONTRIBUTION_HARNESS_SHA256_ASI_KEY,
+	CONTRIBUTION_WORKTREE_TREE_ASI_KEY,
 	type ContributionCandidate,
 	ContributionError,
 	type ContributionGoal,
