@@ -10,11 +10,7 @@ import * as git from "../../utils/git";
 import { parseWorkDirDirtyPaths } from "../git";
 import { dedupeStrings, normalizePathSpec } from "../helpers";
 import { buildExperimentState } from "../state";
-import {
-	openAutoresearchStorage,
-	openAutoresearchStorageIfExists,
-	type SessionRow,
-} from "../storage";
+import { openAutoresearchStorage, openAutoresearchStorageIfExists, type SessionRow } from "../storage";
 import type { AutoresearchToolFactoryOptions, ExperimentState } from "../types";
 
 export const HARNESS_FILENAME = "autoresearch.sh";

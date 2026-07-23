@@ -179,7 +179,9 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 		// switching back resumes seamlessly.
 		const onActiveBranch = session === null || session.branch === null || session.branch === currentBranch;
 		const onContributionBranch =
-			!contributionRunning || runtime.contribution.status !== "running" || runtime.contribution.branch === currentBranch;
+			!contributionRunning ||
+			runtime.contribution.status !== "running" ||
+			runtime.contribution.branch === currentBranch;
 		runtime.autoresearchMode = contributionRunning
 			? onActiveBranch && onContributionBranch
 			: control.autoresearchMode && onActiveBranch;
@@ -246,10 +248,7 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 		}
 	};
 
-	const stopContributionRuntime = async (
-		ctx: ExtensionContext,
-		runtime: AutoresearchRuntime,
-	): Promise<string[]> => {
+	const stopContributionRuntime = async (ctx: ExtensionContext, runtime: AutoresearchRuntime): Promise<string[]> => {
 		if (runtime.contribution.status === "off") return [];
 		const contribution = runtime.contribution;
 		const warnings: string[] = [];
@@ -301,10 +300,7 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 						const storage = await openAutoresearchStorageIfExists(currentCtx.cwd);
 						const currentBranch = await git.branch.current(currentCtx.cwd, signal);
 						const session = storage?.getActiveSessionForBranch(branch) ?? null;
-						if (
-							currentBranch !== branch ||
-							(sessionId === null ? session !== null : session?.id !== sessionId)
-						) {
+						if (currentBranch !== branch || (sessionId === null ? session !== null : session?.id !== sessionId)) {
 							throw new Error("Contribution branch or experiment session changed before mutation.");
 						}
 						assertProcessIdentity(currentCtx);
@@ -593,11 +589,7 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 					ctx.ui.notify(`Contribution review failed: ${describeContributionError(error)}`, "error");
 					return;
 				}
-				const candidateResult = keptResultAtHead(
-					runtime.state.results,
-					runtime.state.currentSegment,
-					currentHead,
-				);
+				const candidateResult = keptResultAtHead(runtime.state.results, runtime.state.currentSegment, currentHead);
 				if (!candidateResult) {
 					ctx.ui.notify(
 						"Contribution review requires the current HEAD to be an unflagged kept result in the current segment.",
@@ -723,11 +715,17 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 					runtime.autoresearchMode ||
 					(!resumingAfterReview && runtime.state.sessionId !== null)
 				) {
-					ctx.ui.notify("Contribution mode requires no active or resumable autoresearch state. Run `/autoresearch clear` deliberately first.", "error");
+					ctx.ui.notify(
+						"Contribution mode requires no active or resumable autoresearch state. Run `/autoresearch clear` deliberately first.",
+						"error",
+					);
 					return;
 				}
 				if (await hasActiveAutoresearchSession(ctx.cwd)) {
-					ctx.ui.notify("Contribution mode requires no active autoresearch database session. Run `/autoresearch clear` deliberately first.", "error");
+					ctx.ui.notify(
+						"Contribution mode requires no active autoresearch database session. Run `/autoresearch clear` deliberately first.",
+						"error",
+					);
 					return;
 				}
 				const [goal, remotes] = await Promise.all([
@@ -737,7 +735,10 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 				await verifyContributionBase(ctx.cwd, goal);
 				const priorBranch = await git.branch.current(ctx.cwd);
 				if (priorBranch?.startsWith("autoresearch/")) {
-					ctx.ui.notify("Contribution mode must start from the official base, not an existing autoresearch branch.", "error");
+					ctx.ui.notify(
+						"Contribution mode must start from the official base, not an existing autoresearch branch.",
+						"error",
+					);
 					return;
 				}
 				const authenticatedModels = ctx.models.list();
@@ -748,16 +749,19 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 				const priorModel = ctx.models.current();
 				if (
 					!priorModel ||
-					!authenticatedModels.some(
-						model => model.provider === priorModel.provider && model.id === priorModel.id,
-					)
+					!authenticatedModels.some(model => model.provider === priorModel.provider && model.id === priorModel.id)
 				) {
-					ctx.ui.notify("Contribution mode requires an authenticated current model so failures can restore it.", "error");
+					ctx.ui.notify(
+						"Contribution mode requires an authenticated current model so failures can restore it.",
+						"error",
+					);
 					return;
 				}
 				const modelLabels = authenticatedModels.map(model => `${model.provider}/${model.id}`);
 				const defaultModelIndex = priorModel
-					? authenticatedModels.findIndex(model => model.provider === priorModel.provider && model.id === priorModel.id)
+					? authenticatedModels.findIndex(
+							model => model.provider === priorModel.provider && model.id === priorModel.id,
+						)
 					: -1;
 				const modelSelection = await ctx.ui.select("Select authenticated contribution model", modelLabels, {
 					initialIndex: defaultModelIndex >= 0 ? defaultModelIndex : 0,
@@ -799,7 +803,10 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 
 				const frozenBaseProof = await verifyContributionBase(ctx.cwd, goal);
 				if (await hasActiveAutoresearchSession(ctx.cwd)) {
-					ctx.ui.notify("Autoresearch state became active before contribution checkout; start cancelled.", "error");
+					ctx.ui.notify(
+						"Autoresearch state became active before contribution checkout; start cancelled.",
+						"error",
+					);
 					return;
 				}
 				if ((await git.branch.current(ctx.cwd)) !== priorBranch) {
@@ -911,7 +918,6 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 			return dashboard.showOverlay(ctx, getRuntime(ctx));
 		},
 	});
-
 
 	api.on("session_start", (_event, ctx) => rehydrate(ctx));
 	api.on("session_before_switch", async (_event, ctx) => {
@@ -1110,38 +1116,38 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 		}
 		const renderedPrompt = prompt.render(promptTemplate, {
 			base_system_prompt: basePrompt,
-					has_goal: goal.trim().length > 0,
-					goal,
-					working_dir: ctx.cwd,
-					default_metric_name: state.metricName,
-					metric_name: state.metricName,
-					has_branch: Boolean(state.branch),
-					branch: state.branch,
-					has_baseline_commit: Boolean(state.baselineCommit),
-					baseline_commit: state.baselineCommit ? state.baselineCommit.slice(0, 12) : "",
-					has_notes: state.notes.trim().length > 0,
-					notes: state.notes,
-					current_segment: state.currentSegment + 1,
-					current_segment_run_count: currentSegmentResults.length,
-					has_baseline_metric: baselineMetric !== null,
-					baseline_metric_display: formatNum(baselineMetric, state.metricUnit),
-					baseline_run_number: baselineRunNumber,
-					has_best_result: bestResult !== null && bestMetric !== null,
-					best_metric_display: bestMetric !== null ? formatNum(bestMetric, state.metricUnit) : "-",
-					best_run_number: bestResult ? (bestResult.runNumber ?? state.results.indexOf(bestResult) + 1) : null,
-					has_recent_results: recentResults.length > 0,
-					recent_results: recentResults,
-					has_unjustified_runs: unjustifiedRuns.length > 0,
-					unjustified_runs: unjustifiedRuns,
-					has_pending_run: Boolean(pendingRun),
-					pending_run_number: pendingRun?.runNumber,
-					pending_run_command: pendingRun?.command,
-					pending_run_passed: pendingRun?.passed ?? false,
-					has_pending_run_metric: pendingRun?.parsedPrimary !== null && pendingRun?.parsedPrimary !== undefined,
-					pending_run_metric_display:
-						pendingRun?.parsedPrimary !== null && pendingRun?.parsedPrimary !== undefined
-							? formatNum(pendingRun.parsedPrimary, state.metricUnit)
-							: null,
+			has_goal: goal.trim().length > 0,
+			goal,
+			working_dir: ctx.cwd,
+			default_metric_name: state.metricName,
+			metric_name: state.metricName,
+			has_branch: Boolean(state.branch),
+			branch: state.branch,
+			has_baseline_commit: Boolean(state.baselineCommit),
+			baseline_commit: state.baselineCommit ? state.baselineCommit.slice(0, 12) : "",
+			has_notes: state.notes.trim().length > 0,
+			notes: state.notes,
+			current_segment: state.currentSegment + 1,
+			current_segment_run_count: currentSegmentResults.length,
+			has_baseline_metric: baselineMetric !== null,
+			baseline_metric_display: formatNum(baselineMetric, state.metricUnit),
+			baseline_run_number: baselineRunNumber,
+			has_best_result: bestResult !== null && bestMetric !== null,
+			best_metric_display: bestMetric !== null ? formatNum(bestMetric, state.metricUnit) : "-",
+			best_run_number: bestResult ? (bestResult.runNumber ?? state.results.indexOf(bestResult) + 1) : null,
+			has_recent_results: recentResults.length > 0,
+			recent_results: recentResults,
+			has_unjustified_runs: unjustifiedRuns.length > 0,
+			unjustified_runs: unjustifiedRuns,
+			has_pending_run: Boolean(pendingRun),
+			pending_run_number: pendingRun?.runNumber,
+			pending_run_command: pendingRun?.command,
+			pending_run_passed: pendingRun?.passed ?? false,
+			has_pending_run_metric: pendingRun?.parsedPrimary !== null && pendingRun?.parsedPrimary !== undefined,
+			pending_run_metric_display:
+				pendingRun?.parsedPrimary !== null && pendingRun?.parsedPrimary !== undefined
+					? formatNum(pendingRun.parsedPrimary, state.metricUnit)
+					: null,
 		});
 		return {
 			systemPrompt: [

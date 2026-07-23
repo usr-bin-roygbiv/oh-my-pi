@@ -71,13 +71,9 @@ interface GoalRequestFixture {
 	calls: ContributionGitHubRequestSpec[];
 }
 
-function makeGoalRequest(options: {
-	ref?: unknown;
-	commit?: unknown;
-	tree?: unknown;
-	blob?: unknown;
-	content?: string;
-} = {}): GoalRequestFixture {
+function makeGoalRequest(
+	options: { ref?: unknown; commit?: unknown; tree?: unknown; blob?: unknown; content?: string } = {},
+): GoalRequestFixture {
 	const content = options.content ?? GOAL_CONTENT;
 	const size = Buffer.byteLength(content);
 	const responses = [
@@ -158,9 +154,7 @@ function makeBaseProof(): ContributionBaseProof {
 	};
 }
 
-function makePublicationGit(
-	overrides: Partial<ContributionPublicationGit> = {},
-): ContributionPublicationGit {
+function makePublicationGit(overrides: Partial<ContributionPublicationGit> = {}): ContributionPublicationGit {
 	return {
 		readRemoteUrl: async () => FORK_URL,
 		readBranch: async () => CONTRIBUTION_BRANCH,
@@ -225,7 +219,10 @@ describe("official contribution goal loading", () => {
 
 	it("rejects a ref that does not resolve to a commit before requesting a commit", async () => {
 		const fixture = makeGoalRequest({ ref: { sha: COMMIT_SHA, type: "tag" } });
-		await expectContributionError(fetchOfficialContributionGoal("/work/repo", { request: fixture.request }), "goal_ref_invalid");
+		await expectContributionError(
+			fetchOfficialContributionGoal("/work/repo", { request: fixture.request }),
+			"goal_ref_invalid",
+		);
 		expect(fixture.calls).toHaveLength(1);
 	});
 
@@ -240,13 +237,19 @@ describe("official contribution goal loading", () => {
 
 	it("rejects truncated trees instead of treating an absent entry as authoritative", async () => {
 		const fixture = makeGoalRequest({ tree: { truncated: true, entries: [] } });
-		await expectContributionError(fetchOfficialContributionGoal("/work/repo", { request: fixture.request }), "goal_tree_invalid");
+		await expectContributionError(
+			fetchOfficialContributionGoal("/work/repo", { request: fixture.request }),
+			"goal_tree_invalid",
+		);
 		expect(fixture.calls).toHaveLength(3);
 	});
 
 	it("rejects a missing official goal path without falling back to a worktree or remote", async () => {
 		const fixture = makeGoalRequest({ tree: { truncated: false, entries: [] } });
-		await expectContributionError(fetchOfficialContributionGoal("/work/repo", { request: fixture.request }), "goal_path_missing");
+		await expectContributionError(
+			fetchOfficialContributionGoal("/work/repo", { request: fixture.request }),
+			"goal_path_missing",
+		);
 		expect(fixture.calls).toHaveLength(3);
 	});
 
@@ -264,7 +267,10 @@ describe("official contribution goal loading", () => {
 				],
 			},
 		});
-		await expectContributionError(fetchOfficialContributionGoal("/work/repo", { request: fixture.request }), "goal_too_large");
+		await expectContributionError(
+			fetchOfficialContributionGoal("/work/repo", { request: fixture.request }),
+			"goal_too_large",
+		);
 		expect(fixture.calls).toHaveLength(3);
 	});
 
@@ -291,7 +297,10 @@ describe("official contribution goal loading", () => {
 			},
 			blob: { sha: BLOB_SHA, size: 1, encoding: "base64", content: oversized.toString("base64") },
 		});
-		await expectContributionError(fetchOfficialContributionGoal("/work/repo", { request: fixture.request }), "goal_too_large");
+		await expectContributionError(
+			fetchOfficialContributionGoal("/work/repo", { request: fixture.request }),
+			"goal_too_large",
+		);
 	});
 
 	it("rejects NUL-bearing content", async () => {
@@ -303,11 +312,7 @@ describe("official contribution goal loading", () => {
 	});
 
 	it("rejects content whose first nonblank line is not a bounded H1 title", async () => {
-		const invalidContents = [
-			"plain text\n# Later heading\n",
-			`# ${"x".repeat(121)}\n`,
-			"## Wrong heading level\n",
-		];
+		const invalidContents = ["plain text\n# Later heading\n", `# ${"x".repeat(121)}\n`, "## Wrong heading level\n"];
 		for (const content of invalidContents) {
 			const fixture = makeGoalRequest({ content });
 			await expectContributionError(
@@ -435,9 +440,9 @@ describe("contribution base proof", () => {
 	});
 
 	it("rejects any whole-worktree dirt, including on an existing autoresearch branch", () => {
-		expect(() => createContributionBaseProof(makeGoal(), COMMIT_SHA, " M packages/coding-agent/src/index.ts\n")).toThrow(
-			expect.objectContaining({ code: "base_worktree_dirty" }),
-		);
+		expect(() =>
+			createContributionBaseProof(makeGoal(), COMMIT_SHA, " M packages/coding-agent/src/index.ts\n"),
+		).toThrow(expect.objectContaining({ code: "base_worktree_dirty" }));
 	});
 
 	it("rejects a local HEAD that is not the exact official main commit", () => {
@@ -644,11 +649,7 @@ describe("contribution fork validation and publication", () => {
 			},
 		});
 
-		expect(calls).toEqual([
-			"read:/work/repo:origin",
-			`ancestor:/work/repo:${COMMIT_SHA}:${CURRENT_HEAD}`,
-			"push",
-		]);
+		expect(calls).toEqual(["read:/work/repo:origin", `ancestor:/work/repo:${COMMIT_SHA}:${CURRENT_HEAD}`, "push"]);
 		expect(requests.map(request => request.endpoint)).toEqual(["/repos/alice/oh-my-pi"]);
 		expect(pushes).toEqual([
 			{
@@ -750,13 +751,7 @@ describe("contribution fork validation and publication", () => {
 		const candidate = makeCandidate();
 		const baseProof = makeBaseProof();
 		const remote = validateContributionForkRemote(FORK_URL);
-		const approvedDraft = buildContributionPrDraft(
-			refreshedGoal,
-			candidate,
-			remote,
-			CONTRIBUTION_BRANCH,
-			baseProof,
-		);
+		const approvedDraft = buildContributionPrDraft(refreshedGoal, candidate, remote, CONTRIBUTION_BRANCH, baseProof);
 		let pushed = false;
 		const published = await publishContributionCandidate({
 			cwd: "/work/repo",
@@ -868,8 +863,7 @@ describe("contribution fork validation and publication", () => {
 		];
 		for (const testCase of cases) {
 			let pushCalls = 0;
-			const candidate =
-				(testCase.overrides.candidate as ContributionCandidate | undefined) ?? makeCandidate();
+			const candidate = (testCase.overrides.candidate as ContributionCandidate | undefined) ?? makeCandidate();
 			const goal = makeGoal();
 			const baseProof = makeBaseProof();
 			const options = {
@@ -1548,7 +1542,10 @@ describe("process-local contribution lifecycle", () => {
 			"Start exact upstream contribution session?",
 		]);
 		expect(harness.githubEndpoints.filter(endpoint => endpoint.includes("/git/ref/heads/"))).toHaveLength(2);
-		expect(harness.notifications.at(-1)).toMatchObject({ type: "error", message: expect.stringContaining("goal_changed") });
+		expect(harness.notifications.at(-1)).toMatchObject({
+			type: "error",
+			message: expect.stringContaining("goal_changed"),
+		});
 		expect(harness.setModelCalls).toEqual([]);
 		expect(harness.checkoutNewCalls).toEqual([]);
 		expect(harness.activeTools).toEqual(initialTools);
@@ -1566,10 +1563,7 @@ describe("process-local contribution lifecycle", () => {
 			"Select authenticated contribution model",
 			"Select GitHub fork publication remote",
 		]);
-		expect(harness.selectCalls[0]?.labels).toEqual([
-			"anthropic/claude-sonnet-4-5",
-			"anthropic/claude-sonnet-4-6",
-		]);
+		expect(harness.selectCalls[0]?.labels).toEqual(["anthropic/claude-sonnet-4-5", "anthropic/claude-sonnet-4-6"]);
 		expect(harness.setModelCalls).toEqual(priorModel ? [priorModel] : []);
 		expect(harness.checkoutNewCalls).toHaveLength(1);
 		const branch = harness.checkoutNewCalls[0] ?? "";
@@ -1694,9 +1688,9 @@ describe("process-local contribution lifecycle", () => {
 		expect(noAuth.selectCalls).toEqual([]);
 		expect(noAuth.setModelCalls).toEqual([]);
 		expect(noAuth.checkoutNewCalls).toEqual([]);
-		expect(noAuth.notifications.some(note => note.type === "error" && /authenticated model/i.test(note.message))).toBe(
-			true,
-		);
+		expect(
+			noAuth.notifications.some(note => note.type === "error" && /authenticated model/i.test(note.message)),
+		).toBe(true);
 		expect(snapshotStorageArtifacts(dbDir.path())).toEqual([]);
 	});
 
@@ -1711,9 +1705,9 @@ describe("process-local contribution lifecycle", () => {
 		const checkedRefs = harness.gitEvents.filter(event => event.startsWith("exists:refs/heads/"));
 		expect(checkedRefs).toHaveLength(2);
 		expect(new Set(checkedRefs)).toHaveSize(1);
-		expect(harness.notifications.some(note => note.type === "error" && /branch|occupied|exists/i.test(note.message))).toBe(
-			true,
-		);
+		expect(
+			harness.notifications.some(note => note.type === "error" && /branch|occupied|exists/i.test(note.message)),
+		).toBe(true);
 	});
 
 	it("rolls back model, tools, branch, and fresh ref when post-confirm activation fails", async () => {
@@ -1896,10 +1890,7 @@ describe("process-local contribution lifecycle", () => {
 		const earlierPause = terminalAgentEnd("stop", "pause before tool [CONTRIBUTE_PAUSE]").messages[0];
 		const laterAssistant = terminalAgentEnd("stop", "tool completed").messages[0];
 		if (!earlierPause || !laterAssistant) throw new Error("Expected assistant messages");
-		await agentEnd(
-			{ type: "agent_end", messages: [earlierPause, laterAssistant] },
-			harness.ctx as ExtensionContext,
-		);
+		await agentEnd({ type: "agent_end", messages: [earlierPause, laterAssistant] }, harness.ctx as ExtensionContext);
 		expect(harness.sentMessages).toHaveLength(2);
 
 		await commandRequired(harness, "contribute").handler("off", harness.ctx);

@@ -5,8 +5,7 @@ export const OFFICIAL_CONTRIBUTION_OWNER = "can1357" as const;
 export const OFFICIAL_CONTRIBUTION_REPO = "oh-my-pi" as const;
 export const OFFICIAL_CONTRIBUTION_REF = "main" as const;
 export const OFFICIAL_CONTRIBUTION_GOAL_PATH = ".github/AUTORESEARCH_GOAL.md" as const;
-export const OFFICIAL_CONTRIBUTION_REPOSITORY =
-	`${OFFICIAL_CONTRIBUTION_OWNER}/${OFFICIAL_CONTRIBUTION_REPO}` as const;
+export const OFFICIAL_CONTRIBUTION_REPOSITORY = `${OFFICIAL_CONTRIBUTION_OWNER}/${OFFICIAL_CONTRIBUTION_REPO}` as const;
 export const CONTRIBUTION_GOAL_MAX_BYTES = 32 * 1024;
 export const CONTRIBUTION_GOAL_TITLE_MAX_LENGTH = 120;
 export const CONTRIBUTION_HUMAN_SUMMARY_PLACEHOLDER =
@@ -85,10 +84,7 @@ export interface ContributionGitHubRequestSpec {
 	readonly jq: string;
 }
 
-export type ContributionGitHubRequest = (
-	spec: ContributionGitHubRequestSpec,
-	signal?: AbortSignal,
-) => Promise<unknown>;
+export type ContributionGitHubRequest = (spec: ContributionGitHubRequestSpec, signal?: AbortSignal) => Promise<unknown>;
 
 export interface FetchOfficialContributionGoalOptions {
 	readonly signal?: AbortSignal;
@@ -445,11 +441,7 @@ export function buildContributionCompareUrl(remote: GitHubRemote, branchName: st
 	return `https://github.com/${encodeURIComponent(OFFICIAL_CONTRIBUTION_OWNER)}/${encodeURIComponent(OFFICIAL_CONTRIBUTION_REPO)}/compare/${base}...${owner}:${head}?expand=1`;
 }
 
-export function buildContributionReviewUrl(
-	remote: GitHubRemote,
-	baseSha: string,
-	candidateSha: string,
-): string {
+export function buildContributionReviewUrl(remote: GitHubRemote, baseSha: string, candidateSha: string): string {
 	validateRemoteObject(remote);
 	if (!GIT_SHA_PATTERN.test(baseSha)) {
 		throw new ContributionError("base_head_mismatch", "Contribution review requires an immutable base SHA.");
@@ -561,7 +553,10 @@ export async function publishContributionCandidate(
 		throw new ContributionError("remote_missing", `The confirmed remote ${options.remoteName} no longer exists.`);
 	}
 	if (currentRemoteUrl !== options.confirmedRemoteUrl) {
-		throw new ContributionError("remote_changed", `The confirmed remote ${options.remoteName} changed before review.`);
+		throw new ContributionError(
+			"remote_changed",
+			`The confirmed remote ${options.remoteName} changed before review.`,
+		);
 	}
 	const currentRemote = validateContributionForkRemote(currentRemoteUrl);
 	if (currentRemote.slug !== approvedRemote.slug) {
@@ -597,11 +592,7 @@ export async function publishContributionCandidate(
 	const targetRef = `refs/heads/${options.branchName}`;
 	const refspec = `${options.candidate.commit}:${targetRef}`;
 	const compareUrl = buildContributionCompareUrl(currentRemote, options.branchName);
-	const reviewUrl = buildContributionReviewUrl(
-		currentRemote,
-		options.baseProof.baseSha,
-		options.candidate.commit,
-	);
+	const reviewUrl = buildContributionReviewUrl(currentRemote, options.baseProof.baseSha, options.candidate.commit);
 	const prDraft = buildContributionPrDraft(
 		options.goal,
 		options.candidate,
@@ -696,7 +687,10 @@ export async function verifyContributionFork(
 	const parent = value.parent?.toLowerCase() ?? null;
 	const source = value.source?.toLowerCase() ?? null;
 	if (parent !== official && source !== official) {
-		throw new ContributionError("remote_not_fork", "The selected GitHub repository is not a fork of the official repository.");
+		throw new ContributionError(
+			"remote_not_fork",
+			"The selected GitHub repository is not a fork of the official repository.",
+		);
 	}
 	return { fork: true, parent: value.parent, source: value.source };
 }
@@ -738,7 +732,10 @@ function validateTreeResponse(value: unknown): TreeEntryResponse {
 		throw new ContributionError("goal_tree_invalid", "The official goal tree response is malformed or truncated.");
 	}
 	if (value.entries.length === 0) {
-		throw new ContributionError("goal_path_missing", `The official goal path ${OFFICIAL_CONTRIBUTION_GOAL_PATH} is missing.`);
+		throw new ContributionError(
+			"goal_path_missing",
+			`The official goal path ${OFFICIAL_CONTRIBUTION_GOAL_PATH} is missing.`,
+		);
 	}
 	if (value.entries.length !== 1) {
 		throw new ContributionError("goal_tree_invalid", "The official goal tree contained duplicate path entries.");
@@ -797,11 +794,7 @@ function validateBlobResponse(value: unknown, treeEntry: TreeEntryResponse): Blo
 function decodeGoalBlob(blob: BlobResponse): Buffer {
 	const normalized = blob.content.replace(/[\r\n]/g, "");
 	const maxEncodedLength = Math.ceil(CONTRIBUTION_GOAL_MAX_BYTES / 3) * 4;
-	if (
-		normalized.length > maxEncodedLength ||
-		normalized.length % 4 !== 0 ||
-		!BASE64_PATTERN.test(normalized)
-	) {
+	if (normalized.length > maxEncodedLength || normalized.length % 4 !== 0 || !BASE64_PATTERN.test(normalized)) {
 		throw new ContributionError("goal_base64_invalid", "The official goal blob contains malformed base64.");
 	}
 	const decoded = Buffer.from(normalized, "base64");
@@ -838,14 +831,13 @@ function extractGoalTitle(content: string): string {
 		const line = content.slice(start, end).replace(/\r$/, "").trim();
 		if (line.length > 0) {
 			if (!line.startsWith("# ")) {
-				throw new ContributionError("goal_title_invalid", "The first nonblank goal line must be a level-one title.");
+				throw new ContributionError(
+					"goal_title_invalid",
+					"The first nonblank goal line must be a level-one title.",
+				);
 			}
 			const title = line.slice(2).trim();
-			if (
-				title.length === 0 ||
-				title.length > CONTRIBUTION_GOAL_TITLE_MAX_LENGTH ||
-				/[\x00-\x1f\x7f]/.test(title)
-			) {
+			if (title.length === 0 || title.length > CONTRIBUTION_GOAL_TITLE_MAX_LENGTH || /[\x00-\x1f\x7f]/.test(title)) {
 				throw new ContributionError("goal_title_invalid", "The official goal title must be 1 to 120 characters.");
 			}
 			return title;
@@ -983,7 +975,10 @@ function validateGoalForDraft(goal: ContributionGoal): void {
 	const title = extractGoalTitle(goal.content);
 	const sha256 = new Bun.SHA256().update(goal.content).digest("hex");
 	if (title !== goal.title || sha256.toLowerCase() !== goal.sha256.toLowerCase()) {
-		throw new ContributionError("goal_content_invalid", "The contribution goal content does not match its provenance.");
+		throw new ContributionError(
+			"goal_content_invalid",
+			"The contribution goal content does not match its provenance.",
+		);
 	}
 }
 
@@ -992,7 +987,12 @@ function validateRemoteObject(remote: GitHubRemote): void {
 		throw new ContributionError("remote_invalid", "The contribution remote is malformed.");
 	}
 	const canonical = canonicalizeGitHubRemote(remote.canonicalUrl);
-	if (!canonical || canonical.slug !== remote.slug || canonical.owner !== remote.owner || canonical.repository !== remote.repository) {
+	if (
+		!canonical ||
+		canonical.slug !== remote.slug ||
+		canonical.owner !== remote.owner ||
+		canonical.repository !== remote.repository
+	) {
 		throw new ContributionError("remote_invalid", "The contribution remote is malformed.");
 	}
 	validateContributionForkRemote(remote.canonicalUrl);
