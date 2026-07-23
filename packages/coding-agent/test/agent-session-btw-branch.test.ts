@@ -137,9 +137,29 @@ describe("AgentSession.branchFromBtw", () => {
 	});
 
 	it("honors session_before_branch cancellation without creating a branch", async () => {
-		const emit = vi.fn(async () => ({ cancel: true }));
+		const emitted: Array<{
+			type: string;
+			transitionId?: string;
+			kind?: string;
+			committed?: boolean;
+			entryId?: string | null;
+		}> = [];
+		const emit = vi.fn(
+			async (event: {
+				type: string;
+				transitionId?: string;
+				kind?: string;
+				committed?: boolean;
+				entryId?: string | null;
+			}) => {
+				emitted.push(event);
+				return event.type === "session_before_branch" ? { cancel: true } : undefined;
+			},
+		);
 		const extensionRunner = {
-			hasHandlers: vi.fn((eventType: string) => eventType === "session_before_branch"),
+			hasHandlers: vi.fn(
+				(eventType: string) => eventType === "session_before_branch" || eventType === "session_transition_end",
+			),
 			emit,
 		} as unknown as ExtensionRunner;
 		const activeSession = await createSession({ extensionRunner });
@@ -151,9 +171,16 @@ describe("AgentSession.branchFromBtw", () => {
 
 		expect(result).toEqual({ cancelled: true, sessionFile: originalFile });
 		expect(activeSession.sessionFile).toBe(originalFile);
-		expect(emit).toHaveBeenCalledWith({
+		expect(emitted[0]).toMatchObject({
 			type: "session_before_branch",
 			entryId: activeSession.sessionManager.getLeafId(),
+			transitionId: expect.any(String),
+		});
+		expect(emitted[1]).toMatchObject({
+			type: "session_transition_end",
+			kind: "branch",
+			committed: false,
+			transitionId: emitted[0]?.transitionId,
 		});
 	});
 

@@ -1348,6 +1348,7 @@ interface IntegrationHarnessOptions {
 	sessionId?: string;
 	refExistsResults?: boolean[];
 	ancestryResults?: boolean[];
+	publishedRefSha?: string;
 }
 
 interface CapturedNotification {
@@ -1551,6 +1552,9 @@ function createIntegrationHarness(cwd: string, options: IntegrationHarnessOption
 		const endpoint = args.find(arg => arg.startsWith("/repos/"));
 		if (!endpoint) throw new Error(`Missing GitHub API endpoint in ${args.join(" ")}`);
 		githubEndpoints.push(endpoint);
+		if (endpoint.startsWith("/repos/alice/oh-my-pi/git/ref/heads/")) {
+			return { sha: options.publishedRefSha ?? CURRENT_HEAD, type: "commit" } as never;
+		}
 		if (endpoint === "/repos/alice/oh-my-pi") {
 			forkMetadataRequestCount++;
 			await options.onForkMetadataRequest?.(forkMetadataRequestCount, signal);
@@ -2077,21 +2081,30 @@ describe("process-local contribution lifecycle", () => {
 		const session = storage.getActiveSessionForBranch(harness.currentBranch());
 		if (!session) throw new Error("Expected ordinary autoresearch session");
 
+		const transitionId = "cancelled-tree-transition";
+		const beforeEvent = {
+			type: "session_before_tree",
+			transitionId,
+			preparation: {
+				targetId: "uncommitted-target",
+				oldLeafId: "ordinary-source",
+				commonAncestorId: "root",
+				entriesToSummarize: [],
+				userWantsSummary: false,
+			},
+			signal: new AbortController().signal,
+		} satisfies SessionBeforeTreeEvent & { transitionId: string };
 		const beforeResult = await handlerRequired<SessionBeforeTreeEvent, { cancel?: boolean }>(
 			harness,
 			"session_before_tree",
-		)(
-			{
-				type: "session_before_tree",
-				preparation: {
-					targetId: "uncommitted-target",
-					oldLeafId: "ordinary-source",
-					commonAncestorId: "root",
-					entriesToSummarize: [],
-					userWantsSummary: false,
-				},
-				signal: new AbortController().signal,
-			},
+		)(beforeEvent, harness.ctx as ExtensionContext);
+		await handlerRequired<{
+			type: "session_transition_end";
+			transitionId: string;
+			kind: "tree";
+			committed: boolean;
+		}>(harness, "session_transition_end")(
+			{ type: "session_transition_end", transitionId, kind: "tree", committed: false },
 			harness.ctx as ExtensionContext,
 		);
 		const updateNotes = harness.tools.get("update_notes");
@@ -2485,6 +2498,9 @@ describe("process-local contribution lifecycle", () => {
 		const planDisplayedBeforeShutdown = harness.notifications.some(notification =>
 			notification.message.startsWith("Contribution publication plan (push outcome pending):"),
 		);
+		const durableIntentBeforeShutdown = harness.appendEntries.find(
+			entry => entry.customType === "autoresearch-contribution-publication",
+		);
 		let shutdownSettled = false;
 		const shutdownPromise = Promise.resolve(
 			handlerRequired<SessionShutdownEvent>(harness, "session_shutdown")(
@@ -2501,11 +2517,60 @@ describe("process-local contribution lifecycle", () => {
 		const [reviewResult, shutdownResult] = await Promise.allSettled([reviewPromise, shutdownPromise]);
 
 		expect(planDisplayedBeforeShutdown).toBe(true);
+		expect(durableIntentBeforeShutdown?.data).toMatchObject({
+			phase: "intent",
+			candidateHead: CURRENT_HEAD,
+			remoteUrl: FORK_URL,
+		});
 		expect(shutdownSettledBeforeRelease).toBe(true);
 		expect(pushSignal).toBeDefined();
 		expect(pushSignal?.aborted).toBe(false);
 		expect(reviewResult.status).toBe("fulfilled");
 		expect(shutdownResult.status).toBe("fulfilled");
+	});
+
+	it("reconciles a durable publication intent after restart without retrying the push", async () => {
+		const harness = createIntegrationHarness(cwd.path(), { publishedRefSha: CURRENT_HEAD });
+		const remote = validateContributionForkRemote(FORK_URL);
+		const goal = makeGoal();
+		const candidate = makeCandidate();
+		const baseProof = makeBaseProof();
+		const prDraft = buildContributionPrDraft(goal, candidate, remote, CONTRIBUTION_BRANCH, baseProof);
+		const reviewUrl = buildContributionReviewUrl(remote, baseProof.baseSha, candidate.commit);
+		const compareUrl = buildContributionCompareUrl(remote, CONTRIBUTION_BRANCH);
+		harness.setSessionBranch([
+			{
+				type: "custom",
+				customType: "autoresearch-contribution-publication",
+				id: "durable-publication-intent",
+				parentId: null,
+				timestamp: new Date(0).toISOString(),
+				data: {
+					phase: "intent",
+					remoteName: "origin",
+					remoteUrl: FORK_URL,
+					pushRemoteUrl: FORK_URL,
+					branchName: CONTRIBUTION_BRANCH,
+					targetRef: `refs/heads/${CONTRIBUTION_BRANCH}`,
+					refspec: `${CURRENT_HEAD}:refs/heads/${CONTRIBUTION_BRANCH}`,
+					candidateHead: CURRENT_HEAD,
+					baseSha: baseProof.baseSha,
+					reviewUrl,
+					compareUrl,
+					prDraft,
+				},
+			},
+		]);
+
+		await commandRequired(harness, "contribute").handler("status", harness.ctx);
+
+		expect(harness.pushes).toEqual([]);
+		expect(harness.githubEndpoints).toContain(
+			`/repos/alice/oh-my-pi/git/ref/heads/${encodeURIComponent(CONTRIBUTION_BRANCH)}`,
+		);
+		expect(harness.notifications.at(-1)?.message).toStartWith("Contribution publication recovered:");
+		expect(harness.notifications.at(-1)?.message).toContain(reviewUrl);
+		expect(harness.notifications.at(-1)?.message).toContain(CURRENT_HEAD);
 	});
 
 	it("preflight cancellation performs no discovery or filesystem/durable mutation", async () => {
