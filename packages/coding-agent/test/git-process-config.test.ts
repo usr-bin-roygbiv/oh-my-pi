@@ -111,6 +111,36 @@ describe("git subprocess config", () => {
 		]);
 	});
 
+	it("can bypass push hooks and ambient submodule publication", async () => {
+		const spawnCalls: SpawnCall[] = [];
+		vi.spyOn(Bun, "spawn").mockImplementation(createSpawnMock(spawnCalls));
+
+		await git.push(
+			"/work/pi",
+			{
+				remote: "fork",
+				refspec: "0123456789abcdef0123456789abcdef01234567:refs/heads/feature",
+				noVerify: true,
+				recurseSubmodules: "no",
+			} as never,
+		);
+
+		expect(spawnCalls).toHaveLength(1);
+		expect(spawnCalls[0]?.cmd).toEqual([
+			"git",
+			"-c",
+			"core.fsmonitor=false",
+			"-c",
+			"core.untrackedCache=false",
+			"push",
+			"--no-follow-tags",
+			"--no-verify",
+			"--recurse-submodules=no",
+			"fork",
+			"0123456789abcdef0123456789abcdef01234567:refs/heads/feature",
+		]);
+	});
+
 	it("preserves the caller's GPG_TTY for signing-capable commands", async () => {
 		const originalGpgTty = process.env.GPG_TTY;
 		const spawnCalls: SpawnCall[] = [];

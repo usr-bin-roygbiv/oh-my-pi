@@ -696,10 +696,12 @@ describe("contribution fork validation and publication", () => {
 		const movedHead = "5".repeat(40);
 		let head = CURRENT_HEAD;
 		let publishedCommit: string | undefined;
+		let pushPolicy: Record<string, unknown> | undefined;
 		const events: string[] = [];
 		const publicationGit = makePublicationGit({
 			readHead: async () => head,
 			push: async (_cwd, options) => {
+				pushPolicy = options as unknown as Record<string, unknown>;
 				expect(options.verifiedRemoteUrl).toBe(FORK_URL);
 				events.push("push URL verified");
 				head = movedHead;
@@ -730,6 +732,7 @@ describe("contribution fork validation and publication", () => {
 
 		expect(events).toEqual(["push URL verified", "HEAD moved", "source resolved"]);
 		expect(publishedCommit).toBe(CURRENT_HEAD);
+		expect(pushPolicy).toMatchObject({ noVerify: true, recurseSubmodules: "no" });
 	});
 
 	it("pushes the validated commit through a real bare remote even when HEAD moves", async () => {
@@ -752,6 +755,10 @@ describe("contribution fork validation and publication", () => {
 			await $`git -C ${source.path()} -c user.name=OMP -c user.email=omp@example.invalid commit -m candidate-b`.quiet();
 			const movedSha = (await $`git -C ${source.path()} rev-parse HEAD`.quiet()).text().trim();
 			await $`git -C ${source.path()} reset --hard ${candidateSha}`.quiet();
+			const hookMarker = `${source.path()}/pre-push-ran`;
+			const hookPath = `${source.path()}/.git/hooks/pre-push`;
+			await Bun.write(hookPath, `#!/bin/sh\nprintf hook > ${JSON.stringify(hookMarker)}\n`);
+			fs.chmodSync(hookPath, 0o755);
 
 			const goal = makeGoal({ commitSha: baseSha });
 			const candidate = makeCandidate({ commit: candidateSha });
@@ -777,12 +784,18 @@ describe("contribution fork validation and publication", () => {
 				isAncestor: (cwd, ancestor, descendant, signal) => git.isAncestor(cwd, ancestor, descendant, signal),
 				push: async (cwd, options) => {
 					await $`git -C ${cwd} reset --hard ${movedSha}`.quiet();
-					await git.push(cwd, {
-						remote: `file://${remote.path()}`,
-						refspec: options.refspec,
-						forceWithLease: options.forceWithLease,
-						signal: options.signal,
-					});
+					const pushPolicy = options as unknown as Record<string, unknown>;
+					await git.push(
+						cwd,
+						{
+							remote: `file://${remote.path()}`,
+							refspec: options.refspec,
+							forceWithLease: options.forceWithLease,
+							signal: options.signal,
+							noVerify: pushPolicy.noVerify,
+							recurseSubmodules: pushPolicy.recurseSubmodules,
+						} as never,
+					);
 				},
 			};
 
@@ -810,6 +823,7 @@ describe("contribution fork validation and publication", () => {
 			expect(published.refspec).toBe(`${candidateSha}:refs/heads/${CONTRIBUTION_BRANCH}`);
 			expect(await git.head.sha(source.path())).toBe(movedSha);
 			expect(remoteSha).toBe(candidateSha);
+			expect(await Bun.file(hookMarker).exists()).toBe(false);
 		} finally {
 			source.removeSync();
 			remote.removeSync();
@@ -1791,7 +1805,17 @@ function terminalAgentEnd(stopReason: "stop" | "aborted" | "error", text = "done
 	} as AgentEndEvent;
 }
 
-async function prepareKeptContribution(harness: IntegrationHarness, cwd: string): Promise<SessionRow> {
+interface KeptContributionOptions {
+	candidateExitCode?: number;
+	candidateTimedOut?: boolean;
+	redProof?: "valid" | "missing" | "passing" | "flagged";
+}
+
+async function prepareKeptContribution(
+	harness: IntegrationHarness,
+	cwd: string,
+	options: KeptContributionOptions = {},
+): Promise<SessionRow> {
 	await Bun.write(`${cwd}/autoresearch.sh`, "#!/usr/bin/env bash\necho METRIC runtime_ms=1\n");
 	const init = harness.tools.get("init_experiment");
 	if (!init) throw new Error("Expected init_experiment tool");
@@ -1806,20 +1830,55 @@ async function prepareKeptContribution(harness: IntegrationHarness, cwd: string)
 	const session = storage.getActiveSessionForBranch(harness.currentBranch());
 	if (!session) throw new Error("Expected contribution session");
 	const now = Date.now();
+	if (options.redProof !== "missing") {
+		const redRun = storage.insertRun({
+			sessionId: session.id,
+			segment: session.currentSegment,
+			command: "bash autoresearch.sh",
+			startedAt: now,
+			logPath: "",
+			preRunDirtyPaths: [],
+		});
+		storage.markRunCompleted({
+			runId: redRun.id,
+			completedAt: now + 1,
+			durationMs: 1,
+			exitCode: options.redProof === "passing" ? 0 : 1,
+			timedOut: false,
+			parsedPrimary: null,
+			parsedMetrics: null,
+			parsedAsi: { hypothesis: "The focused contribution scenario should fail before the fix." },
+		});
+		storage.markRunLogged({
+			runId: redRun.id,
+			status: "checks_failed",
+			description: "Observed the focused scenario fail before implementation.",
+			metric: 0,
+			metrics: {},
+			asi: { hypothesis: "The focused contribution scenario should fail before the fix." },
+			commitHash: COMMIT_SHA,
+			confidence: null,
+			modifiedPaths: [],
+			scopeDeviations: [],
+			justification: null,
+			loggedAt: now + 2,
+		});
+		if (options.redProof === "flagged") storage.flagRun(redRun.id, "invalid red proof");
+	}
 	const run = storage.insertRun({
 		sessionId: session.id,
 		segment: session.currentSegment,
 		command: "bash autoresearch.sh",
-		startedAt: now,
+		startedAt: now + 10,
 		logPath: "",
 		preRunDirtyPaths: [],
 	});
 	storage.markRunCompleted({
 		runId: run.id,
-		completedAt: now + 1,
+		completedAt: now + 11,
 		durationMs: 1,
-		exitCode: 0,
-		timedOut: false,
+		exitCode: options.candidateExitCode ?? 0,
+		timedOut: options.candidateTimedOut ?? false,
 		parsedPrimary: 1,
 		parsedMetrics: { runtime_ms: 1 },
 		parsedAsi: { hypothesis: "Ran the focused contribution scenario." },
@@ -1836,7 +1895,7 @@ async function prepareKeptContribution(harness: IntegrationHarness, cwd: string)
 		modifiedPaths: [],
 		scopeDeviations: [],
 		justification: null,
-		loggedAt: now + 2,
+		loggedAt: now + 12,
 	});
 	harness.setHeadSha(CURRENT_HEAD);
 	return session;
@@ -1952,6 +2011,7 @@ describe("process-local contribution lifecycle", () => {
 				data: { mode: "on", goal: "ordinary autoresearch goal" },
 			},
 		]);
+
 		const firstBranchEntered = Promise.withResolvers<void>();
 		const secondBranchEntered = Promise.withResolvers<void>();
 		const releaseFirstBranch = Promise.withResolvers<void>();
@@ -1998,6 +2058,57 @@ describe("process-local contribution lifecycle", () => {
 		expect(mutationResult).toMatchObject({ status: "rejected", reason: { name: "ToolAbortError" } });
 		expect(secondResult.status).toBe("fulfilled");
 		expect(snapshotStorageArtifacts(dbDir.path())).toEqual([]);
+	});
+
+	it("does not wedge ordinary autoresearch when a tree transition never commits", async () => {
+		const harness = createIntegrationHarness(cwd.path());
+		await commandRequired(harness, "autoresearch").handler("ordinary goal", harness.ctx);
+		await Bun.write(`${cwd.path()}/autoresearch.sh`, "#!/usr/bin/env bash\necho METRIC runtime_ms=1\n");
+		const init = harness.tools.get("init_experiment");
+		if (!init) throw new Error("Expected init_experiment tool");
+		await init.execute(
+			"ordinary-session",
+			{ name: "ordinary", primary_metric: "runtime_ms", metric_unit: "ms" },
+			undefined,
+			undefined,
+			harness.ctx as ExtensionContext,
+		);
+		const storage = await openAutoresearchStorage(cwd.path());
+		const session = storage.getActiveSessionForBranch(harness.currentBranch());
+		if (!session) throw new Error("Expected ordinary autoresearch session");
+
+		const beforeResult = await handlerRequired<SessionBeforeTreeEvent, { cancel?: boolean }>(
+			harness,
+			"session_before_tree",
+		)(
+			{
+				type: "session_before_tree",
+				preparation: {
+					targetId: "uncommitted-target",
+					oldLeafId: "ordinary-source",
+					commonAncestorId: "root",
+					entriesToSummarize: [],
+					userWantsSummary: false,
+				},
+				signal: new AbortController().signal,
+			},
+			harness.ctx as ExtensionContext,
+		);
+		const updateNotes = harness.tools.get("update_notes");
+		if (!updateNotes) throw new Error("Expected update_notes tool");
+		const [updateResult] = await Promise.allSettled([
+			updateNotes.execute(
+				"notes-after-cancelled-tree",
+				{ body: "ordinary notes remain writable" },
+				undefined,
+				undefined,
+				harness.ctx as ExtensionContext,
+			),
+		]);
+
+		expect(beforeResult).toBeUndefined();
+		expect(updateResult.status).toBe("fulfilled");
+		expect(storage.getSessionById(session.id)?.notes).toBe("ordinary notes remain writable");
 	});
 
 	it("aborts and drains a kept log commit before contribution off", async () => {
@@ -2227,30 +2338,79 @@ describe("process-local contribution lifecycle", () => {
 		expect(harness.activeTools).toEqual(["read", "bash"]);
 	});
 
-	for (const invalidation of ["off", "session switch"] as const) {
-		it(`drains a successful publication into its immutable handoff during ${invalidation}`, async () => {
+	it("drains a successful publication into its immutable handoff during off", async () => {
+		const harness = createIntegrationHarness(cwd.path(), { confirmAnswers: [true, true, true] });
+		await startContribution(harness);
+		await prepareKeptContribution(harness, cwd.path());
+		const transportApplied = Promise.withResolvers<void>();
+		const releaseTransport = Promise.withResolvers<void>();
+		let pushSignal: AbortSignal | undefined;
+		vi.spyOn(git, "push").mockImplementation(async (_workDir, options) => {
+			pushSignal = options?.signal;
+			transportApplied.resolve();
+			await releaseTransport.promise;
+		});
+
+		const reviewPromise = commandRequired(harness, "contribute").handler("review", harness.ctx);
+		await transportApplied.promise;
+		const planDisplayedBeforeRelease = harness.notifications.some(notification =>
+			notification.message.startsWith("Contribution publication plan (push outcome pending):"),
+		);
+		let offSettled = false;
+		const offPromise = commandRequired(harness, "contribute")
+			.handler("off", harness.ctx)
+			.finally(() => {
+				offSettled = true;
+			});
+		for (let turn = 0; turn < 4; turn++) await Promise.resolve();
+		const offSettledBeforeRelease = offSettled;
+
+		releaseTransport.resolve();
+		const [reviewResult, offResult] = await Promise.allSettled([reviewPromise, offPromise]);
+
+		expect(planDisplayedBeforeRelease).toBe(true);
+		expect(offSettledBeforeRelease).toBe(false);
+		expect(pushSignal).toBeDefined();
+		expect(pushSignal?.aborted).toBe(false);
+		expect(reviewResult.status).toBe("fulfilled");
+		expect(offResult.status).toBe("fulfilled");
+		expect(
+			harness.notifications.some(notification =>
+				notification.message.startsWith("Contribution candidate was pushed; review handoff preserved."),
+			),
+		).toBe(true);
+		expect(harness.notifications.some(notification => notification.message === "Contribution mode stopped.")).toBe(
+			false,
+		);
+		await commandRequired(harness, "contribute").handler("status", harness.ctx);
+		expect(harness.notifications.at(-1)?.message).toStartWith("Contribution review ready:");
+	});
+
+	for (const transition of ["session_before_switch", "session_before_branch", "session_before_tree"] as const) {
+		it(`cancels ${transition} immediately while an immutable publication settles`, async () => {
 			const harness = createIntegrationHarness(cwd.path(), { confirmAnswers: [true, true, true] });
 			await startContribution(harness);
 			await prepareKeptContribution(harness, cwd.path());
 			const transportApplied = Promise.withResolvers<void>();
 			const releaseTransport = Promise.withResolvers<void>();
 			let pushSignal: AbortSignal | undefined;
-			let refApplied = false;
 			vi.spyOn(git, "push").mockImplementation(async (_workDir, options) => {
 				pushSignal = options?.signal;
-				refApplied = true;
 				transportApplied.resolve();
 				await releaseTransport.promise;
 			});
 
 			const reviewPromise = commandRequired(harness, "contribute").handler("review", harness.ctx);
 			await transportApplied.promise;
+			const planDisplayedBeforeRelease = harness.notifications.some(notification =>
+				notification.message.startsWith("Contribution publication plan (push outcome pending):"),
+			);
+			let transitionResult: { cancel?: boolean } | void;
 			let transitionSettled = false;
 			const transitionPromise = (
-				invalidation === "off"
-					? commandRequired(harness, "contribute").handler("off", harness.ctx)
-					: Promise.resolve(
-							handlerRequired<SessionBeforeSwitchEvent>(harness, "session_before_switch")(
+				transition === "session_before_switch"
+					? Promise.resolve(
+							handlerRequired<SessionBeforeSwitchEvent, { cancel?: boolean }>(harness, transition)(
 								{
 									type: "session_before_switch",
 									reason: "resume",
@@ -2259,44 +2419,94 @@ describe("process-local contribution lifecycle", () => {
 								harness.ctx as ExtensionContext,
 							),
 						)
-			).finally(() => {
+					: transition === "session_before_branch"
+						? Promise.resolve(
+								handlerRequired<SessionBeforeBranchEvent, { cancel?: boolean }>(harness, transition)(
+									{ type: "session_before_branch", entryId: "publication-source" },
+									harness.ctx as ExtensionContext,
+								),
+							)
+						: Promise.resolve(
+								handlerRequired<SessionBeforeTreeEvent, { cancel?: boolean }>(harness, transition)(
+									{
+										type: "session_before_tree",
+										preparation: {
+											targetId: "publication-target",
+											oldLeafId: "publication-source",
+											commonAncestorId: "root",
+											entriesToSummarize: [],
+											userWantsSummary: false,
+										},
+										signal: new AbortController().signal,
+									},
+									harness.ctx as ExtensionContext,
+								),
+							)
+			).then(result => {
+				transitionResult = result;
+			});
+			void transitionPromise.finally(() => {
 				transitionSettled = true;
 			});
-			const transitionBeforeRelease = await Promise.race([
-				transitionPromise.then(() => "settled" as const),
-				Promise.resolve("pending" as const),
-			]);
+			for (let turn = 0; turn < 4; turn++) await Promise.resolve();
+			const transitionSettledBeforeRelease = transitionSettled;
 
 			releaseTransport.resolve();
-			const [reviewResult, transitionResult] = await Promise.allSettled([reviewPromise, transitionPromise]);
+			const [reviewResult, settledTransition] = await Promise.allSettled([reviewPromise, transitionPromise]);
 
-			expect(refApplied).toBe(true);
-			expect(transitionBeforeRelease).toBe("pending");
-			expect(transitionSettled).toBe(true);
+			expect(planDisplayedBeforeRelease).toBe(true);
+			expect(transitionSettledBeforeRelease).toBe(true);
+			expect(transitionResult).toEqual({ cancel: true });
 			expect(pushSignal).toBeDefined();
 			expect(pushSignal?.aborted).toBe(false);
 			expect(reviewResult.status).toBe("fulfilled");
-			expect(transitionResult.status).toBe("fulfilled");
-			expect(
-				harness.notifications.some(notification => notification.message.startsWith("Contribution review failed:")),
-			).toBe(false);
+			expect(settledTransition.status).toBe("fulfilled");
 			expect(
 				harness.notifications.some(notification => notification.message.startsWith("Immutable SHA review:")),
 			).toBe(true);
-			if (invalidation === "off") {
-				expect(
-					harness.notifications.some(notification =>
-						notification.message.startsWith("Contribution candidate was pushed; review handoff preserved."),
-					),
-				).toBe(true);
-				expect(
-					harness.notifications.some(notification => notification.message === "Contribution mode stopped."),
-				).toBe(false);
-			}
-			await commandRequired(harness, "contribute").handler("status", harness.ctx);
-			expect(harness.notifications.at(-1)?.message).toStartWith("Contribution review ready:");
 		});
 	}
+
+	it("returns from shutdown without waiting for a push after pre-displaying the deterministic handoff", async () => {
+		const harness = createIntegrationHarness(cwd.path(), { confirmAnswers: [true, true, true] });
+		await startContribution(harness);
+		await prepareKeptContribution(harness, cwd.path());
+		const transportApplied = Promise.withResolvers<void>();
+		const releaseTransport = Promise.withResolvers<void>();
+		let pushSignal: AbortSignal | undefined;
+		vi.spyOn(git, "push").mockImplementation(async (_workDir, options) => {
+			pushSignal = options?.signal;
+			transportApplied.resolve();
+			await releaseTransport.promise;
+		});
+
+		const reviewPromise = commandRequired(harness, "contribute").handler("review", harness.ctx);
+		await transportApplied.promise;
+		const planDisplayedBeforeShutdown = harness.notifications.some(notification =>
+			notification.message.startsWith("Contribution publication plan (push outcome pending):"),
+		);
+		let shutdownSettled = false;
+		const shutdownPromise = Promise.resolve(
+			handlerRequired<SessionShutdownEvent>(harness, "session_shutdown")(
+				{ type: "session_shutdown" } as SessionShutdownEvent,
+				harness.ctx as ExtensionContext,
+			),
+		).finally(() => {
+			shutdownSettled = true;
+		});
+		for (let turn = 0; turn < 4; turn++) await Promise.resolve();
+		const shutdownSettledBeforeRelease = shutdownSettled;
+
+		releaseTransport.resolve();
+		const [reviewResult, shutdownResult] = await Promise.allSettled([reviewPromise, shutdownPromise]);
+
+		expect(planDisplayedBeforeShutdown).toBe(true);
+		expect(shutdownSettledBeforeRelease).toBe(true);
+		expect(pushSignal).toBeDefined();
+		expect(pushSignal?.aborted).toBe(false);
+		expect(reviewResult.status).toBe("fulfilled");
+		expect(shutdownResult.status).toBe("fulfilled");
+	});
 
 	it("preflight cancellation performs no discovery or filesystem/durable mutation", async () => {
 		const harness = createIntegrationHarness(cwd.path(), { confirmAnswers: [false] });
@@ -2341,7 +2551,7 @@ describe("process-local contribution lifecycle", () => {
 	for (const invalidation of ["off", "session switch"] as const) {
 		it(`invalidates a confirmed start during final confirmation on ${invalidation} without mutation`, async () => {
 			let harness!: IntegrationHarness;
-			let beforeSwitch: Promise<void> | undefined;
+			let beforeSwitch: Promise<{ cancel?: boolean } | void> | undefined;
 			harness = createIntegrationHarness(cwd.path(), {
 				async onConfirm(callNumber): Promise<void> {
 					if (callNumber !== 2) return;
@@ -2350,7 +2560,7 @@ describe("process-local contribution lifecycle", () => {
 						return;
 					}
 					beforeSwitch = Promise.resolve(
-						handlerRequired<SessionBeforeSwitchEvent>(harness, "session_before_switch")(
+						handlerRequired<SessionBeforeSwitchEvent, { cancel?: boolean }>(harness, "session_before_switch")(
 							{ type: "session_before_switch", reason: "resume", targetSessionFile: "/tmp/switched.jsonl" },
 							harness.ctx as ExtensionContext,
 						),
@@ -2363,12 +2573,7 @@ describe("process-local contribution lifecycle", () => {
 			await startContribution(harness);
 			if (invalidation === "session switch") {
 				if (!beforeSwitch) throw new Error("Expected session-before-switch handler to start");
-				await beforeSwitch;
-				harness.setSessionId("switched-session");
-				await handlerRequired<SessionSwitchEvent>(harness, "session_switch")(
-					{ type: "session_switch", reason: "resume", previousSessionFile: "/tmp/original.jsonl" },
-					harness.ctx as ExtensionContext,
-				);
+				expect(await beforeSwitch).toEqual({ cancel: true });
 			}
 
 			expect(harness.confirmCalls.at(-1)?.title).toBe("Start exact upstream contribution session?");
@@ -2382,170 +2587,64 @@ describe("process-local contribution lifecycle", () => {
 		});
 	}
 
-	const partialStartTransitions = [
-		{
-			point: "setModel",
-			beforeName: "session_before_switch",
-			afterName: "session_switch",
-			changesSession: true,
-			beginBefore(harness: IntegrationHarness): Promise<void> {
-				return Promise.resolve(
-					handlerRequired<SessionBeforeSwitchEvent>(harness, "session_before_switch")(
-						{ type: "session_before_switch", reason: "resume", targetSessionFile: "/tmp/target.jsonl" },
-						harness.ctx as ExtensionContext,
-					),
-				);
-			},
-			rehydrate(harness: IntegrationHarness): Promise<void> {
-				return Promise.resolve(
-					handlerRequired<SessionSwitchEvent>(harness, "session_switch")(
-						{ type: "session_switch", reason: "resume", previousSessionFile: "/tmp/source.jsonl" },
-						harness.ctx as ExtensionContext,
-					),
-				);
-			},
-		},
-		{
-			point: "checkoutNewAt",
-			beforeName: "session_before_branch",
-			afterName: "session_branch",
-			changesSession: true,
-			beginBefore(harness: IntegrationHarness): Promise<void> {
-				return Promise.resolve(
-					handlerRequired<SessionBeforeBranchEvent>(harness, "session_before_branch")(
-						{ type: "session_before_branch", entryId: "source-entry" },
-						harness.ctx as ExtensionContext,
-					),
-				);
-			},
-			rehydrate(harness: IntegrationHarness): Promise<void> {
-				return Promise.resolve(
-					handlerRequired<SessionBranchEvent>(harness, "session_branch")(
-						{ type: "session_branch", previousSessionFile: "/tmp/source.jsonl" },
-						harness.ctx as ExtensionContext,
-					),
-				);
-			},
-		},
-		{
-			point: "setActiveTools",
-			beforeName: "session_before_tree",
-			afterName: "session_tree",
-			changesSession: false,
-			beginBefore(harness: IntegrationHarness): Promise<void> {
-				return Promise.resolve(
-					handlerRequired<SessionBeforeTreeEvent>(harness, "session_before_tree")(
-						{
-							type: "session_before_tree",
-							preparation: {
-								targetId: "target-leaf",
-								oldLeafId: "source-leaf",
-								commonAncestorId: "root",
-								entriesToSummarize: [],
-								userWantsSummary: false,
+	it("cancels a session transition immediately while contribution activation rolls back", async () => {
+		const rollbackEntered = Promise.withResolvers<void>();
+		const releaseRollback = Promise.withResolvers<void>();
+		const priorModel = requiredBundledModel("anthropic", "claude-sonnet-4-5");
+		const selectedModel = requiredBundledModel("anthropic", "claude-sonnet-4-6");
+		let harness!: IntegrationHarness;
+		let transitionResult: { cancel?: boolean } | void;
+		let transitionSettled = false;
+		let transitionPromise: Promise<void> | null = null;
+		harness = createIntegrationHarness(cwd.path(), {
+			currentModel: priorModel,
+			selectedModelId: selectedModel.id,
+			async onSetModel(callNumber): Promise<void> {
+				if (callNumber === 1) {
+					transitionPromise = Promise.resolve(
+						handlerRequired<SessionBeforeSwitchEvent, { cancel?: boolean }>(
+							harness,
+							"session_before_switch",
+						)(
+							{
+								type: "session_before_switch",
+								reason: "resume",
+								targetSessionFile: "/tmp/activation-switch.jsonl",
 							},
-							signal: new AbortController().signal,
-						},
-						harness.ctx as ExtensionContext,
-					),
-				);
+							harness.ctx as ExtensionContext,
+						),
+					).then(result => {
+						transitionResult = result;
+						transitionSettled = true;
+					});
+				} else if (callNumber === 2) {
+					rollbackEntered.resolve();
+					await releaseRollback.promise;
+				}
 			},
-			rehydrate(harness: IntegrationHarness): Promise<void> {
-				return Promise.resolve(
-					handlerRequired<SessionTreeEvent>(harness, "session_tree")(
-						{ type: "session_tree", newLeafId: "target-leaf", oldLeafId: "source-leaf" },
-						harness.ctx as ExtensionContext,
-					),
-				);
-			},
-		},
-	] as const;
-
-	for (const transition of partialStartTransitions) {
-		it(`waits for ${transition.beforeName} rollback before ${transition.afterName} rehydrate during ${transition.point}`, async () => {
-			const priorModel = requiredBundledModel("anthropic", "claude-sonnet-4-5");
-			const targetModel = requiredBundledModel("anthropic", "claude-sonnet-4-6");
-			const targetBranch = "autoresearch/rehydrated-target";
-			const targetGoal = "rehydrated target goal";
-			let harness!: IntegrationHarness;
-			let transitionTask: Promise<void> | undefined;
-			const beginTransition = (): void => {
-				if (transitionTask) return;
-				const beforeHandler = transition.beginBefore(harness);
-				transitionTask = (async () => {
-					await beforeHandler;
-					harness.gitEvents.push(`${transition.beforeName}:settled`);
-					if (transition.changesSession) harness.setSessionId(`target-${transition.afterName}`);
-					harness.setCurrentModel(targetModel);
-					harness.setCurrentBranch(targetBranch);
-					harness.setActiveToolState(["read", "target-tool"]);
-					harness.setSessionBranch([
-						{
-							type: "custom",
-							customType: "autoresearch-control",
-							id: `target-${transition.afterName}`,
-							parentId: null,
-							timestamp: new Date(0).toISOString(),
-							data: { mode: "on", goal: targetGoal },
-						},
-					]);
-					await transition.rehydrate(harness);
-					harness.gitEvents.push(`${transition.afterName}:rehydrated`);
-				})();
-			};
-			const options: IntegrationHarnessOptions = {
-				currentModel: priorModel,
-				selectedModelId: targetModel.id,
-			};
-			if (transition.point === "setModel") {
-				options.onSetModel = callNumber => {
-					if (callNumber === 1) beginTransition();
-				};
-			} else if (transition.point === "checkoutNewAt") {
-				options.onCheckoutNewAt = callNumber => {
-					if (callNumber === 1) beginTransition();
-				};
-			} else {
-				options.onSetActiveTools = callNumber => {
-					if (callNumber === 1) beginTransition();
-				};
-			}
-			harness = createIntegrationHarness(cwd.path(), options);
-
-			await startContribution(harness);
-			if (!transitionTask) throw new Error(`Expected ${transition.beforeName} handler to start`);
-			await transitionTask;
-
-			const rollbackModelEvent = `model:${priorModel.provider}/${priorModel.id}`;
-			const rollbackIndex = harness.gitEvents.lastIndexOf(rollbackModelEvent);
-			const beforeSettledIndex = harness.gitEvents.indexOf(`${transition.beforeName}:settled`);
-			expect(rollbackIndex).toBeGreaterThanOrEqual(0);
-			expect(beforeSettledIndex).toBeGreaterThan(rollbackIndex);
-			expect(harness.currentModel()).toBe(targetModel);
-			expect(harness.currentBranch()).toBe(targetBranch);
-			expect(harness.activeTools).toEqual([
-				"read",
-				"target-tool",
-				"init_experiment",
-				"run_experiment",
-				"log_experiment",
-				"update_notes",
-			]);
-			const beforeAgentStart = await handlerRequired<
-				{ type: "before_agent_start"; systemPrompt: string[] },
-				{ systemPrompt: string[] }
-			>(harness, "before_agent_start")(
-				{ type: "before_agent_start", systemPrompt: [] },
-				harness.ctx as ExtensionContext,
-			);
-			expect(beforeAgentStart?.systemPrompt.join("\n")).toContain(targetGoal);
-			await commandRequired(harness, "contribute").handler("status", harness.ctx);
-			expect(harness.notifications.at(-1)?.message).toBe("Contribution mode is off.");
-			expect(harness.appendEntries).toEqual([]);
-			expect(harness.sentUserMessages).toEqual([]);
-			expect(snapshotStorageArtifacts(dbDir.path())).toEqual([]);
 		});
-	}
+
+		const startPromise = startContribution(harness);
+		await rollbackEntered.promise;
+		for (let turn = 0; turn < 4; turn++) await Promise.resolve();
+		const transitionSettledBeforeRollback = transitionSettled;
+		const transitionResultBeforeRollback = transitionResult;
+
+		releaseRollback.resolve();
+		const startedTransition = transitionPromise as Promise<void> | null;
+		if (!startedTransition) throw new Error("Expected session transition to start during model activation");
+		const [startResult, settledTransition] = await Promise.allSettled([startPromise, startedTransition]);
+
+		expect(transitionSettledBeforeRollback).toBe(true);
+		expect(transitionResultBeforeRollback).toEqual({ cancel: true });
+		expect(startResult.status).toBe("fulfilled");
+		expect(settledTransition.status).toBe("fulfilled");
+		expect(harness.currentModel()).toBe(priorModel);
+		expect(harness.currentBranch()).toBe("main");
+		expect(harness.activeTools).toEqual(["read", "bash"]);
+		expect(harness.sentUserMessages).toEqual([]);
+		expect(snapshotStorageArtifacts(dbDir.path())).toEqual([]);
+	});
 
 	for (const invalidationPoint of ["setModel", "checkout", "tool activation"] as const) {
 		it(`rolls back only owned start mutations when stopped during awaited ${invalidationPoint}`, async () => {
@@ -2934,6 +3033,27 @@ describe("process-local contribution lifecycle", () => {
 		expect(harness.notifications.some(note => note.type === "error")).toBe(true);
 	});
 
+	for (const testCase of [
+		{ name: "the kept candidate benchmark failed", options: { candidateExitCode: 1 } },
+		{ name: "the prior failing proof is missing", options: { redProof: "missing" as const } },
+		{ name: "the prior checks_failed proof actually passed", options: { redProof: "passing" as const } },
+		{ name: "the prior failing proof is flagged", options: { redProof: "flagged" as const } },
+	] as const) {
+		it(`rejects publication when ${testCase.name}`, async () => {
+			const harness = createIntegrationHarness(cwd.path(), { confirmAnswers: [true, true, true] });
+			await startContribution(harness);
+			await prepareKeptContribution(harness, cwd.path(), testCase.options);
+
+			await commandRequired(harness, "contribute").handler("review", harness.ctx);
+
+			expect(harness.pushes).toEqual([]);
+			expect(harness.notifications.at(-1)).toMatchObject({
+				type: "error",
+				message: expect.stringContaining("TDD"),
+			});
+		});
+	}
+
 	it("rejects an orphan candidate before displaying contribution review", async () => {
 		const harness = createIntegrationHarness(cwd.path(), { ancestryResults: [false] });
 		await startContribution(harness);
@@ -3013,54 +3133,8 @@ describe("process-local contribution lifecycle", () => {
 	it("pushes one exact kept candidate and creates only a human review handoff", async () => {
 		const harness = createIntegrationHarness(cwd.path(), { confirmAnswers: [true, true, true] });
 		await startContribution(harness);
-		await Bun.write(`${cwd.path()}/autoresearch.sh`, "#!/usr/bin/env bash\necho METRIC runtime_ms=1\n");
-		const init = harness.tools.get("init_experiment");
-		if (!init) throw new Error("Expected init_experiment tool");
-		await init.execute(
-			"initial",
-			{ name: "candidate", primary_metric: "runtime_ms", metric_unit: "ms" },
-			undefined,
-			undefined,
-			harness.ctx as ExtensionContext,
-		);
-
+		const session = await prepareKeptContribution(harness, cwd.path());
 		const storage = await openAutoresearchStorage(cwd.path());
-		const session = storage.getActiveSessionForBranch(harness.currentBranch());
-		if (!session) throw new Error("Expected contribution session");
-		const now = Date.now();
-		const run = storage.insertRun({
-			sessionId: session.id,
-			segment: session.currentSegment,
-			command: "bash autoresearch.sh",
-			startedAt: now,
-			logPath: "",
-			preRunDirtyPaths: [],
-		});
-		storage.markRunCompleted({
-			runId: run.id,
-			completedAt: now + 1,
-			durationMs: 1,
-			exitCode: 0,
-			timedOut: false,
-			parsedPrimary: 1,
-			parsedMetrics: { runtime_ms: 1 },
-			parsedAsi: { hypothesis: "Ran the focused contribution scenario." },
-		});
-		storage.markRunLogged({
-			runId: run.id,
-			status: "keep",
-			description: "Observed the focused scenario pass at runtime_ms=1.",
-			metric: 1,
-			metrics: {},
-			asi: { hypothesis: "Ran the focused contribution scenario." },
-			commitHash: CURRENT_HEAD,
-			confidence: null,
-			modifiedPaths: [],
-			scopeDeviations: [],
-			justification: null,
-			loggedAt: now + 2,
-		});
-		harness.setHeadSha(CURRENT_HEAD);
 
 		await commandRequired(harness, "contribute").handler("review", harness.ctx);
 
