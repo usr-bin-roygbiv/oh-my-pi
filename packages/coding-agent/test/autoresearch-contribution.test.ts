@@ -2142,6 +2142,80 @@ describe("process-local contribution lifecycle", () => {
 		expect(harness.notifications.at(-1)?.message).toBe("Contribution mode is off.");
 	});
 
+	it("aborts and drains an in-flight harness commit before contribution off", async () => {
+		const offDeactivationEntered = Promise.withResolvers<void>();
+		const harness = createIntegrationHarness(cwd.path(), {
+			onSetActiveTools(callCount) {
+				if (callCount === 2) offDeactivationEntered.resolve();
+			},
+		});
+		await startContribution(harness);
+		await Bun.write(`${cwd.path()}/autoresearch.sh`, "#!/usr/bin/env bash\necho METRIC runtime_ms=1\n");
+		harness.setStatusText(" M autoresearch.sh");
+		const init = harness.tools.get("init_experiment");
+		if (!init) throw new Error("Expected init_experiment tool");
+		const commitEntered = Promise.withResolvers<void>();
+		const commitAbortObserved = Promise.withResolvers<void>();
+		const releaseCommit = Promise.withResolvers<void>();
+		let stageSignal: AbortSignal | undefined;
+		let commitSignal: AbortSignal | undefined;
+		vi.spyOn(git.stage, "files").mockImplementation(async (_workDir, _files, signal) => {
+			stageSignal = signal;
+		});
+		vi.spyOn(git, "commit").mockImplementation(async (_workDir, _message, options) => {
+			commitSignal = options.signal;
+			if (commitSignal?.aborted) {
+				commitAbortObserved.resolve();
+			} else {
+				commitSignal?.addEventListener("abort", () => commitAbortObserved.resolve(), { once: true });
+			}
+			commitEntered.resolve();
+			await releaseCommit.promise;
+			if (commitSignal?.aborted) {
+				throw commitSignal.reason ?? new DOMException("Contribution init aborted", "AbortError");
+			}
+			harness.setHeadSha("9".repeat(40));
+			return { exitCode: 0, stdout: "", stderr: "" };
+		});
+
+		const initPromise = init.execute(
+			"deferred-commit",
+			{ name: "initial", primary_metric: "runtime_ms" },
+			undefined,
+			undefined,
+			harness.ctx as ExtensionContext,
+		);
+		await commitEntered.promise;
+		let offSettled = false;
+		const offPromise = commandRequired(harness, "contribute")
+			.handler("off", harness.ctx)
+			.finally(() => {
+				offSettled = true;
+			});
+		const firstLifecycleEvent = await Promise.race([
+			commitAbortObserved.promise.then(() => "aborted" as const),
+			offDeactivationEntered.promise.then(() => "deactivated" as const),
+		]);
+		await commandRequired(harness, "contribute").handler("status", harness.ctx);
+		const statusBeforeRelease = harness.notifications.at(-1)?.message;
+		const offSettledBeforeRelease = offSettled;
+		const stageAbortedBeforeRelease = stageSignal?.aborted ?? false;
+		const commitAbortedBeforeRelease = commitSignal?.aborted ?? false;
+		releaseCommit.resolve();
+		const [initResult, offResult] = await Promise.allSettled([initPromise, offPromise]);
+
+		expect(firstLifecycleEvent).toBe("aborted");
+		expect(statusBeforeRelease).toStartWith("Contribution running on ");
+		expect(offSettledBeforeRelease).toBe(false);
+		expect(stageAbortedBeforeRelease).toBe(true);
+		expect(commitAbortedBeforeRelease).toBe(true);
+		expect(initResult.status).toBe("rejected");
+		expect(offResult.status).toBe("fulfilled");
+		expect(await git.head.sha(cwd.path())).toBe(COMMIT_SHA);
+		expect(snapshotStorageArtifacts(dbDir.path())).toEqual([]);
+		await expect(hasActiveAutoresearchSession(cwd.path())).resolves.toBe(false);
+	});
+
 	it("fails closed when the process-local session switches during initial init preparation", async () => {
 		const harness = createIntegrationHarness(cwd.path());
 		await startContribution(harness);
@@ -2557,7 +2631,7 @@ describe("process-local contribution lifecycle", () => {
 		if (!init) throw new Error("Expected init_experiment tool");
 		if (typeof init.concurrency !== "function") throw new Error("Expected argument-aware init concurrency");
 		expect(init.concurrency({ new_segment: true })).toBe("exclusive");
-		expect(init.concurrency({ new_segment: false })).toBe("shared");
+		expect(init.concurrency({ new_segment: false })).toBe("exclusive");
 		await init.execute(
 			"initial",
 			{ name: "initial", primary_metric: "runtime_ms" },
