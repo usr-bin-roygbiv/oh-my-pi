@@ -1,0 +1,62 @@
+name: Roy branch proof
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_sha:
+        description: Exact commit SHA to check out and verify
+        required: true
+        type: string
+      suite:
+        description: Fixed proof suite
+        required: true
+        type: choice
+        options:
+          - contract
+          - check
+          - coding-agent-runtime
+          - smoke
+
+permissions:
+  contents: read
+
+concurrency:
+  group: roy-branch-proof-${{ inputs.target_sha }}-${{ inputs.suite }}
+  cancel-in-progress: false
+
+jobs:
+  proof:
+    name: ${{ inputs.suite }} at ${{ inputs.target_sha }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.target_sha }}
+          fetch-depth: 1
+      - name: Verify immutable target
+        env:
+          TARGET_SHA: ${{ inputs.target_sha }}
+        shell: bash
+        run: |
+          if [[ ! "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Invalid target SHA: $TARGET_SHA" >&2
+            exit 2
+          fi
+          actual=$(git rev-parse HEAD)
+          echo "target_sha=$TARGET_SHA"
+          echo "checked_out_sha=$actual"
+          test "$actual" = "$TARGET_SHA"
+      - uses: ./.github/actions/bun-install
+      - name: Focused contribution contract
+        if: inputs.suite == 'contract'
+        run: bun test packages/coding-agent/test/autoresearch-contribution.test.ts
+      - name: Workspace type and format checks
+        if: inputs.suite == 'check'
+        run: bun run ci:check:full
+      - name: Coding-agent runtime tests
+        if: inputs.suite == 'coding-agent-runtime'
+        run: bun run ci:test:coding-agent:runtime
+      - name: Build native addon and run CLI smoke
+        if: inputs.suite == 'smoke'
+        run: bun run build:native && bun run ci:test:smoke
