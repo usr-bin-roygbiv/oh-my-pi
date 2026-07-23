@@ -47,6 +47,7 @@ import type {
 	ExtensionContext,
 	ExtensionHandler,
 	RegisteredCommand,
+	SessionBeforeSwitchEvent,
 	SessionShutdownEvent,
 	SessionStartEvent,
 	ToolDefinition,
@@ -655,11 +656,11 @@ describe("contribution fork validation and publication", () => {
 			{
 				cwd: "/work/repo",
 				remote: FORK_URL,
-				refspec: `${CURRENT_HEAD}:refs/heads/${CONTRIBUTION_BRANCH}`,
+				refspec: `HEAD:refs/heads/${CONTRIBUTION_BRANCH}`,
 				forceWithLease: `refs/heads/${CONTRIBUTION_BRANCH}:`,
 			},
 		]);
-		expect(published.refspec).toBe(`${CURRENT_HEAD}:refs/heads/${CONTRIBUTION_BRANCH}`);
+		expect(published.refspec).toBe(`HEAD:refs/heads/${CONTRIBUTION_BRANCH}`);
 		expect(published.compareUrl).toContain("/compare/main...alice:");
 		expect(published.reviewUrl).toBe(
 			`https://github.com/${OFFICIAL_CONTRIBUTION_OWNER}/${OFFICIAL_CONTRIBUTION_REPO}/compare/${COMMIT_SHA}...alice:${CURRENT_HEAD}?expand=1`,
@@ -1000,6 +1001,12 @@ interface IntegrationHarnessOptions {
 	rollbackCheckoutFailure?: Error;
 	branchDeleteFailure?: Error;
 	onGoalRefRequest?(signal?: AbortSignal): void | Promise<void>;
+	onConfirm?(callNumber: number, title: string): void | Promise<void>;
+	onSetModel?(callNumber: number): void | Promise<void>;
+	onCheckoutNewAt?(callNumber: number): void | Promise<void>;
+	onSetActiveTools?(callNumber: number): void | Promise<void>;
+	onForkMetadataRequest?(callNumber: number, signal?: AbortSignal): void | Promise<void>;
+	onAncestryRequest?(callNumber: number, signal?: AbortSignal): void | Promise<void>;
 	statusText?: string;
 	headSha?: string;
 	hasPendingMessages?: boolean;
@@ -1117,6 +1124,8 @@ function createIntegrationHarness(cwd: string, options: IntegrationHarnessOption
 	const goals = options.goalVersions ?? defaultGoalVersions();
 	let activeGoal = goals[0];
 	let goalLoadCount = 0;
+	let forkMetadataRequestCount = 0;
+	let ancestryRequestCount = 0;
 
 	vi.spyOn(git.repo, "root").mockResolvedValue(cwd);
 	vi.spyOn(git.show, "prefix").mockResolvedValue("");
@@ -1136,7 +1145,9 @@ function createIntegrationHarness(cwd: string, options: IntegrationHarnessOption
 		return headSha;
 	});
 	vi.spyOn(git.branch, "current").mockImplementation(async () => currentBranch);
-	vi.spyOn(git, "isAncestor").mockImplementation(async (_workDir, ancestor, descendant) => {
+	vi.spyOn(git, "isAncestor").mockImplementation(async (_workDir, ancestor, descendant, signal) => {
+		ancestryRequestCount++;
+		await options.onAncestryRequest?.(ancestryRequestCount, signal);
 		gitEvents.push(`ancestor:${ancestor}:${descendant}`);
 		return ancestryResults.shift() ?? true;
 	});
@@ -1153,6 +1164,7 @@ function createIntegrationHarness(cwd: string, options: IntegrationHarnessOption
 	vi.spyOn(git.branch, "checkoutNewAt").mockImplementation(async (_workDir, branch, startPoint) => {
 		checkoutNewCalls.push(branch);
 		gitEvents.push(`checkoutNewAt:${branch}:${startPoint}`);
+		await options.onCheckoutNewAt?.(checkoutNewCalls.length);
 		if (options.checkoutFailure) throw options.checkoutFailure;
 		currentBranch = branch;
 	});
@@ -1184,6 +1196,8 @@ function createIntegrationHarness(cwd: string, options: IntegrationHarnessOption
 		if (!endpoint) throw new Error(`Missing GitHub API endpoint in ${args.join(" ")}`);
 		githubEndpoints.push(endpoint);
 		if (endpoint === "/repos/alice/oh-my-pi") {
+			forkMetadataRequestCount++;
+			await options.onForkMetadataRequest?.(forkMetadataRequestCount, signal);
 			return { fork: true, parent: "can1357/oh-my-pi", source: "can1357/oh-my-pi" } as never;
 		}
 		if (endpoint.includes("/git/ref/heads/")) {
@@ -1249,11 +1263,13 @@ function createIntegrationHarness(cwd: string, options: IntegrationHarnessOption
 		setActiveTools: async (names: string[]): Promise<void> => {
 			setActiveToolsCallCount++;
 			setActiveToolsCalls.push([...names]);
+			await options.onSetActiveTools?.(setActiveToolsCallCount);
 			if (options.setActiveToolsFailureAt === setActiveToolsCallCount) throw new Error("setActiveTools failed");
 			activeTools.splice(0, activeTools.length, ...names);
 		},
 		setModel: async (model: Model<Api>): Promise<boolean> => {
 			setModelCalls.push(model);
+			await options.onSetModel?.(setModelCalls.length);
 			if (options.setModelFailureAt === setModelCalls.length) {
 				selectedModel = model;
 				throw new Error("setModel synchronization failed");
@@ -1304,6 +1320,7 @@ function createIntegrationHarness(cwd: string, options: IntegrationHarnessOption
 			confirm: async (title: string, message: string) => {
 				confirmCalls.push({ title, message });
 				gitEvents.push(`confirm:${confirmCalls.length}`);
+				await options.onConfirm?.(confirmCalls.length, title);
 				return confirmAnswers.shift() ?? false;
 			},
 			custom: async () => undefined,
@@ -1518,6 +1535,66 @@ describe("process-local contribution lifecycle", () => {
 		expect(harness.sentUserMessages).toEqual([]);
 		expect(snapshotStorageArtifacts(dbDir.path())).toEqual([]);
 	});
+	for (const invalidation of ["off", "session switch"] as const) {
+		it(`invalidates a confirmed start during final confirmation on ${invalidation} without mutation`, async () => {
+			let harness!: IntegrationHarness;
+			harness = createIntegrationHarness(cwd.path(), {
+				async onConfirm(callNumber): Promise<void> {
+					if (callNumber !== 2) return;
+					if (invalidation === "off") {
+						await commandRequired(harness, "contribute").handler("off", harness.ctx);
+						return;
+					}
+					await handlerRequired<SessionBeforeSwitchEvent>(harness, "session_before_switch")(
+						{ type: "session_before_switch", reason: "resume", targetSessionFile: "/tmp/switched.jsonl" },
+						harness.ctx as ExtensionContext,
+					);
+					harness.setSessionId("switched-session");
+				},
+			});
+			const initialTools = [...harness.activeTools];
+			const initialModel = harness.currentModel();
+
+			await startContribution(harness);
+
+			expect(harness.confirmCalls.at(-1)?.title).toBe("Start exact upstream contribution session?");
+			expect(harness.setModelCalls).toEqual([]);
+			expect(harness.checkoutNewCalls).toEqual([]);
+			expect(harness.currentBranch()).toBe("main");
+			expect(harness.currentModel()).toBe(initialModel);
+			expect(harness.activeTools).toEqual(initialTools);
+			expect(harness.sentUserMessages).toEqual([]);
+			expect(snapshotStorageArtifacts(dbDir.path())).toEqual([]);
+		});
+	}
+
+	for (const invalidationPoint of ["setModel", "checkout", "tool activation"] as const) {
+		it(`rolls back only owned start mutations when stopped during awaited ${invalidationPoint}`, async () => {
+			const priorModel = requiredBundledModel("anthropic", "claude-sonnet-4-5");
+			const selectedModel = requiredBundledModel("anthropic", "claude-sonnet-4-6");
+			let harness!: IntegrationHarness;
+			const invalidate = async (callNumber: number): Promise<void> => {
+				if (callNumber === 1) await commandRequired(harness, "contribute").handler("off", harness.ctx);
+			};
+			harness = createIntegrationHarness(cwd.path(), {
+				currentModel: priorModel,
+				selectedModelId: selectedModel.id,
+				onSetModel: invalidationPoint === "setModel" ? invalidate : undefined,
+				onCheckoutNewAt: invalidationPoint === "checkout" ? invalidate : undefined,
+				onSetActiveTools: invalidationPoint === "tool activation" ? invalidate : undefined,
+			});
+
+			await startContribution(harness);
+
+			expect(harness.currentModel()).toBe(priorModel);
+			expect(harness.currentBranch()).toBe("main");
+			expect(harness.activeTools).toEqual(["read", "bash"]);
+			expect(harness.sentUserMessages).toEqual([]);
+			expect(snapshotStorageArtifacts(dbDir.path())).toEqual([]);
+			await commandRequired(harness, "contribute").handler("status", harness.ctx);
+			expect(harness.notifications.at(-1)?.message).toBe("Contribution mode is off.");
+		});
+	}
 
 	it("cancels post-confirm goal drift before model, branch, tool, runtime, or SQLite mutation", async () => {
 		const initial = defaultGoalVersions()[0]!;
@@ -1786,6 +1863,46 @@ describe("process-local contribution lifecycle", () => {
 			message: expect.stringContaining("candidate_not_descendant"),
 		});
 	});
+	for (const race of [
+		{ point: "fork verification", invalidation: "off" },
+		{ point: "pre-push ancestry", invalidation: "session switch" },
+	] as const) {
+		it(`aborts review publication during ${race.point} on ${race.invalidation} with zero push`, async () => {
+			let harness!: IntegrationHarness;
+			let publicationSignal: AbortSignal | undefined;
+			const invalidate = async (signal: AbortSignal | undefined): Promise<void> => {
+				publicationSignal = signal;
+				if (race.invalidation === "off") {
+					await commandRequired(harness, "contribute").handler("off", harness.ctx);
+					return;
+				}
+				await handlerRequired<SessionBeforeSwitchEvent>(harness, "session_before_switch")(
+					{ type: "session_before_switch", reason: "resume", targetSessionFile: "/tmp/review-switched.jsonl" },
+					harness.ctx as ExtensionContext,
+				);
+				harness.setSessionId("review-switched-session");
+			};
+			harness = createIntegrationHarness(cwd.path(), {
+				confirmAnswers: [true, true, true],
+				async onForkMetadataRequest(callNumber, signal): Promise<void> {
+					if (race.point === "fork verification" && callNumber === 2) await invalidate(signal);
+				},
+				async onAncestryRequest(callNumber, signal): Promise<void> {
+					if (race.point === "pre-push ancestry" && callNumber === 2) await invalidate(signal);
+				},
+			});
+			await startContribution(harness);
+			await prepareKeptContribution(harness, cwd.path());
+
+			await commandRequired(harness, "contribute").handler("review", harness.ctx);
+
+			expect(publicationSignal).toBeDefined();
+			expect(publicationSignal?.aborted).toBe(true);
+			expect(harness.pushes).toEqual([]);
+			await commandRequired(harness, "contribute").handler("status", harness.ctx);
+			expect(harness.notifications.at(-1)?.message).toBe("Contribution mode is off.");
+		});
+	}
 
 	it("pushes one exact kept candidate and creates only a human review handoff", async () => {
 		const harness = createIntegrationHarness(cwd.path(), { confirmAnswers: [true, true, true] });
@@ -1845,13 +1962,16 @@ describe("process-local contribution lifecycle", () => {
 		expect(harness.pushes).toEqual([
 			{
 				remote: FORK_URL,
-				refspec: `${CURRENT_HEAD}:refs/heads/${branch}`,
+				refspec: `HEAD:refs/heads/${branch}`,
 				forceWithLease: `refs/heads/${branch}:`,
 			},
 		]);
 		expect(harness.confirmCalls.at(-1)?.message).toContain("Ran the focused contribution scenario.");
 		expect(harness.confirmCalls.at(-1)?.message).toContain("Observed the focused scenario pass");
 		expect(harness.confirmCalls.at(-1)?.message).toContain(CONTRIBUTION_HUMAN_SUMMARY_PLACEHOLDER);
+		const reviewConfirmation = harness.confirmCalls.at(-1)?.message ?? "";
+		expect(reviewConfirmation).toContain(`HEAD:refs/heads/${branch}`);
+		expect(reviewConfirmation).not.toContain(`${CURRENT_HEAD}:refs/heads/${branch}`);
 		expect(harness.activeTools).toEqual(["read", "bash"]);
 		expect(storage.getSessionById(session.id)?.closedAt).not.toBeNull();
 		expect(harness.githubEndpoints.every(endpoint => endpoint.startsWith("/repos/"))).toBe(true);
