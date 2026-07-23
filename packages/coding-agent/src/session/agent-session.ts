@@ -2823,7 +2823,11 @@ export class AgentSession {
 				this.#beginInFlight();
 				try {
 					await this.#recovery.maybeRestoreRetryFallbackPrimary();
-					if (!(await this.#runUsageAwarePreflight())) {
+					if (
+						this.settings.get("retry.modelFallback") &&
+						this.settings.get("retry.usageAwareFallback") &&
+						!(await this.#runUsageAwarePreflight())
+					) {
 						this.#skipAgentContinue("session-unavailable", options);
 						return;
 					}

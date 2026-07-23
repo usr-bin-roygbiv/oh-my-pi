@@ -27,7 +27,11 @@ import {
 	createAcpExtensionUiContext,
 } from "@oh-my-pi/pi-coding-agent/modes/acp/acp-agent";
 import type { PlanModeState } from "@oh-my-pi/pi-coding-agent/plan-mode/state";
-import type { AgentSession, AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import type {
+	AgentSession,
+	AgentSessionEvent,
+	UsageFallbackConfirmation,
+} from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SILENT_ABORT_MARKER } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { DEFAULT_STT_MODEL_KEY, STT_MODEL_OPTIONS } from "@oh-my-pi/pi-coding-agent/stt/models";
@@ -135,6 +139,7 @@ class FakeAgentSession {
 	waitForIdleCalls = 0;
 	waitForIdleBlocker: (() => Promise<void>) | undefined;
 	asyncJobDrain: ((options?: { timeoutMs?: number }) => Promise<boolean>) | undefined;
+	usageFallbackConfirmer: ((confirmation: UsageFallbackConfirmation) => Promise<boolean>) | undefined;
 	#listeners = new Set<(event: AgentSessionEvent) => void>();
 
 	constructor(
@@ -185,6 +190,11 @@ class FakeAgentSession {
 
 	setSlashCommands(_commands: unknown[]): void {
 		// no-op for tests
+	}
+	setUsageFallbackConfirmer(
+		confirmer: ((confirmation: UsageFallbackConfirmation) => Promise<boolean>) | undefined,
+	): void {
+		this.usageFallbackConfirmer = confirmer;
 	}
 
 	async setModel(model: Model): Promise<void> {
