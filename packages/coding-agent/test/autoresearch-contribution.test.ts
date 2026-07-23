@@ -1749,6 +1749,43 @@ async function prepareKeptContribution(harness: IntegrationHarness, cwd: string)
 	harness.setHeadSha(CURRENT_HEAD);
 	return session;
 }
+
+async function preparePendingContribution(harness: IntegrationHarness, cwd: string) {
+	await Bun.write(`${cwd}/autoresearch.sh`, "#!/usr/bin/env bash\necho METRIC runtime_ms=1\n");
+	const init = harness.tools.get("init_experiment");
+	if (!init) throw new Error("Expected init_experiment tool");
+	await init.execute(
+		"initial-pending",
+		{ name: "pending candidate", primary_metric: "runtime_ms", metric_unit: "ms" },
+		undefined,
+		undefined,
+		harness.ctx as ExtensionContext,
+	);
+	const storage = await openAutoresearchStorage(cwd);
+	const session = storage.getActiveSessionForBranch(harness.currentBranch());
+	if (!session) throw new Error("Expected contribution session");
+	const now = Date.now();
+	const run = storage.insertRun({
+		sessionId: session.id,
+		segment: session.currentSegment,
+		command: "bash autoresearch.sh",
+		startedAt: now,
+		logPath: "",
+		preRunDirtyPaths: [],
+	});
+	storage.markRunCompleted({
+		runId: run.id,
+		completedAt: now + 1,
+		durationMs: 1,
+		exitCode: 0,
+		timedOut: false,
+		parsedPrimary: 1,
+		parsedMetrics: { runtime_ms: 1 },
+		parsedAsi: null,
+	});
+	return { run, session, storage };
+}
+
 describe("process-local contribution lifecycle", () => {
 	let cwd: TempDir;
 	let dbDir: TempDir;
@@ -1765,6 +1802,240 @@ describe("process-local contribution lifecycle", () => {
 		cwd.removeSync();
 		dbDir.removeSync();
 	});
+
+	it("waits for activating contribution rollback before off returns", async () => {
+		const rollbackEntered = Promise.withResolvers<void>();
+		const releaseRollback = Promise.withResolvers<void>();
+		const priorModel = requiredBundledModel("anthropic", "claude-sonnet-4-5");
+		const selectedModel = requiredBundledModel("anthropic", "claude-sonnet-4-6");
+		const harness = createIntegrationHarness(cwd.path(), {
+			currentModel: priorModel,
+			selectedModelId: selectedModel.id,
+			setActiveToolsFailureAt: 1,
+			onSetActiveTools(callNumber) {
+				if (callNumber !== 2) return;
+				rollbackEntered.resolve();
+				return releaseRollback.promise;
+			},
+		});
+		const initialTools = [...harness.activeTools];
+		const startPromise = startContribution(harness);
+		await rollbackEntered.promise;
+		let offSettled = false;
+		const offPromise = commandRequired(harness, "contribute")
+			.handler("off", harness.ctx)
+			.finally(() => {
+				offSettled = true;
+			});
+		const offBeforeRelease = await Promise.race([
+			offPromise.then(() => "settled" as const),
+			Promise.resolve("pending" as const),
+		]);
+
+		releaseRollback.resolve();
+		const [startResult, offResult] = await Promise.allSettled([startPromise, offPromise]);
+
+		expect(offBeforeRelease).toBe("pending");
+		expect(offSettled).toBe(true);
+		expect(startResult.status).toBe("fulfilled");
+		expect(offResult.status).toBe("fulfilled");
+		expect(harness.currentModel()).toBe(priorModel);
+		expect(harness.currentBranch()).toBe("main");
+		expect(harness.activeTools).toEqual(initialTools);
+		expect(harness.sentUserMessages).toEqual([]);
+	});
+
+	it("aborts and drains a kept log commit before contribution off", async () => {
+		const harness = createIntegrationHarness(cwd.path());
+		await startContribution(harness);
+		const { run, session, storage } = await preparePendingContribution(harness, cwd.path());
+		harness.setStatusText(" M autoresearch.sh\0");
+		const log = harness.tools.get("log_experiment");
+		if (!log) throw new Error("Expected log_experiment tool");
+		let stageSignal: AbortSignal | undefined;
+		let diffSignal: AbortSignal | undefined;
+		let commitSignal: AbortSignal | undefined;
+		let offPromise: Promise<void> | null = null;
+		let offSettled = false;
+		let statusDuringCommit: string | undefined;
+		let offSettledDuringCommit = false;
+		vi.spyOn(git.stage, "files").mockImplementation(async (_workDir, _files, signal) => {
+			stageSignal = signal;
+		});
+		vi.spyOn(git.diff, "has").mockImplementation(async (_workDir, options) => {
+			diffSignal = options?.signal;
+			return true;
+		});
+		vi.spyOn(git, "commit").mockImplementation(async (_workDir, _message, options) => {
+			commitSignal = options?.signal;
+			offPromise = commandRequired(harness, "contribute")
+				.handler("off", harness.ctx)
+				.finally(() => {
+					offSettled = true;
+				});
+			await commandRequired(harness, "contribute").handler("status", harness.ctx);
+			statusDuringCommit = harness.notifications.at(-1)?.message;
+			offSettledDuringCommit = offSettled;
+			if (commitSignal?.aborted) {
+				throw commitSignal.reason ?? new DOMException("Contribution log aborted", "AbortError");
+			}
+			harness.setHeadSha("9".repeat(40));
+			return { exitCode: 0, stdout: "", stderr: "" };
+		});
+
+		const [logResult] = await Promise.allSettled([
+			log.execute(
+				"kept-log-during-off",
+				{ metric: 1, status: "keep", description: "candidate result" },
+				undefined,
+				undefined,
+				harness.ctx as ExtensionContext,
+			),
+		]);
+		const startedOff = offPromise as Promise<void> | null;
+		if (!startedOff) throw new Error("Expected contribution off to start during log commit");
+		const [offResult] = await Promise.allSettled([startedOff]);
+
+		expect(statusDuringCommit).toStartWith("Contribution running on ");
+		expect(offSettledDuringCommit).toBe(false);
+		expect(stageSignal).toBeDefined();
+		expect(diffSignal).toBe(stageSignal);
+		expect(commitSignal).toBe(stageSignal);
+		expect(stageSignal?.aborted).toBe(true);
+		expect(logResult).toMatchObject({ status: "rejected", reason: { name: "ToolAbortError" } });
+		expect(offResult.status).toBe("fulfilled");
+		expect(await git.head.sha(cwd.path())).toBe(COMMIT_SHA);
+		expect(storage.getPendingRun(session.id)?.id).toBe(run.id);
+		expect(storage.listLoggedRuns(session.id)).toEqual([]);
+		expect(harness.activeTools).toEqual(["read", "bash"]);
+	});
+
+	it("aborts and drains a discarded log reset before a session transition", async () => {
+		const deactivationEntered = Promise.withResolvers<void>();
+		const harness = createIntegrationHarness(cwd.path(), {
+			onSetActiveTools(callNumber) {
+				if (callNumber === 2) deactivationEntered.resolve();
+			},
+		});
+		await startContribution(harness);
+		const { run, session, storage } = await preparePendingContribution(harness, cwd.path());
+		const log = harness.tools.get("log_experiment");
+		if (!log) throw new Error("Expected log_experiment tool");
+		let resetSignal: AbortSignal | undefined;
+		let firstLifecycleEvent: "aborted" | "revoked" | undefined;
+		let transitionPromise: Promise<void> | null = null;
+		let cleanCalls = 0;
+		vi.spyOn(git, "reset").mockImplementation(async (_workDir, options) => {
+			resetSignal = options?.signal;
+			const abortObserved = Promise.withResolvers<void>();
+			if (resetSignal?.aborted) {
+				abortObserved.resolve();
+			} else {
+				resetSignal?.addEventListener("abort", () => abortObserved.resolve(), { once: true });
+			}
+			transitionPromise = Promise.resolve(
+				handlerRequired<SessionBeforeSwitchEvent>(harness, "session_before_switch")(
+					{ type: "session_before_switch", reason: "resume", targetSessionFile: "/tmp/log-switch.jsonl" },
+					harness.ctx as ExtensionContext,
+				),
+			);
+			firstLifecycleEvent = await Promise.race([
+				abortObserved.promise.then(() => "aborted" as const),
+				deactivationEntered.promise.then(() => "revoked" as const),
+			]);
+			if (resetSignal?.aborted) {
+				throw resetSignal.reason ?? new DOMException("Contribution log aborted", "AbortError");
+			}
+		});
+		vi.spyOn(git, "clean").mockImplementation(async () => {
+			cleanCalls++;
+		});
+
+		const [logResult] = await Promise.allSettled([
+			log.execute(
+				"discarded-log-during-switch",
+				{ metric: 1, status: "discard", description: "discard candidate" },
+				undefined,
+				undefined,
+				harness.ctx as ExtensionContext,
+			),
+		]);
+		const startedTransition = transitionPromise as Promise<void> | null;
+		if (!startedTransition) throw new Error("Expected session transition to start during log reset");
+		const [transitionResult] = await Promise.allSettled([startedTransition]);
+
+		expect(firstLifecycleEvent).toBe("aborted");
+		expect(resetSignal).toBeDefined();
+		expect(resetSignal?.aborted).toBe(true);
+		expect(cleanCalls).toBe(0);
+		expect(logResult).toMatchObject({ status: "rejected", reason: { name: "ToolAbortError" } });
+		expect(transitionResult.status).toBe("fulfilled");
+		expect(storage.getPendingRun(session.id)?.id).toBe(run.id);
+		expect(storage.listLoggedRuns(session.id)).toEqual([]);
+		expect(harness.activeTools).toEqual(["read", "bash"]);
+	});
+
+
+	for (const invalidation of ["off", "session switch"] as const) {
+		it(`drains a successful publication into its immutable handoff during ${invalidation}`, async () => {
+			const harness = createIntegrationHarness(cwd.path(), { confirmAnswers: [true, true, true] });
+			await startContribution(harness);
+			await prepareKeptContribution(harness, cwd.path());
+			const transportApplied = Promise.withResolvers<void>();
+			const releaseTransport = Promise.withResolvers<void>();
+			let pushSignal: AbortSignal | undefined;
+			let refApplied = false;
+			vi.spyOn(git, "push").mockImplementation(async (_workDir, options) => {
+				pushSignal = options?.signal;
+				refApplied = true;
+				transportApplied.resolve();
+				await releaseTransport.promise;
+			});
+
+			const reviewPromise = commandRequired(harness, "contribute").handler("review", harness.ctx);
+			await transportApplied.promise;
+			let transitionSettled = false;
+			const transitionPromise = (
+				invalidation === "off"
+					? commandRequired(harness, "contribute").handler("off", harness.ctx)
+					: Promise.resolve(
+							handlerRequired<SessionBeforeSwitchEvent>(harness, "session_before_switch")(
+								{
+									type: "session_before_switch",
+									reason: "resume",
+									targetSessionFile: "/tmp/publication-switch.jsonl",
+								},
+								harness.ctx as ExtensionContext,
+							),
+						)
+			).finally(() => {
+				transitionSettled = true;
+			});
+			const transitionBeforeRelease = await Promise.race([
+				transitionPromise.then(() => "settled" as const),
+				Promise.resolve("pending" as const),
+			]);
+
+			releaseTransport.resolve();
+			const [reviewResult, transitionResult] = await Promise.allSettled([reviewPromise, transitionPromise]);
+
+			expect(refApplied).toBe(true);
+			expect(transitionBeforeRelease).toBe("pending");
+			expect(transitionSettled).toBe(true);
+			expect(pushSignal).toBeDefined();
+			expect(pushSignal?.aborted).toBe(false);
+			expect(reviewResult.status).toBe("fulfilled");
+			expect(transitionResult.status).toBe("fulfilled");
+			expect(
+				harness.notifications.some(notification => notification.message.startsWith("Contribution review failed:")),
+			).toBe(false);
+			expect(
+				harness.notifications.some(notification => notification.message.startsWith("Immutable SHA review:")),
+			).toBe(true);
+			await commandRequired(harness, "contribute").handler("status", harness.ctx);
+			expect(harness.notifications.at(-1)?.message).toStartWith("Contribution review ready:");
+		});
+	}
 
 	it("preflight cancellation performs no discovery or filesystem/durable mutation", async () => {
 		const harness = createIntegrationHarness(cwd.path(), { confirmAnswers: [false] });
