@@ -539,6 +539,8 @@ export interface ToolDefinition<TParams extends TSchema = TSchema, TDetails = un
 	/** If true, tool is registered but not auto-included in the initial active set.
 	 *  The registering extension is responsible for activating/deactivating it via setActiveTools(). */
 	defaultInactive?: boolean;
+	/** Execution scheduling. Exclusive calls wait for all earlier shared calls and block later calls. */
+	concurrency?: "shared" | "exclusive" | ((args: Partial<Static<TParams>>) => "shared" | "exclusive");
 	/** How this tool is presented when enabled. See {@link ToolLoadMode}. Extension tools default to `"discoverable"`; set `"essential"` to stay top-level. */
 	loadMode?: ToolLoadMode;
 	/** If true, tool may stage deferred changes that require explicit resolve/discard. */

@@ -2,6 +2,7 @@ import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import type { ExtensionAPI, ExtensionContext } from "../extensibility/extensions";
 import type { SessionEntry } from "../session/session-entries";
 import type { TruncationResult } from "../session/streaming-output";
+import type { ContributionBaseProof, ContributionGoal, PublishedContributionCandidate } from "./contribution";
 
 export type MetricDirection = "lower" | "higher";
 export type ExperimentStatus = "keep" | "discard" | "crash" | "checks_failed";
@@ -120,6 +121,39 @@ export interface RunningExperiment {
 	runNumber: number;
 }
 
+export interface ContributionModelSelection {
+	provider: string;
+	id: string;
+}
+
+export interface ContributionRunningState {
+	status: "running";
+	goal: ContributionGoal;
+	baseProof: ContributionBaseProof;
+	branch: string;
+	model: ContributionModelSelection;
+	remoteName: string;
+	remoteUrl: string;
+	currentSegment: number | null;
+	sessionId: number | null;
+}
+
+export interface ContributionReviewState {
+	status: "review";
+	goal: ContributionGoal;
+	baseProof: ContributionBaseProof;
+	branch: string;
+	model: ContributionModelSelection;
+	remoteName: string;
+	remoteUrl: string;
+	currentSegment: number | null;
+	sessionId: number | null;
+	publication: PublishedContributionCandidate;
+	candidateHead: string;
+}
+
+export type ContributionState = { status: "off" } | ContributionRunningState | ContributionReviewState;
+
 export interface AutoresearchRuntime {
 	autoresearchMode: boolean;
 	autoResumeArmed: boolean;
@@ -133,6 +167,7 @@ export interface AutoresearchRuntime {
 	runningExperiment: RunningExperiment | null;
 	state: ExperimentState;
 	goal: string | null;
+	contribution: ContributionState;
 }
 
 export interface AutoresearchControlEntryData {

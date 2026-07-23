@@ -2,9 +2,10 @@ import * as path from "node:path";
 
 import { Text } from "@oh-my-pi/pi-tui";
 import { type } from "arktype";
-import type { ToolDefinition } from "../../extensibility/extensions";
+import type { ExtensionContext, ToolDefinition } from "../../extensibility/extensions";
 import type { Theme } from "../../modes/theme/theme";
 import { replaceTabs, truncateToWidth } from "../../tools/render-utils";
+import { throwIfAborted } from "../../tools/tool-errors";
 import * as git from "../../utils/git";
 import { parseWorkDirDirtyPaths } from "../git";
 import { dedupeStrings, normalizePathSpec } from "../helpers";
@@ -39,8 +40,19 @@ interface InitExperimentDetails {
 	baselineCommit: string | null;
 }
 
+interface PreparedNewSegment {
+	goal: string;
+	complete(state: ExperimentState): string | null;
+}
+
+interface InitExperimentToolFactoryOptions extends AutoresearchToolFactoryOptions {
+	forceUncapped?(ctx: ExtensionContext): boolean;
+	prepareNewSegment?(ctx: ExtensionContext, signal?: AbortSignal): Promise<PreparedNewSegment | null>;
+	onSessionUpdated?(ctx: ExtensionContext, state: ExperimentState): void;
+}
+
 export function createInitExperimentTool(
-	options: AutoresearchToolFactoryOptions,
+	options: InitExperimentToolFactoryOptions,
 ): ToolDefinition<typeof initExperimentSchema, InitExperimentDetails> {
 	return {
 		name: "init_experiment",
@@ -49,19 +61,27 @@ export function createInitExperimentTool(
 			"Initialize or reconfigure the autoresearch session. On first call (Phase 1 → Phase 2 transition), requires `./autoresearch.sh` to exist and pending harness changes are auto-committed on an autoresearch branch. Pass `new_segment: true` to start a fresh baseline within an existing session.",
 		parameters: initExperimentSchema,
 		defaultInactive: true,
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+		concurrency: params => (params.new_segment === true ? "exclusive" : "shared"),
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			const preparedNewSegment =
+				params.new_segment === true ? ((await options.prepareNewSegment?.(ctx, signal)) ?? null) : null;
+			if (preparedNewSegment) throwIfAborted(signal);
 			const storage = await openAutoresearchStorage(ctx.cwd);
 			const runtime = options.getRuntime(ctx);
-
 			const direction = params.direction ?? "lower";
 			const metricUnit = params.metric_unit ?? "";
 			const scopePaths = dedupeStrings((params.scope_paths ?? []).map(normalizePathSpec));
 			const offLimits = dedupeStrings((params.off_limits ?? []).map(normalizePathSpec));
 			const constraints = dedupeStrings(params.constraints ?? []);
 			const secondaryMetrics = dedupeStrings(params.secondary_metrics ?? []);
-			const goal = params.goal?.trim() || null;
-			const maxIterations =
-				params.max_iterations !== undefined && Number.isFinite(params.max_iterations) && params.max_iterations > 0
+			const goal =
+				preparedNewSegment?.goal ??
+				(runtime.contribution.status === "running"
+					? runtime.contribution.goal.content
+					: params.goal?.trim() || null);
+			const maxIterations = options.forceUncapped?.(ctx)
+				? null
+				: params.max_iterations !== undefined && Number.isFinite(params.max_iterations) && params.max_iterations > 0
 					? Math.floor(params.max_iterations)
 					: null;
 			const branch = (await git.branch.current(ctx.cwd)) ?? null;
@@ -164,6 +184,8 @@ export function createInitExperimentTool(
 			runtime.lastRunSummary = null;
 			options.dashboard.updateWidget(ctx, runtime);
 			options.dashboard.requestRender();
+			options.onSessionUpdated?.(ctx, state);
+			const segmentResultText = bumpedSegment ? (preparedNewSegment?.complete(state) ?? null) : null;
 
 			const lines: string[] = [];
 			if (abandonedRuns > 0) {
@@ -214,6 +236,7 @@ export function createInitExperimentTool(
 				);
 			}
 
+			if (segmentResultText) lines.push(segmentResultText);
 			return {
 				content: [{ type: "text", text: lines.join("\n") }],
 				details: {

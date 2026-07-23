@@ -551,6 +551,28 @@ export class AutoresearchStorage {
 
 const storageCache = new Map<string, AutoresearchStorage>();
 
+export async function hasActiveAutoresearchSession(cwd: string): Promise<boolean> {
+	const { dbPath } = await resolveAutoresearchPaths(cwd);
+	const cached = storageCache.get(dbPath);
+	if (cached) return cached.getActiveSession() !== null;
+	if (!(await Bun.file(dbPath).exists())) return false;
+
+	let database: Database | null = null;
+	try {
+		database = new Database(dbPath, { readonly: true, create: false });
+		return database.query<{ active: number }, []>(
+			"SELECT 1 AS active FROM sessions WHERE closed_at IS NULL LIMIT 1",
+		).get() !== null;
+	} catch (error) {
+		throw new Error(
+			`Unable to inspect existing autoresearch state without modifying it: ${error instanceof Error ? error.message : String(error)}`,
+			{ cause: error },
+		);
+	} finally {
+		database?.close();
+	}
+}
+
 export async function openAutoresearchStorage(cwd: string): Promise<AutoresearchStorage> {
 	const { dbPath, projectDir } = await resolveAutoresearchPaths(cwd);
 	const cached = storageCache.get(dbPath);

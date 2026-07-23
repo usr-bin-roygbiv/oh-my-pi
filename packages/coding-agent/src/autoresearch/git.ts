@@ -84,7 +84,7 @@ export async function ensureAutoresearchBranch(
 		};
 	}
 
-	const branchName = await allocateBranchName(api, workDir, goal);
+	const branchName = await allocateAutoresearchBranchName(api, workDir, goal);
 	try {
 		await git.branch.checkoutNew(workDir, branchName);
 	} catch (err) {
@@ -182,7 +182,11 @@ export function normalizeStatusPath(rawPath: string): string {
 	return normalizePathSpec(normalized);
 }
 
-async function allocateBranchName(api: ExtensionAPI, workDir: string, goal: string | null): Promise<string> {
+export async function allocateAutoresearchBranchName(
+	api: ExtensionAPI,
+	workDir: string,
+	goal: string | null,
+): Promise<string> {
 	const baseName = `${AUTORESEARCH_BRANCH_PREFIX}${slugifyGoal(goal)}-${currentDateStamp()}`;
 	let candidate = baseName;
 	let suffix = 2;
