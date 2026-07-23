@@ -326,6 +326,18 @@ describe("OpenAI Responses explicit prompt cache policy", () => {
 		expect(historicalContext.messages[0].content).toEqual([{ type: "text", text: "stable history" }]);
 	});
 
+	it("leaves boundary selection automatic in implicit mode", () => {
+		const params = buildParams(
+			openAI56ResponsesModel,
+			historicalContext,
+			{ sessionId: "cache-key", promptCache: { mode: "implicit" } },
+			undefined,
+		).params;
+
+		expect(params.prompt_cache_options).toEqual({ mode: "implicit", ttl: "30m" });
+		expect(JSON.stringify(params.input)).not.toContain("prompt_cache_breakpoint");
+	});
+
 	it("marks the latest eligible stable history block", () => {
 		const params = buildParams(
 			openAI56ResponsesModel,

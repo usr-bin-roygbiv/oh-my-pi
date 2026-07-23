@@ -200,6 +200,17 @@ describe("OpenAI Chat Completions explicit prompt cache policy", () => {
 		expect(messages[2]).toMatchObject({ content: "current prompt" });
 	});
 
+	it("leaves boundary selection automatic in implicit mode", async () => {
+		const { body } = await captureRequest(
+			{ sessionId: "cache-key", promptCache: { mode: "implicit" } },
+			openAI56CompletionsModel,
+			historicalContext,
+		);
+
+		expect(body.prompt_cache_options).toEqual({ mode: "implicit", ttl: "30m" });
+		expect(JSON.stringify(body.messages)).not.toContain("prompt_cache_breakpoint");
+	});
+
 	it("does not synthesize first-turn content or a caller-disabled breakpoint", async () => {
 		const firstTurn: Context = {
 			messages: [{ role: "user", content: "only prompt", timestamp: 0 }],

@@ -1043,7 +1043,8 @@ function applyOpenAIResponsesPromptCachePolicy(
 		mode: promptCache.mode,
 		ttl: promptCache.ttl ?? model.compat.promptCacheBreakpointTtl,
 	};
-	if (promptCache.breakpoint !== "none") markLatestStableResponsesCacheBreakpoint(params.input, statefulCacheBaseline);
+	if (promptCache.mode === "explicit" && promptCache.breakpoint !== "none")
+		markLatestStableResponsesCacheBreakpoint(params.input, statefulCacheBaseline);
 }
 
 export function buildParams(

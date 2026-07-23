@@ -1513,7 +1513,8 @@ function applyOpenAIChatCompletionsPromptCachePolicy(
 		mode: promptCache.mode,
 		ttl: promptCache.ttl ?? model.compat.promptCacheBreakpointTtl,
 	};
-	if (promptCache.breakpoint !== "none") markLatestStableChatCompletionsCacheBreakpoint(params.messages);
+	if (promptCache.mode === "explicit" && promptCache.breakpoint !== "none")
+		markLatestStableChatCompletionsCacheBreakpoint(params.messages);
 }
 
 function buildParams(
