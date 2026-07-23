@@ -763,6 +763,49 @@ describe("contribution fork validation and publication", () => {
 		}
 	});
 
+	it("neutralizes insteadOf after resolving a pushInsteadOf destination", async () => {
+		const source = TempDir.createSync("@pi-contribution-chain-source-");
+		const intended = TempDir.createSync("@pi-contribution-chain-intended-");
+		const redirected = TempDir.createSync("@pi-contribution-chain-redirected-");
+		try {
+			const confirmedUrl = "omp-confirmed://alice/oh-my-pi.git";
+			const intendedUrl = `file://${intended.path()}`;
+			const redirectedUrl = `file://${redirected.path()}`;
+			await $`git init --bare ${intended.path()}`.quiet();
+			await $`git init --bare ${redirected.path()}`.quiet();
+			await $`git -C ${source.path()} init -b main`.quiet();
+			await Bun.write(`${source.path()}/proof.txt`, "verified rewrite chain\n");
+			await $`git -C ${source.path()} add proof.txt`.quiet();
+			await $`git -C ${source.path()} -c user.name=OMP -c user.email=omp@example.invalid commit -m proof`.quiet();
+			await $`git -C ${source.path()} remote add origin ${confirmedUrl}`.quiet();
+			const pushRewriteKey = `url.${intendedUrl}.pushInsteadOf`;
+			const fetchRewriteKey = `url.${redirectedUrl}.insteadOf`;
+			await $`git -C ${source.path()} config ${pushRewriteKey} ${confirmedUrl}`.quiet();
+			await $`git -C ${source.path()} config ${fetchRewriteKey} ${intendedUrl}`.quiet();
+			await expect(git.remote.pushUrl(source.path(), "origin")).resolves.toBe(intendedUrl);
+
+			await git.push(source.path(), {
+				remote: "origin",
+				verifiedRemoteUrl: intendedUrl,
+				refspec: "HEAD:refs/heads/candidate",
+			});
+
+			const intendedRef = await $`git --git-dir ${intended.path()} show-ref --verify --quiet refs/heads/candidate`
+				.quiet()
+				.nothrow();
+			const redirectedRef =
+				await $`git --git-dir ${redirected.path()} show-ref --verify --quiet refs/heads/candidate`
+					.quiet()
+					.nothrow();
+			expect(intendedRef.exitCode).toBe(0);
+			expect(redirectedRef.exitCode).not.toBe(0);
+		} finally {
+			source.removeSync();
+			intended.removeSync();
+			redirected.removeSync();
+		}
+	});
+
 	it("rechecks frozen-base ancestry immediately before push", async () => {
 		const calls: string[] = [];
 		await expectContributionError(
