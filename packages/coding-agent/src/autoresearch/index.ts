@@ -689,12 +689,18 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 						git.remote.pushUrl(ctx.cwd, contribution.remoteName),
 					]);
 					if (reviewRemoteUrl !== contribution.remoteUrl || pushRemoteUrl === undefined) {
-						throw new ContributionError("remote_changed", "The confirmed fork destination changed before review.");
+						throw new ContributionError(
+							"remote_changed",
+							"The confirmed fork destination changed before review.",
+						);
 					}
 					const reviewRemote = validateContributionForkRemote(reviewRemoteUrl);
 					const pushRemote = validateContributionForkRemote(pushRemoteUrl);
 					if (pushRemote.slug !== reviewRemote.slug) {
-						throw new ContributionError("remote_changed", "The push-effective destination differs from the confirmed fork.");
+						throw new ContributionError(
+							"remote_changed",
+							"The push-effective destination differs from the confirmed fork.",
+						);
 					}
 					await verifyContributionFork(ctx.cwd, pushRemote);
 					reviewPushRemoteUrl = pushRemoteUrl;
@@ -956,7 +962,10 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 					git.remote.pushUrl(ctx.cwd, selectedRemote.name),
 				]);
 				if (recheckedRemoteUrl !== selectedRemote.url || recheckedPushRemoteUrl !== selectedRemote.pushUrl) {
-					ctx.ui.notify("The selected fork or its push-effective destination changed after confirmation; start cancelled.", "error");
+					ctx.ui.notify(
+						"The selected fork or its push-effective destination changed after confirmation; start cancelled.",
+						"error",
+					);
 					return;
 				}
 				const recheckedRemote = validateContributionForkRemote(recheckedRemoteUrl);

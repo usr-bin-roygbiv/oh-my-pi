@@ -744,7 +744,9 @@ describe("contribution fork validation and publication", () => {
 				.quiet()
 				.nothrow();
 			const redirectedRef =
-				await $`git --git-dir ${redirected.path()} show-ref --verify --quiet refs/heads/candidate`.quiet().nothrow();
+				await $`git --git-dir ${redirected.path()} show-ref --verify --quiet refs/heads/candidate`
+					.quiet()
+					.nothrow();
 			expect(intendedRef.exitCode).toBe(0);
 			expect(redirectedRef.exitCode).not.toBe(0);
 		} finally {
