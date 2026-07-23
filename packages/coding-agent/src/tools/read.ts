@@ -11,7 +11,7 @@ import type {
 	ToolTier,
 } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent, TextContent } from "@oh-my-pi/pi-ai";
-import { glob, type SummaryResult, summarizeCode } from "@oh-my-pi/pi-natives";
+import { type SummaryResult, summarizeCode } from "@oh-my-pi/pi-natives";
 import type { Component } from "@oh-my-pi/pi-tui";
 import { Text } from "@oh-my-pi/pi-tui";
 import {
@@ -21,7 +21,6 @@ import {
 	logger,
 	prompt,
 	readImageMetadata,
-	untilAborted,
 } from "@oh-my-pi/pi-utils";
 import { type } from "arktype";
 import { LRUCache } from "lru-cache/raw";
@@ -94,6 +93,7 @@ import {
 } from "./output-meta";
 import {
 	expandPath,
+	findUniqueWorkspaceSuffix,
 	formatPathRelativeToCwd,
 	isReadableUrlPath,
 	type LineRange,
@@ -639,67 +639,11 @@ async function streamLinesFromFile(
 
 // Maximum image file size (20MB) - larger images will be rejected to prevent OOM during serialization
 const MAX_IMAGE_SIZE = MAX_IMAGE_INPUT_BYTES;
-const GLOB_TIMEOUT_MS = 5000;
 
 function isNotFoundError(error: unknown): boolean {
 	if (!error || typeof error !== "object") return false;
 	const code = (error as { code?: string }).code;
 	return code === "ENOENT" || code === "ENOTDIR";
-}
-
-/**
- * Escape glob metacharacters so a literal path (e.g. `foo[1].ts`) interpolated
- * into a suffix-glob pattern matches itself. Each metachar is wrapped in a
- * character class (the native glob engine rewrites `\` to `/`, so backslash
- * escaping is unavailable). `]`/`}` need no escaping once their openers are
- * neutralized — unmatched closers are literal.
- */
-function escapeGlobMetachars(value: string): string {
-	return value.replace(/[*?[{]/g, "[$&]");
-}
-
-/**
- * Attempt to resolve a non-existent path by finding a unique suffix match within the workspace.
- * Uses a glob suffix pattern so the native engine handles matching directly.
- * Returns null when 0 or >1 candidates match (ambiguous = no auto-resolution).
- */
-async function findUniqueSuffixMatch(
-	rawPath: string,
-	cwd: string,
-	signal?: AbortSignal,
-): Promise<{ absolutePath: string; displayPath: string } | null> {
-	const normalized = rawPath.replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/+$/, "");
-	if (!normalized) return null;
-	const pattern = `**/${escapeGlobMetachars(normalized)}`;
-
-	const timeoutSignal = AbortSignal.timeout(GLOB_TIMEOUT_MS);
-	const combinedSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
-
-	let matches: string[];
-	try {
-		const result = await untilAborted(combinedSignal, () =>
-			glob({
-				pattern,
-				path: cwd,
-				// No fileType filter: matches both files and directories
-				hidden: true,
-			}),
-		);
-		matches = result.matches.map(m => m.path);
-	} catch (error) {
-		if (error instanceof Error && error.name === "AbortError") {
-			if (!signal?.aborted) return null; // timeout — give up silently
-			throw new ToolAbortError();
-		}
-		return null;
-	}
-
-	if (matches.length !== 1) return null;
-
-	return {
-		absolutePath: path.resolve(cwd, matches[0]),
-		displayPath: matches[0],
-	};
 }
 
 function decodeUtf8Text(bytes: Uint8Array): string | null {
@@ -991,7 +935,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 	}
 
 	/**
-	 * Memoized {@link findUniqueSuffixMatch} for a single read call. A missing
+	 * Memoized {@link findUniqueWorkspaceSuffix} for a single read call. A missing
 	 * path with archive/sqlite extensions probes the workspace once per stage
 	 * (archive candidates, sqlite candidates, plain path) — each glob carries a
 	 * 5s timeout, so repeated lookups of the same string stack into a long
@@ -1004,7 +948,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 	): Promise<{ absolutePath: string; displayPath: string } | null> {
 		const hit = cache.get(rawPath);
 		if (hit !== undefined) return hit;
-		const result = await findUniqueSuffixMatch(rawPath, this.session.cwd, signal);
+		const result = await findUniqueWorkspaceSuffix(rawPath, this.session.cwd, signal);
 		cache.set(rawPath, result);
 		return result;
 	}
