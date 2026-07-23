@@ -49,7 +49,14 @@ import {
 } from "./conflict-detect";
 import { invalidateFsScanAfterWrite } from "./fs-cache-invalidation";
 import { type OutputMeta, outputMeta } from "./output-meta";
-import { formatPathRelativeToCwd, isInternalUrlPath, pathTargetsSsh, peelWriteUrlSelector } from "./path-utils";
+import {
+	formatPathRelativeToCwd,
+	isInternalUrlPath,
+	pathTargetsSsh,
+	peelWriteUrlSelector,
+	probeLiteralPathExists,
+	splitPathAndSel,
+} from "./path-utils";
 import { enforcePlanModeWrite, resolvePlanPath, unwrapHashlineHeaderPath } from "./plan-mode-guard";
 import {
 	cachedRenderedString,
@@ -113,6 +120,35 @@ function assertWriteTargetAddressable(target: string, router: InternalUrlRouter)
 		: " Tool devices use 'xd://<tool>'.";
 	throw new ToolError(
 		`Unknown URI-like write target '${trimmed}'.${suggestion} Prefix the path with './' to write it as a filesystem path.`,
+	);
+}
+
+/**
+ * Fail closed when a local write target looks like a mis-dispatched read.
+ *
+ * A read-only step that selects `write` instead of `read` passes the full read
+ * expression (`src/foo.tsx:1-260:raw`) as the target. Because a literal colon
+ * filename is legal on POSIX (issue #4618), that request otherwise resolves to
+ * filesystem creation and reports success, leaving a stray zero-byte file the
+ * model cannot recover from — the local analogue of the `xd://` near-miss guard
+ * ({@link assertWriteTargetAddressable}, issue #6123).
+ *
+ * Fires only on the high-confidence combination the report identifies: the tail
+ * parses as a read-tool selector, the literal target is missing, and no content
+ * was supplied. Non-empty content is the escape hatch — it is never blocked, so
+ * a deliberate write to a selector-shaped filename still succeeds. An existing
+ * literal path or an ambiguous stat (`"unknown"`: EACCES, transient I/O) also
+ * passes through so a real file is never shadowed by the guard.
+ */
+async function assertNotReadSelectorMisfire(target: string, content: string, cwd: string): Promise<void> {
+	if (content.length > 0) return;
+	const { sel } = splitPathAndSel(target);
+	if (sel === undefined) return;
+	if ((await probeLiteralPathExists(target, cwd)) !== "missing") return;
+	throw new ToolError(
+		`write target '${target}' ends with a read-tool selector ':${sel}' and no such file exists — refusing to create a literal file by that name. ` +
+			`If you meant to read it, use read({ path: "${target}" }). ` +
+			`If you truly intend to create this file, pass its contents in \`content\` (a non-empty write is never blocked).`,
 	);
 }
 
@@ -1159,6 +1195,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				return sqliteResult;
 			}
 
+			await assertNotReadSelectorMisfire(path, cleanContent, this.session.cwd);
 			enforcePlanModeWrite(this.session, path, { op: "create" });
 			const absolutePath = resolvePlanPath(this.session, path);
 			const batchRequest = getLspBatchRequest(context?.toolCall);
