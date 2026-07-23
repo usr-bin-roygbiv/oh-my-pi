@@ -2925,7 +2925,12 @@ describe("process-local contribution lifecycle", () => {
 
 	it("aborts and drains an ordinary init before contribution startup activation", async () => {
 		const activationEntered = Promise.withResolvers<void>();
+		let initSignal: AbortSignal | undefined;
+		let initAbortedAtFinalConfirmation: boolean | undefined;
 		const harness = createIntegrationHarness(cwd.path(), {
+			onConfirm(callNumber) {
+				if (callNumber === 2) initAbortedAtFinalConfirmation = initSignal?.aborted;
+			},
 			onSetModel() {
 				activationEntered.resolve();
 			},
@@ -2960,7 +2965,7 @@ describe("process-local contribution lifecycle", () => {
 			undefined,
 			harness.ctx as ExtensionContext,
 		);
-		const initSignal = await statusEntered.promise;
+		initSignal = await statusEntered.promise;
 		const startPromise = startContribution(harness);
 		const firstLifecycleEvent = await Promise.race([
 			statusAbortObserved.promise.then(() => "aborted" as const),
@@ -2972,6 +2977,7 @@ describe("process-local contribution lifecycle", () => {
 		expect(firstLifecycleEvent).toBe("aborted");
 		expect(initSignal).toBeDefined();
 		expect(initSignal?.aborted).toBe(true);
+		expect(initAbortedAtFinalConfirmation).toBe(false);
 		expect(initResult.status).toBe("rejected");
 		expect(startResult.status).toBe("fulfilled");
 		expect(await git.head.sha(cwd.path())).toBe(initialHead);
@@ -3397,6 +3403,103 @@ describe("process-local contribution lifecycle", () => {
 		expect(harness.appendEntries).toEqual([
 			{ customType: "autoresearch-control", data: { mode: "on", goal: "reduce edit latency" } },
 		]);
+	});
+
+	it("does not abort an ordinary mutation when contribution mode is already off", async () => {
+		const harness = createIntegrationHarness(cwd.path());
+		await commandRequired(harness, "autoresearch").handler("ordinary mutation", harness.ctx);
+		await Bun.write(`${cwd.path()}/autoresearch.sh`, "#!/usr/bin/env bash\necho METRIC runtime_ms=1\n");
+		harness.setStatusText(" M autoresearch.sh\0");
+		const statusEntered = Promise.withResolvers<AbortSignal | undefined>();
+		const releaseStatus = Promise.withResolvers<void>();
+		harness.setNextStatusRequest(async signal => {
+			statusEntered.resolve(signal);
+			await releaseStatus.promise;
+			if (signal?.aborted) throw signal.reason ?? new DOMException("Ordinary init aborted", "AbortError");
+		});
+		const init = harness.tools.get("init_experiment");
+		if (!init) throw new Error("Expected init_experiment tool");
+		const activeTools = [...harness.activeTools];
+		const initPromise = init.execute(
+			"ordinary-during-contribution-off",
+			{ name: "ordinary", primary_metric: "runtime_ms" },
+			undefined,
+			undefined,
+			harness.ctx as ExtensionContext,
+		);
+		const operationSignal = await statusEntered.promise;
+		let offSettled = false;
+		const offPromise = commandRequired(harness, "contribute")
+			.handler("off", harness.ctx)
+			.finally(() => {
+				offSettled = true;
+			});
+		for (let turn = 0; turn < 4; turn++) await Promise.resolve();
+		const offSettledDuringInit = offSettled;
+		releaseStatus.resolve();
+		const [initResult, offResult] = await Promise.allSettled([initPromise, offPromise]);
+
+		expect(offSettledDuringInit).toBe(true);
+		expect(operationSignal).toBeDefined();
+		expect(operationSignal?.aborted).toBe(false);
+		expect(initResult.status).toBe("fulfilled");
+		expect(offResult.status).toBe("fulfilled");
+		expect(harness.activeTools).toEqual(activeTools);
+		expect(harness.appendEntries).toEqual([
+			{ customType: "autoresearch-control", data: { mode: "on", goal: "ordinary mutation" } },
+		]);
+	});
+
+	it("aborts an active mutation before review and refuses a pending experiment", async () => {
+		const harness = createIntegrationHarness(cwd.path(), { confirmAnswers: [true, true, true] });
+		await startContribution(harness);
+		await prepareKeptContribution(harness, cwd.path());
+		const run = harness.tools.get("run_experiment");
+		if (!run) throw new Error("Expected run_experiment tool");
+		const processEntered = Promise.withResolvers<void>();
+		const releaseProcess = Promise.withResolvers<void>();
+		const processAborted = Promise.withResolvers<void>();
+		let processSignal: AbortSignal | undefined;
+		vi.spyOn(bashExecutor, "executeBash").mockImplementation(async (_command, options) => {
+			processSignal = options?.signal;
+			if (processSignal?.aborted) processAborted.resolve();
+			else processSignal?.addEventListener("abort", () => processAborted.resolve(), { once: true });
+			processEntered.resolve();
+			await releaseProcess.promise;
+			if (processSignal?.aborted) {
+				throw processSignal.reason ?? new DOMException("Contribution run aborted before review", "AbortError");
+			}
+			return {
+				output: "METRIC runtime_ms=1",
+				exitCode: 0,
+				cancelled: false,
+				truncated: false,
+				totalLines: 1,
+				totalBytes: 19,
+				outputLines: 1,
+				outputBytes: 19,
+			};
+		});
+		const pushSpy = vi.spyOn(git, "push").mockResolvedValue(undefined);
+		const runPromise = run.execute("run-before-review", {}, undefined, undefined, harness.ctx as ExtensionContext);
+		await processEntered.promise;
+		const reviewPromise = commandRequired(harness, "contribute").handler("review", harness.ctx);
+		const firstLifecycleEvent = await Promise.race([
+			processAborted.promise.then(() => "aborted" as const),
+			reviewPromise.then(() => "reviewed" as const),
+		]);
+		releaseProcess.resolve();
+		const [runResult, reviewResult] = await Promise.allSettled([runPromise, reviewPromise]);
+
+		expect(firstLifecycleEvent).toBe("aborted");
+		expect(processSignal).toBeDefined();
+		expect(processSignal?.aborted).toBe(true);
+		expect(runResult).toMatchObject({ status: "rejected", reason: { name: "ToolAbortError" } });
+		expect(reviewResult.status).toBe("fulfilled");
+		expect(pushSpy).not.toHaveBeenCalled();
+		expect(harness.notifications.at(-1)?.message).toContain("pending experiment");
+		await commandRequired(harness, "contribute").handler("status", harness.ctx);
+		expect(harness.notifications.at(-1)?.message).toStartWith("Contribution running on ");
 	});
 
 	it("fails closed when contribution is stopped during new-segment goal preparation", async () => {
