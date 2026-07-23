@@ -611,7 +611,13 @@ describe("contribution fork validation and publication", () => {
 
 	it("re-reads the exact fork URL, verifies ancestry, and pushes only the exact HEAD refspec", async () => {
 		const calls: string[] = [];
-		const pushes: Array<{ cwd: string; remote: string; refspec: string; forceWithLease: string }> = [];
+		const pushes: Array<{
+			cwd: string;
+			remote: string;
+			verifiedRemoteUrl: string;
+			refspec: string;
+			forceWithLease: string;
+		}> = [];
 		const git = makePublicationGit({
 			async readRemoteUrl(cwd, remote) {
 				calls.push(`read:${cwd}:${remote}`);
@@ -626,6 +632,7 @@ describe("contribution fork validation and publication", () => {
 				pushes.push({
 					cwd,
 					remote: options.remote,
+					verifiedRemoteUrl: options.verifiedRemoteUrl,
 					refspec: options.refspec,
 					forceWithLease: options.forceWithLease,
 				});
