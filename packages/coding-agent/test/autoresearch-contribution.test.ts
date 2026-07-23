@@ -1253,7 +1253,7 @@ interface IntegrationHarness {
 	setStatusText(value: string): void;
 	setHeadSha(value: string): void;
 	setRefOccupied(value: boolean): void;
-	setNextStatusRequest(callback: () => void | Promise<void>): void;
+	setNextStatusRequest(callback: (signal?: AbortSignal) => void | Promise<void>): void;
 	setSessionId(value: string): void;
 	setActiveToolState(names: string[]): void;
 	setCurrentBranch(value: string): void;
@@ -1327,7 +1327,7 @@ function createIntegrationHarness(cwd: string, options: IntegrationHarnessOption
 	let refOccupied = false;
 	const refExistsResults = [...(options.refExistsResults ?? [])];
 	const ancestryResults = [...(options.ancestryResults ?? [])];
-	let nextStatusRequest: (() => void | Promise<void>) | null = null;
+	let nextStatusRequest: ((signal?: AbortSignal) => void | Promise<void>) | null = null;
 	let sessionId = options.sessionId ?? "contribution-session";
 	let sessionBranch: unknown[] = [];
 	let setActiveToolsCallCount = 0;
@@ -1340,10 +1340,10 @@ function createIntegrationHarness(cwd: string, options: IntegrationHarnessOption
 	vi.spyOn(git.repo, "root").mockResolvedValue(cwd);
 	vi.spyOn(git.show, "prefix").mockResolvedValue("");
 	const statusMock = Object.assign(
-		async () => {
+		async (...args: Parameters<typeof git.status>) => {
 			const callback = nextStatusRequest;
 			nextStatusRequest = null;
-			await callback?.();
+			await callback?.(args[1]?.signal);
 			gitEvents.push(`status:${statusText}`);
 			return statusText;
 		},
@@ -1598,7 +1598,7 @@ function createIntegrationHarness(cwd: string, options: IntegrationHarnessOption
 		setRefOccupied(value: boolean): void {
 			refOccupied = value;
 		},
-		setNextStatusRequest(callback: () => void | Promise<void>): void {
+		setNextStatusRequest(callback: (signal?: AbortSignal) => void | Promise<void>): void {
 			nextStatusRequest = callback;
 		},
 		setSessionId(value: string): void {
@@ -2115,6 +2115,68 @@ describe("process-local contribution lifecycle", () => {
 		expect(session).not.toBeNull();
 		expect(session?.maxIterations).toBeNull();
 		expect(session?.goal).toBe(GOAL_CONTENT);
+	});
+
+	it("aborts and drains an ordinary init before contribution startup activation", async () => {
+		const activationEntered = Promise.withResolvers<void>();
+		const harness = createIntegrationHarness(cwd.path(), {
+			onSetModel() {
+				activationEntered.resolve();
+			},
+		});
+		await Bun.write(`${cwd.path()}/autoresearch.sh`, "#!/usr/bin/env bash\necho METRIC runtime_ms=1\n");
+		const init = harness.tools.get("init_experiment");
+		if (!init) throw new Error("Expected init_experiment tool");
+		const statusEntered = Promise.withResolvers<AbortSignal | undefined>();
+		const statusAbortObserved = Promise.withResolvers<void>();
+		const releaseStatus = Promise.withResolvers<void>();
+		harness.setNextStatusRequest(async signal => {
+			statusEntered.resolve(signal);
+			if (signal?.aborted) {
+				statusAbortObserved.resolve();
+			} else {
+				signal?.addEventListener("abort", () => statusAbortObserved.resolve(), { once: true });
+			}
+			await Promise.race([releaseStatus.promise, statusAbortObserved.promise]);
+			if (signal?.aborted) {
+				throw signal.reason ?? new DOMException("Init invalidated by contribution start", "AbortError");
+			}
+		});
+		const initialHead = await git.head.sha(cwd.path());
+		const initPromise = init.execute(
+			"ordinary-before-contribution",
+			{ name: "ordinary", primary_metric: "runtime_ms" },
+			undefined,
+			undefined,
+			harness.ctx as ExtensionContext,
+		);
+		const initSignal = await statusEntered.promise;
+		const startPromise = startContribution(harness);
+		const firstLifecycleEvent = await Promise.race([
+			statusAbortObserved.promise.then(() => "aborted" as const),
+			activationEntered.promise.then(() => "activated" as const),
+		]);
+		releaseStatus.resolve();
+		const [initResult, startResult] = await Promise.allSettled([initPromise, startPromise]);
+
+		expect(firstLifecycleEvent).toBe("aborted");
+		expect(initSignal).toBeDefined();
+		expect(initSignal?.aborted).toBe(true);
+		expect(initResult.status).toBe("rejected");
+		expect(startResult.status).toBe("fulfilled");
+		expect(await git.head.sha(cwd.path())).toBe(initialHead);
+		expect(snapshotStorageArtifacts(dbDir.path())).toEqual([]);
+		await expect(hasActiveAutoresearchSession(cwd.path())).resolves.toBe(false);
+		await commandRequired(harness, "contribute").handler("status", harness.ctx);
+		expect(harness.notifications.at(-1)?.message).toStartWith("Contribution running on ");
+		expect(harness.activeTools).toEqual([
+			"read",
+			"bash",
+			"init_experiment",
+			"run_experiment",
+			"log_experiment",
+			"update_notes",
+		]);
 	});
 
 	it("fails closed when contribution is stopped during initial init preparation", async () => {
