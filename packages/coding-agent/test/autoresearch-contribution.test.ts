@@ -1884,8 +1884,8 @@ describe("process-local contribution lifecycle", () => {
 			};
 			harness = createIntegrationHarness(cwd.path(), {
 				confirmAnswers: [true, true, true],
-				async onForkMetadataRequest(callNumber, signal): Promise<void> {
-					if (race.point === "fork verification" && callNumber === 2) await invalidate(signal);
+				async onForkMetadataRequest(_callNumber, signal): Promise<void> {
+					if (race.point === "fork verification" && signal) await invalidate(signal);
 				},
 				async onAncestryRequest(callNumber, signal): Promise<void> {
 					if (race.point === "pre-push ancestry" && callNumber === 2) await invalidate(signal);
