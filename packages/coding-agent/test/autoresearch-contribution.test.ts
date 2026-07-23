@@ -887,7 +887,7 @@ describe("contribution fork validation and publication", () => {
 				baseProof,
 				approvedDraft: buildContributionPrDraft(
 					goal,
-					candidate,
+					makeCandidate(),
 					validateContributionForkRemote(FORK_URL),
 					CONTRIBUTION_BRANCH,
 					baseProof,
@@ -1704,7 +1704,7 @@ describe("process-local contribution lifecycle", () => {
 		expect(harness.setModelCalls).toEqual([]);
 		const checkedRefs = harness.gitEvents.filter(event => event.startsWith("exists:refs/heads/"));
 		expect(checkedRefs).toHaveLength(2);
-		expect(new Set(checkedRefs)).toHaveSize(1);
+		expect(new Set(checkedRefs).size).toBe(1);
 		expect(
 			harness.notifications.some(note => note.type === "error" && /branch|occupied|exists/i.test(note.message)),
 		).toBe(true);
@@ -2192,7 +2192,7 @@ describe("process-local contribution lifecycle", () => {
 				undefined,
 				harness.ctx as ExtensionContext,
 			),
-		).rejects.toThrow("user interrupted");
+		).rejects.toThrow("Operation aborted");
 		expect(observedSignal).toBe(controller.signal);
 		expect(snapshotStorageArtifacts(dbDir.path())).toEqual(beforeArtifacts);
 	});

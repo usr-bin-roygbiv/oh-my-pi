@@ -870,9 +870,7 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 					if (branchCreated) {
 						try {
 							await git.checkout(ctx.cwd, priorBranch ?? frozenBaseProof.baseSha);
-							if (!(await git.branch.tryDelete(ctx.cwd, branchName))) {
-								rollbackErrors.push(`branch: failed to delete ${branchName}`);
-							}
+							await git.branch.delete(ctx.cwd, branchName);
 						} catch (rollbackError) {
 							rollbackErrors.push(`branch: ${describeContributionError(rollbackError)}`);
 						}
