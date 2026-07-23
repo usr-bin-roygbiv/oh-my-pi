@@ -691,6 +691,46 @@ describe("contribution fork validation and publication", () => {
 		expect(published.prDraft).toEqual(approvedDraft);
 	});
 
+	it("publishes only the frozen candidate when HEAD moves after push URL verification", async () => {
+		const movedHead = "5".repeat(40);
+		let head = CURRENT_HEAD;
+		let publishedCommit: string | undefined;
+		const events: string[] = [];
+		const publicationGit = makePublicationGit({
+			readHead: async () => head,
+			push: async (_cwd, options) => {
+				expect(options.verifiedRemoteUrl).toBe(FORK_URL);
+				events.push("push URL verified");
+				head = movedHead;
+				events.push("HEAD moved");
+				const source = options.refspec.slice(0, options.refspec.indexOf(":"));
+				publishedCommit = source === "HEAD" ? head : source;
+				events.push("source resolved");
+			},
+		});
+
+		await publishContributionCandidate({
+			cwd: "/work/repo",
+			remoteName: "origin",
+			confirmedRemoteUrl: FORK_URL,
+			confirmedPushRemoteUrl: FORK_URL,
+			branchName: CONTRIBUTION_BRANCH,
+			currentBranch: CONTRIBUTION_BRANCH,
+			worktreeClean: true,
+			goal: makeGoal(),
+			candidate: makeCandidate(),
+			currentSegment: 2,
+			currentHead: CURRENT_HEAD,
+			baseProof: makeBaseProof(),
+			approvedDraft: makeApprovedDraft(),
+			git: publicationGit,
+			request: async () => ({ fork: true, parent: "can1357/oh-my-pi", source: "can1357/oh-my-pi" }),
+		});
+
+		expect(events).toEqual(["push URL verified", "HEAD moved", "source resolved"]);
+		expect(publishedCommit).toBe(CURRENT_HEAD);
+	});
+
 	it("rejects a push-effective URL rewrite away from the confirmed fork", async () => {
 		let pushCalls = 0;
 		const publicationGit = {
