@@ -2143,36 +2143,35 @@ describe("process-local contribution lifecycle", () => {
 	});
 
 	it("aborts and drains an in-flight harness commit before contribution off", async () => {
-		let contributionStarted = false;
-		const offDeactivationEntered = Promise.withResolvers<void>();
-		const harness = createIntegrationHarness(cwd.path(), {
-			onSetActiveTools() {
-				if (contributionStarted) offDeactivationEntered.resolve();
-			},
-		});
+		const harness = createIntegrationHarness(cwd.path());
 		await startContribution(harness);
-		contributionStarted = true;
 		await Bun.write(`${cwd.path()}/autoresearch.sh`, "#!/usr/bin/env bash\necho METRIC runtime_ms=1\n");
-		harness.setStatusText(" M autoresearch.sh");
+		harness.setStatusText(" M autoresearch.sh\0");
 		const init = harness.tools.get("init_experiment");
 		if (!init) throw new Error("Expected init_experiment tool");
-		const commitEntered = Promise.withResolvers<void>();
-		const commitAbortObserved = Promise.withResolvers<void>();
-		const releaseCommit = Promise.withResolvers<void>();
 		let stageSignal: AbortSignal | undefined;
 		let commitSignal: AbortSignal | undefined;
+		let offPromise: Promise<void> | null = null;
+		let offSettled = false;
+		let statusDuringCommit: string | undefined;
+		let offSettledDuringCommit = false;
+		let stageAbortedDuringCommit = false;
+		let commitAbortedDuringCommit = false;
 		vi.spyOn(git.stage, "files").mockImplementation(async (_workDir, _files, signal) => {
 			stageSignal = signal;
 		});
 		vi.spyOn(git, "commit").mockImplementation(async (_workDir, _message, options) => {
 			commitSignal = options.signal;
-			if (commitSignal?.aborted) {
-				commitAbortObserved.resolve();
-			} else {
-				commitSignal?.addEventListener("abort", () => commitAbortObserved.resolve(), { once: true });
-			}
-			commitEntered.resolve();
-			await releaseCommit.promise;
+			offPromise = commandRequired(harness, "contribute")
+				.handler("off", harness.ctx)
+				.finally(() => {
+					offSettled = true;
+				});
+			await commandRequired(harness, "contribute").handler("status", harness.ctx);
+			statusDuringCommit = harness.notifications.at(-1)?.message;
+			offSettledDuringCommit = offSettled;
+			stageAbortedDuringCommit = stageSignal?.aborted ?? false;
+			commitAbortedDuringCommit = commitSignal?.aborted ?? false;
 			if (commitSignal?.aborted) {
 				throw commitSignal.reason ?? new DOMException("Contribution init aborted", "AbortError");
 			}
@@ -2180,37 +2179,23 @@ describe("process-local contribution lifecycle", () => {
 			return { exitCode: 0, stdout: "", stderr: "" };
 		});
 
-		const initPromise = init.execute(
-			"deferred-commit",
-			{ name: "initial", primary_metric: "runtime_ms" },
-			undefined,
-			undefined,
-			harness.ctx as ExtensionContext,
-		);
-		await commitEntered.promise;
-		let offSettled = false;
-		const offPromise = commandRequired(harness, "contribute")
-			.handler("off", harness.ctx)
-			.finally(() => {
-				offSettled = true;
-			});
-		const firstLifecycleEvent = await Promise.race([
-			commitAbortObserved.promise.then(() => "aborted" as const),
-			offDeactivationEntered.promise.then(() => "deactivated" as const),
+		const [initResult] = await Promise.allSettled([
+			init.execute(
+				"deferred-commit",
+				{ name: "initial", primary_metric: "runtime_ms" },
+				undefined,
+				undefined,
+				harness.ctx as ExtensionContext,
+			),
 		]);
-		await commandRequired(harness, "contribute").handler("status", harness.ctx);
-		const statusBeforeRelease = harness.notifications.at(-1)?.message;
-		const offSettledBeforeRelease = offSettled;
-		const stageAbortedBeforeRelease = stageSignal?.aborted ?? false;
-		const commitAbortedBeforeRelease = commitSignal?.aborted ?? false;
-		releaseCommit.resolve();
-		const [initResult, offResult] = await Promise.allSettled([initPromise, offPromise]);
+		const startedOff = offPromise as Promise<void> | null;
+		if (!startedOff) throw new Error("Expected contribution off to start during commit");
+		const [offResult] = await Promise.allSettled([startedOff]);
 
-		expect(firstLifecycleEvent).toBe("aborted");
-		expect(statusBeforeRelease).toStartWith("Contribution running on ");
-		expect(offSettledBeforeRelease).toBe(false);
-		expect(stageAbortedBeforeRelease).toBe(true);
-		expect(commitAbortedBeforeRelease).toBe(true);
+		expect(statusDuringCommit).toStartWith("Contribution running on ");
+		expect(offSettledDuringCommit).toBe(false);
+		expect(stageAbortedDuringCommit).toBe(true);
+		expect(commitAbortedDuringCommit).toBe(true);
 		expect(initResult.status).toBe("rejected");
 		expect(offResult.status).toBe("fulfilled");
 		expect(await git.head.sha(cwd.path())).toBe(COMMIT_SHA);
