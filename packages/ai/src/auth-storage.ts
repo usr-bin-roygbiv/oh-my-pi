@@ -635,10 +635,10 @@ const USAGE_REPORT_CACHE_KEY_VERSION_OVERRIDES: Partial<Record<Provider, number>
 	"google-antigravity": 2,
 	zai: 2,
 	// v2: cache identity gained an `org:` component so two subscriptions on one
-	// account email stop sharing a slot. The bump also retires pre-org entries —
-	// otherwise an org-less credential could replay another org's cached pool
-	// (incl. the 24h last-good fallback) via the old bare email/account key.
-	anthropic: 2,
+	// account email stop sharing a slot. v3 retires parsed reports created before
+	// Anthropic extra-usage rows existed; header ingestion can otherwise keep
+	// renewing those incomplete reports throughout the 24h last-good retention.
+	anthropic: 3,
 };
 const DEFAULT_OAUTH_REFRESH_TIMEOUT_MS = 10_000;
 /**

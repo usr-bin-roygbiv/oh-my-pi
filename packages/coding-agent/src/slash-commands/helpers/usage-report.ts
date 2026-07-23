@@ -12,6 +12,14 @@ function formatProviderName(provider: string): string {
 		.join(" ");
 }
 
+function formatWindowSuffix(label: string, windowLabel: string | undefined): string {
+	if (!windowLabel) return "";
+	const normalizedLabel = label.toLowerCase();
+	const normalizedWindow = windowLabel.toLowerCase();
+	if (normalizedWindow === "quota window" || normalizedLabel.includes(normalizedWindow)) return "";
+	return ` — ${windowLabel}`;
+}
+
 function formatUsageAmount(limit: UsageLimit): string {
 	const amount = limit.amount;
 	const used = amount.used ?? (amount.usedFraction !== undefined ? amount.usedFraction * 100 : undefined);
@@ -118,7 +126,7 @@ function renderUsageReports(
 					limit.scope.tier && !limit.label.toLowerCase().includes(limit.scope.tier.toLowerCase())
 						? ` (${limit.scope.tier})`
 						: "";
-				lines.push(`- ${limit.label}${tier}${window ? ` — ${window}` : ""}`);
+				lines.push(`- ${limit.label}${tier}${formatWindowSuffix(limit.label, window)}`);
 				lines.push(
 					`  ${formatUsageReportAccount(report, limit, index)}: ${formatUsageAmount(limit)}${inUse ? "  ← in use by this session" : ""}`,
 				);

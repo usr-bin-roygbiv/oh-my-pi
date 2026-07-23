@@ -6,6 +6,7 @@
 
 - Added Synthetic (synthetic.new) usage provider: `/usage` now reports the rolling 5-hour request limit and weekly credit quota via `GET /v2/quotas`, including per-tick regeneration rates in the window labels.
 - Added optional `UsageWindow.resetLabel` so rolling windows can render their countdown with an accurate verb (e.g. "tick in 12m" / "regen in 51m" instead of "resets in") — both quota windows on Synthetic regenerate incrementally rather than hard-resetting.
+- Added Anthropic extra-usage reporting across `omp usage`, interactive `/usage`, and ACP `/usage`: the OAuth usage endpoint's authoritative `spend` payload (or legacy `extra_usage` fallback when absent) is normalized into a `Claude Extra Usage` USD row; capped accounts show limit/remaining/fractions and status, while uncapped spend exposes only its absolute used amount—rendered as `$… used` in CLI/TUI and `123.45 usd used` in ACP—without a fabricated cap, percentage, or status. ([#5575](https://github.com/can1357/oh-my-pi/issues/5575))
 
 ### Fixed
 

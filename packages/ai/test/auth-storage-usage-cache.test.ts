@@ -229,6 +229,22 @@ describe("AuthStorage usage cache: last-good failure fallback", () => {
 		expect(calls).toBe(1);
 	});
 
+	it("cold-fetches instead of replaying a report stored under the previous Anthropic cache version", async () => {
+		const previousVersionKey = "usage_cache:report:2:anthropic:default:oauth|account:account-1|email:a@example.com";
+		store.cache.set(previousVersionKey, {
+			value: JSON.stringify({ value: makeReport("a@example.com"), expiresAt: Date.now() + 60_000 }),
+			expiresAtSec: Math.floor((Date.now() + 24 * 60 * 60_000) / 1000),
+		});
+		const base = makeReport("a@example.com");
+		const freshReport = { ...base, metadata: { ...base.metadata, source: "fresh-v3-fetch" } };
+		const fetchSpy = vi.spyOn(claudeUsage.claudeUsageProvider, "fetchUsage").mockResolvedValue(freshReport);
+
+		const reports = anthropicReports(await storage.fetchUsageReports());
+
+		expect(fetchSpy).toHaveBeenCalledTimes(1);
+		expect(reports[0]?.metadata?.source).toBe("fresh-v3-fetch");
+	});
+
 	it("caches null on a cold failure for the backoff window, then retries after it expires", async () => {
 		let calls = 0;
 		vi.spyOn(claudeUsage.claudeUsageProvider, "fetchUsage").mockImplementation(async () => {
@@ -596,7 +612,7 @@ describe("AuthStorage usage cache: terminal refresh failure", () => {
 		if (row.credential.type !== "oauth") throw new Error("expected OAuth test credential");
 		row.credential.expires = Date.now() - 1000;
 		const store = makeStore([row]);
-		const cacheKey = "usage_cache:report:2:anthropic:default:oauth|account:account-3|email:expired@example.com";
+		const cacheKey = "usage_cache:report:3:anthropic:default:oauth|account:account-3|email:expired@example.com";
 		store.cache.set(cacheKey, {
 			value: JSON.stringify({ value: makeReport("expired@example.com"), expiresAt: 1 }),
 			expiresAtSec: Math.floor((Date.now() + 24 * 60 * 60_000) / 1000),
@@ -654,7 +670,7 @@ describe("AuthStorage usage cache: terminal refresh failure", () => {
 		};
 
 		const lastGood = makeReport("b@example.com");
-		const cacheKey = "usage_cache:report:2:anthropic:default:oauth|account:account-2|email:b@example.com";
+		const cacheKey = "usage_cache:report:3:anthropic:default:oauth|account:account-2|email:b@example.com";
 		cache.set(cacheKey, {
 			value: JSON.stringify({ value: lastGood, expiresAt: 1 }),
 			expiresAtSec: Math.floor((Date.now() + 24 * 60 * 60_000) / 1000),

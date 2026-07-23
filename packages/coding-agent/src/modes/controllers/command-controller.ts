@@ -1593,11 +1593,28 @@ function padColumn(text: string, width: number): string {
 	return `${text}${padding(width - visible)}`;
 }
 
-function resolveAggregateStatus(limits: UsageLimit[]): UsageLimit["status"] {
+type AggregateDisplayStatus = NonNullable<UsageLimit["status"]> | "neutral";
+
+function isUsedOnlyAbsoluteAmount(limit: UsageLimit): boolean {
+	const amount = limit.amount;
+	return (
+		amount.unit !== "percent" &&
+		amount.unit !== "unknown" &&
+		amount.used !== undefined &&
+		Number.isFinite(amount.used) &&
+		amount.limit === undefined &&
+		amount.remaining === undefined &&
+		resolveUsedFraction(limit) === undefined
+	);
+}
+
+function resolveAggregateStatus(limits: UsageLimit[]): AggregateDisplayStatus {
 	const hasOk = limits.some(limit => limit.status === "ok");
 	const hasWarning = limits.some(limit => limit.status === "warning");
 	const hasExhausted = limits.some(limit => limit.status === "exhausted");
-	if (!hasOk && !hasWarning && !hasExhausted) return "unknown";
+	if (!hasOk && !hasWarning && !hasExhausted) {
+		return limits.length > 0 && limits.every(isUsedOnlyAbsoluteAmount) ? "neutral" : "unknown";
+	}
 	if (hasOk) {
 		return hasWarning || hasExhausted ? "warning" : "ok";
 	}
@@ -1624,6 +1641,8 @@ function formatAggregateAmount(limits: UsageLimit[]): string {
 		const remainingPct = totalLimit > 0 ? Math.max(0, 100 - (totalUsed / totalLimit) * 100) : 0;
 		return `${formatNumber(remainingPct)}% free`;
 	}
+
+	if (limits.length > 0 && limits.every(isUsedOnlyAbsoluteAmount)) return "";
 
 	// Count unique accounts from limit scopes — not limits.length.
 	const uniqueAccountIds = new Set(
@@ -1707,7 +1726,8 @@ export function formatCompactQuota(
 	return `Quota: ${lines.join(" │ ")}`;
 }
 
-function resolveStatusIcon(status: UsageLimit["status"], uiTheme: typeof theme): string {
+function resolveStatusIcon(status: AggregateDisplayStatus, uiTheme: typeof theme): string {
+	if (status === "neutral") return uiTheme.fg("dim", uiTheme.status.info);
 	if (status === "exhausted") return uiTheme.fg("error", uiTheme.status.error);
 	if (status === "warning") return uiTheme.fg("warning", uiTheme.status.warning);
 	if (status === "ok") return uiTheme.fg("success", uiTheme.status.success);
@@ -1722,6 +1742,14 @@ function resolveStatusColor(status: UsageLimit["status"]): "success" | "warning"
 }
 
 function renderUsageBar(limit: UsageLimit, uiTheme: typeof theme, barWidth: number): string {
+	const usedAmount = limit.amount.used;
+	if (usedAmount !== undefined && isUsedOnlyAbsoluteAmount(limit)) {
+		const used =
+			limit.amount.unit === "usd"
+				? `$${usedAmount.toFixed(2)}`
+				: `${formatNumber(usedAmount, 2)} ${limit.amount.unit}`;
+		return uiTheme.fg("dim", truncateJobLabel(`${used} used`, barWidth));
+	}
 	const fraction = resolveUsedFraction(limit);
 	if (fraction === undefined) {
 		return uiTheme.fg("dim", "·".repeat(barWidth));
