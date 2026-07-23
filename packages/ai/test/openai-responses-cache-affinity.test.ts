@@ -325,6 +325,36 @@ describe("OpenAI Responses explicit prompt cache policy", () => {
 		expect(historicalContext.messages[0].content).toEqual([{ type: "text", text: "stable history" }]);
 	});
 
+	it("marks the latest eligible stable history block", () => {
+		const params = buildParams(
+			openAI56ResponsesModel,
+			{
+				messages: [
+					{ role: "user", content: [{ type: "text", text: "oldest stable history" }], timestamp: 0 },
+					{ role: "user", content: [{ type: "text", text: "newer stable history" }], timestamp: 1 },
+					{ role: "user", content: [{ type: "text", text: "current prompt" }], timestamp: 2 },
+				],
+			},
+			{ sessionId: "cache-key", promptCache: { mode: "explicit" } },
+			undefined,
+		).params;
+
+		expect(params.input).toEqual([
+			{ role: "user", content: [{ type: "input_text", text: "oldest stable history" }] },
+			{
+				role: "user",
+				content: [
+					{
+						type: "input_text",
+						text: "newer stable history",
+						prompt_cache_breakpoint: { mode: "explicit" },
+					},
+				],
+			},
+			{ role: "user", content: [{ type: "input_text", text: "current prompt" }] },
+		]);
+	});
+
 	it("marks an existing first-turn developer string without adding a message or changing its text", () => {
 		const firstTurnWithSystem: Context = {
 			systemPrompt: ["stable developer instruction"],

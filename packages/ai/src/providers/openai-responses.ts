@@ -447,7 +447,7 @@ const streamOpenAIResponsesOnce = (
 				providerSessionState,
 				strictToolsScope,
 				false,
-				chainState?.canAppend === true,
+				chainState?.canAppend ? chainState.lastParams?.input : undefined,
 			);
 			const params = builtParams.params;
 			let activeParams = params;
@@ -613,6 +613,7 @@ const streamOpenAIResponsesOnce = (
 								providerSessionState,
 								strictToolsScope,
 								true,
+								chainState?.canAppend ? chainState.lastParams?.input : undefined,
 							);
 							const fallbackParams = fallbackBuilt.params;
 							if (chainState && !chainState.disabled) fallbackParams.store = true;
@@ -902,7 +903,7 @@ function isResponsesPromptCacheableMessage(item: unknown): item is ResponsesProm
 
 type ResponsesStringInstruction = {
 	role: "developer" | "system";
-	content: string | ResponseInputContent[];
+	content: string;
 };
 
 function isStableStringResponsesInstruction(item: unknown): item is ResponsesStringInstruction {
@@ -914,11 +915,60 @@ function isStableStringResponsesInstruction(item: unknown): item is ResponsesStr
 	);
 }
 
-function markEarliestStableResponsesCacheBreakpoint(
+function restoreResponsesCacheBreakpointsFromBaseline(
 	input: ResponseInput | undefined,
-	preserveStatefulPrefix = false,
+	baseline: ResponseInput | undefined,
+): boolean {
+	if (!input || !baseline) return false;
+	let restored = false;
+	for (let i = 0; i < baseline.length && i < input.length; i++) {
+		const baselineMessage = baseline[i];
+		const message = input[i];
+		if (!isResponsesPromptCacheableMessage(baselineMessage)) continue;
+
+		if (isStableStringResponsesInstruction(message)) {
+			const [baselineBlock] = baselineMessage.content;
+			if (
+				baselineMessage.content.length === 1 &&
+				baselineBlock?.type === "input_text" &&
+				baselineBlock.text === message.content &&
+				baselineBlock.prompt_cache_breakpoint
+			) {
+				Object.assign(message, {
+					content: [
+						{
+							type: "input_text",
+							text: message.content,
+							prompt_cache_breakpoint: baselineBlock.prompt_cache_breakpoint,
+						},
+					],
+				});
+				restored = true;
+			}
+			continue;
+		}
+
+		if (!isResponsesPromptCacheableMessage(message)) continue;
+		for (let j = 0; j < baselineMessage.content.length && j < message.content.length; j++) {
+			const baselineBlock = baselineMessage.content[j];
+			const block = message.content[j];
+			if (!baselineBlock?.prompt_cache_breakpoint || !isResponsesPromptCacheableContentBlock(block)) continue;
+			Object.assign(block, { prompt_cache_breakpoint: baselineBlock.prompt_cache_breakpoint });
+			restored = true;
+		}
+	}
+	return restored;
+}
+
+function markLatestStableResponsesCacheBreakpoint(
+	input: ResponseInput | undefined,
+	statefulBaseline?: ResponseInput,
 ): boolean {
 	if (!input) return false;
+	// Stateful appends use a strict wire-prefix comparison. Retain the exact
+	// marker from that prefix rather than recomputing a newer boundary.
+	if (statefulBaseline) return restoreResponsesCacheBreakpointsFromBaseline(input, statefulBaseline);
+
 	let latestInputMessage = -1;
 	for (let i = input.length - 1; i >= 0; i--) {
 		const message = input[i];
@@ -930,32 +980,26 @@ function markEarliestStableResponsesCacheBreakpoint(
 	}
 	if (latestInputMessage <= 0) return false;
 
-	// Anchor at the first eligible history block. A stateful turn rebuilds its
-	// full transcript before deriving a delta, so moving this marker toward the
-	// growing tail would make the append baseline appear mutated. If its prior
-	// turn did not have a system/developer prefix, do not introduce a marker on
-	// historical user content now: that content has already been stored.
-	for (let i = 0; i < latestInputMessage; i++) {
+	for (let i = latestInputMessage - 1; i >= 0; i--) {
 		const message = input[i];
-		if (
-			isResponsesPromptCacheableMessage(message) &&
-			(!preserveStatefulPrefix || message.role === "developer" || message.role === "system")
-		) {
-			const block = message.content[message.content.length - 1];
-			if (block) {
-				Object.assign(block, { prompt_cache_breakpoint: { mode: "explicit" } });
-				return true;
-			}
-		}
-		if (isStableStringResponsesInstruction(message) && typeof message.content === "string") {
+		if (isStableStringResponsesInstruction(message)) {
 			const text = message.content;
-			message.content = [
-				{
-					type: "input_text",
-					text,
-					prompt_cache_breakpoint: { mode: "explicit" },
-				},
-			];
+			Object.assign(message, {
+				content: [
+					{
+						type: "input_text",
+						text,
+						prompt_cache_breakpoint: { mode: "explicit" },
+					},
+				],
+			});
+			return true;
+		}
+		if (!isResponsesPromptCacheableMessage(message)) continue;
+		for (let j = message.content.length - 1; j >= 0; j--) {
+			const block = message.content[j];
+			if (!isResponsesPromptCacheableContentBlock(block)) continue;
+			Object.assign(block, { prompt_cache_breakpoint: { mode: "explicit" } });
 			return true;
 		}
 	}
@@ -966,7 +1010,7 @@ function applyOpenAIResponsesPromptCachePolicy(
 	params: OpenAIResponsesSamplingParams,
 	model: Model<"openai-responses">,
 	options: OpenAIResponsesOptions | undefined,
-	preserveStatefulPrefix = false,
+	statefulCacheBaseline?: ResponseInput,
 ): void {
 	const promptCache = options?.promptCache;
 	if (!promptCache || resolveCacheRetention(options?.cacheRetention) === "none") return;
@@ -983,8 +1027,7 @@ function applyOpenAIResponsesPromptCachePolicy(
 		mode: promptCache.mode,
 		ttl: promptCache.ttl ?? model.compat.promptCacheBreakpointTtl,
 	};
-	if (promptCache.breakpoint !== "none")
-		markEarliestStableResponsesCacheBreakpoint(params.input, preserveStatefulPrefix);
+	if (promptCache.breakpoint !== "none") markLatestStableResponsesCacheBreakpoint(params.input, statefulCacheBaseline);
 }
 
 export function buildParams(
@@ -994,14 +1037,13 @@ export function buildParams(
 	providerSessionState: OpenAIResponsesProviderSessionState | undefined,
 	strictToolsScope?: OpenAIStrictToolsScope,
 	disableStrictToolsOverride = false,
-	preserveStatefulPrefix = false,
+	statefulCacheBaseline?: ResponseInput,
 ): { params: OpenAIResponsesSamplingParams; strictToolsApplied: boolean } {
 	const policy = resolveOpenAICompatPolicy(model, {
 		endpoint: "responses",
 		reasoning: options?.reasoning,
 		disableReasoning: options?.disableReasoning,
 		toolChoice: options?.toolChoice,
-		strictResponsesPairing: options?.strictResponsesPairing,
 		includeEncryptedReasoning: options?.includeEncryptedReasoning,
 		filterReasoningHistory: options?.filterReasoningHistory,
 		omitReasoningEffort: options?.omitReasoningEffort,
@@ -1144,7 +1186,7 @@ export function buildParams(
 	applyOpenAIGatewayRouting(params, model.compat);
 
 	applyOpenAIExtraBody(params, options?.extraBody);
-	applyOpenAIResponsesPromptCachePolicy(params, model, options, preserveStatefulPrefix);
+	applyOpenAIResponsesPromptCachePolicy(params, model, options, statefulCacheBaseline);
 
 	return { params, strictToolsApplied };
 }

@@ -402,7 +402,7 @@ describe("openai-completions wire-quirk compat detection", () => {
 });
 
 describe("OpenAI explicit prompt-cache breakpoint compat", () => {
-	it("enables the 30-minute breakpoint contract only for GPT-5.6 on the official API", () => {
+	it("enables the 30-minute breakpoint contract for GPT-5.6+ on the official API", () => {
 		const completions = buildOpenAICompat(
 			completionsSpec({ id: "gpt-5.6", provider: "openai", baseUrl: "https://api.openai.com/v1" }),
 		);
@@ -419,8 +419,34 @@ describe("OpenAI explicit prompt-cache breakpoint compat", () => {
 		expect(responses.promptCacheBreakpointTtl).toBe("30m");
 
 		expect(
+			buildOpenAICompat(
+				completionsSpec({ id: "gpt-5.6-preview", provider: "openai", baseUrl: "https://api.openai.com/v1" }),
+			).supportsPromptCacheBreakpoints,
+		).toBe(true);
+		expect(
+			buildOpenAICompat(completionsSpec({ id: "gpt-5.7", provider: "openai", baseUrl: "https://api.openai.com/v1" }))
+				.supportsPromptCacheBreakpoints,
+		).toBe(true);
+		expect(
+			buildOpenAIResponsesCompat({
+				id: "gpt-6.1-mini",
+				provider: "openai",
+				name: "GPT 6.1 Mini",
+				baseUrl: "https://api.openai.com/v1",
+			}).supportsPromptCacheBreakpoints,
+		).toBe(true);
+
+		expect(
 			buildOpenAICompat(completionsSpec({ id: "gpt-5.5", provider: "openai", baseUrl: "https://api.openai.com/v1" }))
 				.supportsPromptCacheBreakpoints,
+		).toBe(false);
+		expect(
+			buildOpenAIResponsesCompat({
+				id: "gpt-4.1",
+				provider: "openai",
+				name: "GPT 4.1",
+				baseUrl: "https://api.openai.com/v1",
+			}).supportsPromptCacheBreakpoints,
 		).toBe(false);
 		expect(
 			buildOpenAIResponsesCompat({

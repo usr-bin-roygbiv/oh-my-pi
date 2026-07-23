@@ -180,6 +180,58 @@ describe("openai-responses stateful chaining", () => {
 		]);
 	});
 
+	it("preserves an established no-system cache breakpoint across chained turns", async () => {
+		const sentRequests: Array<Record<string, unknown>> = [];
+		const fetchMock = createCapturingFetch(sentRequests);
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const options = {
+			apiKey: "test-key",
+			sessionId: "stateful-no-system-marker-session",
+			providerSessionState,
+			statefulResponses: true,
+			promptCache: { mode: "explicit" as const },
+			fetch: fetchMock,
+		};
+		const oldestUser = { role: "user" as const, content: "Oldest stable question", timestamp: 1000 };
+		const firstUser = { role: "user" as const, content: "First question", timestamp: 1001 };
+		const firstResponse = await streamOpenAIResponses(
+			explicitPromptCacheModel,
+			{ messages: [oldestUser, firstUser] },
+			options,
+		).result();
+		const secondResponse = await streamOpenAIResponses(
+			explicitPromptCacheModel,
+			{
+				messages: [
+					oldestUser,
+					firstUser,
+					firstResponse,
+					{ role: "user", content: "Second question", timestamp: 1002 },
+				],
+			},
+			options,
+		).result();
+
+		expect(secondResponse.stopReason).toBe("stop");
+		expect(sentRequests[0]?.input).toEqual([
+			{
+				role: "user",
+				content: [
+					{
+						type: "input_text",
+						text: "Oldest stable question",
+						prompt_cache_breakpoint: { mode: "explicit" },
+					},
+				],
+			},
+			{ role: "user", content: [{ type: "input_text", text: "First question" }] },
+		]);
+		expect(sentRequests[1]?.previous_response_id).toBe("resp_1");
+		expect(sentRequests[1]?.input).toEqual([
+			{ role: "user", content: [{ type: "input_text", text: "Second question" }] },
+		]);
+	});
+
 	it("chains turns without appending an extra no-reasoning developer item", async () => {
 		const sentRequests: Array<Record<string, unknown>> = [];
 		const fetchMock = createCapturingFetch(sentRequests);
