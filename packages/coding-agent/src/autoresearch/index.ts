@@ -898,13 +898,27 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 				contributionStartSessionKey = startSessionKey;
 				contributionStartTransaction = startTransaction;
 				contributionStartTransactions.set(startSessionKey, startTransaction);
-				assertContributionStartFresh(ctx, runtime, startSessionKey, startTransaction, startContribution, startState);
+				assertContributionStartFresh(
+					ctx,
+					runtime,
+					startSessionKey,
+					startTransaction,
+					startContribution,
+					startState,
+				);
 				const finalConfirmed = await ctx.ui.confirm(
 					"Start exact upstream contribution session?",
 					`Goal: ${goal.title}\nOfficial main commit/base: ${goal.commitSha}\nGoal blob: ${goal.blobSha}\nGoal SHA-256: ${goal.sha256}\nModel: ${selectedModel.provider}/${selectedModel.id}\nConfirmed fork: ${selectedRemote.name} (${selectedRemote.url})\nFresh local candidate branch: ${branchName}\n\nThis native OMP session continues indefinitely until /contribute off, an input/review gate, interruption, or session exit. It consumes model tokens, runs tests/commands under normal approval policy, and may create commits on the candidate branch. /contribute review requires another exact approval before an absent candidate branch is pushed to this fork; it never opens a pull request.\n\nOn confirmation only: recheck the official base and fork, switch model, create this exact branch from the frozen base commit, activate the existing autoresearch tools, then start the turn. Global approval policy is unchanged.`,
 				);
 				if (!finalConfirmed) return;
-				assertContributionStartFresh(ctx, runtime, startSessionKey, startTransaction, startContribution, startState);
+				assertContributionStartFresh(
+					ctx,
+					runtime,
+					startSessionKey,
+					startTransaction,
+					startContribution,
+					startState,
+				);
 
 				const recheckedGoal = await fetchOfficialContributionGoal(ctx.cwd);
 				assertContributionGoalUnchanged(goal, recheckedGoal);
@@ -942,31 +956,80 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 				let branchCreated = false;
 				let toolsTouched = false;
 				try {
-					assertContributionStartFresh(ctx, runtime, startSessionKey, startTransaction, startContribution, startState);
+					assertContributionStartFresh(
+						ctx,
+						runtime,
+						startSessionKey,
+						startTransaction,
+						startContribution,
+						startState,
+					);
 					startTransaction.phase = "activating";
 					modelChanged = true;
 					const modelAccepted = await api.setModel(selectedModel);
-					assertContributionStartFresh(ctx, runtime, startSessionKey, startTransaction, startContribution, startState);
+					assertContributionStartFresh(
+						ctx,
+						runtime,
+						startSessionKey,
+						startTransaction,
+						startContribution,
+						startState,
+					);
 					if (!modelAccepted) {
 						throw new Error(`Authenticated model switch failed: ${selectedModel.provider}/${selectedModel.id}`);
 					}
-					assertContributionStartFresh(ctx, runtime, startSessionKey, startTransaction, startContribution, startState);
+					assertContributionStartFresh(
+						ctx,
+						runtime,
+						startSessionKey,
+						startTransaction,
+						startContribution,
+						startState,
+					);
 					await git.branch.checkoutNewAt(ctx.cwd, branchName, frozenBaseProof.baseSha);
 					branchCreated = true;
-					assertContributionStartFresh(ctx, runtime, startSessionKey, startTransaction, startContribution, startState);
+					assertContributionStartFresh(
+						ctx,
+						runtime,
+						startSessionKey,
+						startTransaction,
+						startContribution,
+						startState,
+					);
 					await verifyContributionBase(ctx.cwd, goal);
 					if ((await git.branch.current(ctx.cwd)) !== branchName) {
 						throw new Error("Contribution checkout did not land on the frozen candidate branch.");
 					}
-					assertContributionStartFresh(ctx, runtime, startSessionKey, startTransaction, startContribution, startState);
+					assertContributionStartFresh(
+						ctx,
+						runtime,
+						startSessionKey,
+						startTransaction,
+						startContribution,
+						startState,
+					);
 					toolsTouched = true;
 					await api.setActiveTools([...new Set([...previousTools, ...EXPERIMENT_TOOL_NAMES])]);
-					assertContributionStartFresh(ctx, runtime, startSessionKey, startTransaction, startContribution, startState);
+					assertContributionStartFresh(
+						ctx,
+						runtime,
+						startSessionKey,
+						startTransaction,
+						startContribution,
+						startState,
+					);
 					await verifyContributionBase(ctx.cwd, goal);
 					if ((await git.branch.current(ctx.cwd)) !== branchName) {
 						throw new Error("Contribution checkout changed during tool activation.");
 					}
-					assertContributionStartFresh(ctx, runtime, startSessionKey, startTransaction, startContribution, startState);
+					assertContributionStartFresh(
+						ctx,
+						runtime,
+						startSessionKey,
+						startTransaction,
+						startContribution,
+						startState,
+					);
 					const contribution: ContributionRunningState = {
 						status: "running",
 						authorization: Symbol("contribution-authorization"),
@@ -1038,9 +1101,7 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 				ctx.ui.notify(`Contribution preflight failed: ${describeContributionError(error)}`, "error");
 			} finally {
 				if (contributionStartSessionKey !== null && contributionStartTransaction !== null) {
-					if (
-						contributionStartTransactions.get(contributionStartSessionKey) === contributionStartTransaction
-					) {
+					if (contributionStartTransactions.get(contributionStartSessionKey) === contributionStartTransaction) {
 						contributionStartTransactions.delete(contributionStartSessionKey);
 					}
 					contributionStartTransaction.settlement.resolve();

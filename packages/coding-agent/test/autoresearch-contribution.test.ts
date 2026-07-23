@@ -51,10 +51,10 @@ import type {
 	SessionBeforeSwitchEvent,
 	SessionBeforeTreeEvent,
 	SessionBranchEvent,
-	SessionSwitchEvent,
-	SessionTreeEvent,
 	SessionShutdownEvent,
 	SessionStartEvent,
+	SessionSwitchEvent,
+	SessionTreeEvent,
 	ToolDefinition,
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import * as git from "@oh-my-pi/pi-coding-agent/utils/git";
