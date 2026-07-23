@@ -266,67 +266,67 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 		const activationSettlement = invalidateContributionOperations(sessionKey);
 		if (activationSettlement) await activationSettlement;
 		try {
-		const runtime = getRuntime(ctx);
-		const control = reconstructControlState(ctx.sessionManager.getBranch());
-		const contributionRunning = runtime.contribution.status === "running";
-		if (!contributionRunning) runtime.goal = control.goal;
-		runtime.autoResumeArmed = false;
-		runtime.lastAutoResumePendingRunNumber = null;
+			const runtime = getRuntime(ctx);
+			const control = reconstructControlState(ctx.sessionManager.getBranch());
+			const contributionRunning = runtime.contribution.status === "running";
+			if (!contributionRunning) runtime.goal = control.goal;
+			runtime.autoResumeArmed = false;
+			runtime.lastAutoResumePendingRunNumber = null;
 
-		// Skip storage entirely if autoresearch was never activated in this conversation.
-		// This is the common case: every project gets a session_start event but most
-		// never touch autoresearch, so we must not create a SQLite file just to look.
-		const everActivated = control.lastMode !== null || contributionRunning;
-		const { session, currentBranch } = everActivated
-			? await loadActiveSession(ctx)
-			: { session: null, currentBranch: null };
+			// Skip storage entirely if autoresearch was never activated in this conversation.
+			// This is the common case: every project gets a session_start event but most
+			// never touch autoresearch, so we must not create a SQLite file just to look.
+			const everActivated = control.lastMode !== null || contributionRunning;
+			const { session, currentBranch } = everActivated
+				? await loadActiveSession(ctx)
+				: { session: null, currentBranch: null };
 
-		// Mode is effective only when the recorded session matches the current git
-		// branch. When the user switches off the autoresearch branch the widget hides
-		// and the experiment tools detach, but the session entries are preserved so
-		// switching back resumes seamlessly.
-		const onActiveBranch = session === null || session.branch === null || session.branch === currentBranch;
-		const onContributionBranch =
-			!contributionRunning ||
-			runtime.contribution.status !== "running" ||
-			runtime.contribution.branch === currentBranch;
-		runtime.autoresearchMode = contributionRunning
-			? onActiveBranch && onContributionBranch
-			: control.autoresearchMode && onActiveBranch;
+			// Mode is effective only when the recorded session matches the current git
+			// branch. When the user switches off the autoresearch branch the widget hides
+			// and the experiment tools detach, but the session entries are preserved so
+			// switching back resumes seamlessly.
+			const onActiveBranch = session === null || session.branch === null || session.branch === currentBranch;
+			const onContributionBranch =
+				!contributionRunning ||
+				runtime.contribution.status !== "running" ||
+				runtime.contribution.branch === currentBranch;
+			runtime.autoresearchMode = contributionRunning
+				? onActiveBranch && onContributionBranch
+				: control.autoresearchMode && onActiveBranch;
 
-		if (session && onActiveBranch) {
-			const storage = await openAutoresearchStorageIfExists(ctx.cwd);
-			if (storage) {
-				const loggedRuns = storage.listLoggedRuns(session.id);
-				runtime.state = buildExperimentState(session, loggedRuns);
-				runtime.goal = runtime.goal ?? session.goal;
-				runtime.lastRunSummary = pendingRunSummaryFromRow(storage.getPendingRun(session.id));
+			if (session && onActiveBranch) {
+				const storage = await openAutoresearchStorageIfExists(ctx.cwd);
+				if (storage) {
+					const loggedRuns = storage.listLoggedRuns(session.id);
+					runtime.state = buildExperimentState(session, loggedRuns);
+					runtime.goal = runtime.goal ?? session.goal;
+					runtime.lastRunSummary = pendingRunSummaryFromRow(storage.getPendingRun(session.id));
+				} else {
+					runtime.state = createExperimentState();
+					runtime.lastRunSummary = null;
+				}
 			} else {
 				runtime.state = createExperimentState();
 				runtime.lastRunSummary = null;
 			}
-		} else {
-			runtime.state = createExperimentState();
-			runtime.lastRunSummary = null;
-		}
-		runtime.lastRunDuration = runtime.lastRunSummary?.durationSeconds ?? null;
-		runtime.lastRunAsi = runtime.lastRunSummary?.parsedAsi ?? null;
-		runtime.lastRunArtifactDir = runtime.lastRunSummary?.runDirectory ?? null;
-		runtime.lastRunNumber = runtime.lastRunSummary?.runNumber ?? null;
-		runtime.runningExperiment = null;
-		dashboard.updateWidget(ctx, runtime);
+			runtime.lastRunDuration = runtime.lastRunSummary?.durationSeconds ?? null;
+			runtime.lastRunAsi = runtime.lastRunSummary?.parsedAsi ?? null;
+			runtime.lastRunArtifactDir = runtime.lastRunSummary?.runDirectory ?? null;
+			runtime.lastRunNumber = runtime.lastRunSummary?.runNumber ?? null;
+			runtime.runningExperiment = null;
+			dashboard.updateWidget(ctx, runtime);
 
-		const activeTools = api.getActiveTools();
-		const experimentTools = new Set(EXPERIMENT_TOOL_NAMES);
-		const nextActiveTools = runtime.autoresearchMode
-			? [...new Set([...activeTools, ...EXPERIMENT_TOOL_NAMES])]
-			: activeTools.filter(name => !experimentTools.has(name));
-		const toolsChanged =
-			nextActiveTools.length !== activeTools.length ||
-			nextActiveTools.some((name, index) => name !== activeTools[index]);
-		if (toolsChanged) {
-			await api.setActiveTools(nextActiveTools);
-		}
+			const activeTools = api.getActiveTools();
+			const experimentTools = new Set(EXPERIMENT_TOOL_NAMES);
+			const nextActiveTools = runtime.autoresearchMode
+				? [...new Set([...activeTools, ...EXPERIMENT_TOOL_NAMES])]
+				: activeTools.filter(name => !experimentTools.has(name));
+			const toolsChanged =
+				nextActiveTools.length !== activeTools.length ||
+				nextActiveTools.some((name, index) => name !== activeTools[index]);
+			if (toolsChanged) {
+				await api.setActiveTools(nextActiveTools);
+			}
 		} finally {
 			closedMutationAdmission.delete(sessionKey);
 		}

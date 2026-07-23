@@ -803,9 +803,7 @@ describe("contribution fork validation and publication", () => {
 				git: publicationGit,
 				request: async () => ({ fork: true, parent: "can1357/oh-my-pi", source: "can1357/oh-my-pi" }),
 			});
-			const remoteSha = (
-				await $`git --git-dir ${remote.path()} rev-parse refs/heads/${CONTRIBUTION_BRANCH}`.quiet()
-			)
+			const remoteSha = (await $`git --git-dir ${remote.path()} rev-parse refs/heads/${CONTRIBUTION_BRANCH}`.quiet())
 				.text()
 				.trim();
 
@@ -2169,7 +2167,6 @@ describe("process-local contribution lifecycle", () => {
 		expect(harness.activeTools).toEqual(["read", "bash"]);
 	});
 
-
 	for (const invalidation of ["off", "session switch"] as const) {
 		it(`drains a successful publication into its immutable handoff during ${invalidation}`, async () => {
 			const harness = createIntegrationHarness(cwd.path(), { confirmAnswers: [true, true, true] });
@@ -2232,9 +2229,9 @@ describe("process-local contribution lifecycle", () => {
 						notification.message.startsWith("Contribution candidate was pushed; review handoff preserved."),
 					),
 				).toBe(true);
-				expect(harness.notifications.some(notification => notification.message === "Contribution mode stopped.")).toBe(
-					false,
-				);
+				expect(
+					harness.notifications.some(notification => notification.message === "Contribution mode stopped."),
+				).toBe(false);
 			}
 			await commandRequired(harness, "contribute").handler("status", harness.ctx);
 			expect(harness.notifications.at(-1)?.message).toStartWith("Contribution review ready:");

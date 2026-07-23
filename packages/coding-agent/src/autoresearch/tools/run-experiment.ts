@@ -61,187 +61,187 @@ export function createRunExperimentTool(
 			const operationSignal = mutation.signal;
 			try {
 				await mutation.authorizeMutation();
-			const storage = await openAutoresearchStorageIfExists(ctx.cwd);
-			const currentBranch = (await git.branch.current(ctx.cwd, operationSignal)) ?? null;
-			await mutation.authorizeMutation();
-			const session = storage?.getActiveSessionForBranch(currentBranch) ?? null;
-			if (!storage || !session) {
+				const storage = await openAutoresearchStorageIfExists(ctx.cwd);
+				const currentBranch = (await git.branch.current(ctx.cwd, operationSignal)) ?? null;
+				await mutation.authorizeMutation();
+				const session = storage?.getActiveSessionForBranch(currentBranch) ?? null;
+				if (!storage || !session) {
+					return {
+						content: [
+							{
+								type: "text",
+								text: "Error: no active autoresearch session for the current branch. Call init_experiment first.",
+							},
+						],
+					};
+				}
+
+				const runtime = options.getRuntime(ctx);
+
+				const abandonedPriorRun = (() => {
+					const pending = storage.getPendingRun(session.id);
+					if (!pending) return null;
+					storage.abandonPendingRuns(session.id);
+					return pending.id;
+				})();
+
+				const resolvedCommand = DEFAULT_HARNESS_COMMAND;
+				const preRunStatus = await tryGitStatus(ctx.cwd, operationSignal);
+				const workDirPrefix = await tryGitPrefix(ctx.cwd, operationSignal);
+				const preRunDirtyPaths = parseWorkDirDirtyPaths(preRunStatus, workDirPrefix);
+				await mutation.authorizeMutation();
+
+				const startedAt = Date.now();
+				const insertedRun = storage.insertRun({
+					sessionId: session.id,
+					segment: session.currentSegment,
+					command: resolvedCommand,
+					logPath: "", // patched after we know the run id
+					preRunDirtyPaths,
+					startedAt,
+				});
+
+				const runDirectory = path.join(storage.projectDir, "runs", String(insertedRun.id).padStart(4, "0"));
+				const benchmarkLogPath = path.join(runDirectory, "benchmark.log");
+				fs.mkdirSync(runDirectory, { recursive: true });
+				storage.updateRunLogPath(insertedRun.id, benchmarkLogPath);
+
+				runtime.lastRunDuration = null;
+				runtime.lastRunAsi = null;
+				runtime.lastRunArtifactDir = runDirectory;
+				runtime.lastRunNumber = insertedRun.id;
+				runtime.lastRunSummary = null;
+				runtime.runningExperiment = {
+					startedAt,
+					command: resolvedCommand,
+					runDirectory,
+					runNumber: insertedRun.id,
+				};
+				options.dashboard.updateWidget(ctx, runtime);
+				options.dashboard.requestRender();
+
+				const timeoutMs = Math.max(0, Math.floor((params.timeout_seconds ?? 600) * 1000));
+				let execution: ProcessExecutionResult;
+				try {
+					execution = await executeProcess({
+						command: resolvedCommand,
+						cwd: ctx.cwd,
+						logPath: benchmarkLogPath,
+						timeoutMs,
+						signal: operationSignal,
+						onProgress: details => {
+							onUpdate?.({
+								content: [{ type: "text", text: details.tailOutput }],
+								details: {
+									phase: "running",
+									elapsed: details.elapsed,
+									truncation: details.truncation,
+									fullOutputPath: details.fullOutputPath,
+									runDirectory: details.runDirectory,
+								},
+							});
+						},
+					});
+				} finally {
+					runtime.runningExperiment = null;
+					options.dashboard.updateWidget(ctx, runtime);
+					options.dashboard.requestRender();
+				}
+				await mutation.authorizeMutation();
+
+				const completedAt = Date.now();
+				const durationMs = completedAt - startedAt;
+				const durationSeconds = durationMs / 1000;
+				runtime.lastRunDuration = durationSeconds;
+
+				const llmTruncation = truncateTail(execution.output, {
+					maxBytes: EXPERIMENT_MAX_BYTES,
+					maxLines: EXPERIMENT_MAX_LINES,
+				});
+				const displayTruncation = truncateTail(execution.output, {
+					maxBytes: DEFAULT_MAX_BYTES,
+					maxLines: DEFAULT_MAX_LINES,
+				});
+
+				const parsedMetricsMap = parseMetricLines(execution.output);
+				const parsedMetrics = parsedMetricsMap.size > 0 ? Object.fromEntries(parsedMetricsMap.entries()) : null;
+				const parsedPrimary = parsedMetricsMap.get(session.primaryMetric) ?? null;
+				const parsedAsi = parseAsiLines(execution.output);
+				runtime.lastRunAsi = parsedAsi;
+
+				storage.markRunCompleted({
+					runId: insertedRun.id,
+					completedAt,
+					durationMs,
+					exitCode: execution.exitCode,
+					timedOut: execution.killed,
+					parsedPrimary,
+					parsedMetrics,
+					parsedAsi,
+				});
+
+				const passed = execution.exitCode === 0 && !execution.killed;
+				const resultDetails: RunDetails = {
+					runNumber: insertedRun.id,
+					runDirectory,
+					benchmarkLogPath,
+					command: resolvedCommand,
+					exitCode: execution.exitCode,
+					durationSeconds,
+					passed,
+					crashed: execution.exitCode !== 0 || execution.killed,
+					timedOut: execution.killed,
+					tailOutput: displayTruncation.content,
+					parsedMetrics,
+					parsedPrimary,
+					parsedAsi,
+					metricName: session.primaryMetric,
+					metricUnit: session.metricUnit,
+					preRunDirtyPaths,
+					abandonedPriorRun,
+					truncation: llmTruncation.truncated ? llmTruncation : undefined,
+					fullOutputPath: execution.logPath,
+				};
+
+				runtime.lastRunSummary = {
+					command: resolvedCommand,
+					durationSeconds,
+					parsedAsi,
+					parsedMetrics,
+					parsedPrimary,
+					passed,
+					preRunDirtyPaths,
+					runDirectory,
+					runNumber: insertedRun.id,
+					exitCode: execution.exitCode,
+					timedOut: execution.killed,
+				};
+				runtime.autoResumeArmed = true;
+				runtime.lastAutoResumePendingRunNumber = null;
+
+				// Refresh state to reflect any prior abandonment changes (logged set unchanged).
+				const refreshedSession = storage.getSessionById(session.id);
+				if (refreshedSession) {
+					runtime.state = buildExperimentState(refreshedSession, storage.listLoggedRuns(session.id));
+				}
+				options.dashboard.updateWidget(ctx, runtime);
+				options.dashboard.requestRender();
+
+				const headerLines: string[] = [];
+				if (abandonedPriorRun !== null) {
+					headerLines.push(`Note: abandoned prior pending run #${abandonedPriorRun} before starting this run.`);
+				}
+				const warningPrefix = headerLines.length > 0 ? `${headerLines.join("\n")}\n\n` : "";
+
 				return {
 					content: [
 						{
 							type: "text",
-							text: "Error: no active autoresearch session for the current branch. Call init_experiment first.",
+							text: warningPrefix + buildRunText(resultDetails, llmTruncation.content, runtime.state.bestMetric),
 						},
 					],
+					details: resultDetails,
 				};
-			}
-
-			const runtime = options.getRuntime(ctx);
-
-			const abandonedPriorRun = (() => {
-				const pending = storage.getPendingRun(session.id);
-				if (!pending) return null;
-				storage.abandonPendingRuns(session.id);
-				return pending.id;
-			})();
-
-			const resolvedCommand = DEFAULT_HARNESS_COMMAND;
-			const preRunStatus = await tryGitStatus(ctx.cwd, operationSignal);
-			const workDirPrefix = await tryGitPrefix(ctx.cwd, operationSignal);
-			const preRunDirtyPaths = parseWorkDirDirtyPaths(preRunStatus, workDirPrefix);
-			await mutation.authorizeMutation();
-
-			const startedAt = Date.now();
-			const insertedRun = storage.insertRun({
-				sessionId: session.id,
-				segment: session.currentSegment,
-				command: resolvedCommand,
-				logPath: "", // patched after we know the run id
-				preRunDirtyPaths,
-				startedAt,
-			});
-
-			const runDirectory = path.join(storage.projectDir, "runs", String(insertedRun.id).padStart(4, "0"));
-			const benchmarkLogPath = path.join(runDirectory, "benchmark.log");
-			fs.mkdirSync(runDirectory, { recursive: true });
-			storage.updateRunLogPath(insertedRun.id, benchmarkLogPath);
-
-			runtime.lastRunDuration = null;
-			runtime.lastRunAsi = null;
-			runtime.lastRunArtifactDir = runDirectory;
-			runtime.lastRunNumber = insertedRun.id;
-			runtime.lastRunSummary = null;
-			runtime.runningExperiment = {
-				startedAt,
-				command: resolvedCommand,
-				runDirectory,
-				runNumber: insertedRun.id,
-			};
-			options.dashboard.updateWidget(ctx, runtime);
-			options.dashboard.requestRender();
-
-			const timeoutMs = Math.max(0, Math.floor((params.timeout_seconds ?? 600) * 1000));
-			let execution: ProcessExecutionResult;
-			try {
-				execution = await executeProcess({
-					command: resolvedCommand,
-					cwd: ctx.cwd,
-					logPath: benchmarkLogPath,
-					timeoutMs,
-					signal: operationSignal,
-					onProgress: details => {
-						onUpdate?.({
-							content: [{ type: "text", text: details.tailOutput }],
-							details: {
-								phase: "running",
-								elapsed: details.elapsed,
-								truncation: details.truncation,
-								fullOutputPath: details.fullOutputPath,
-								runDirectory: details.runDirectory,
-							},
-						});
-					},
-				});
-			} finally {
-				runtime.runningExperiment = null;
-				options.dashboard.updateWidget(ctx, runtime);
-				options.dashboard.requestRender();
-			}
-			await mutation.authorizeMutation();
-
-			const completedAt = Date.now();
-			const durationMs = completedAt - startedAt;
-			const durationSeconds = durationMs / 1000;
-			runtime.lastRunDuration = durationSeconds;
-
-			const llmTruncation = truncateTail(execution.output, {
-				maxBytes: EXPERIMENT_MAX_BYTES,
-				maxLines: EXPERIMENT_MAX_LINES,
-			});
-			const displayTruncation = truncateTail(execution.output, {
-				maxBytes: DEFAULT_MAX_BYTES,
-				maxLines: DEFAULT_MAX_LINES,
-			});
-
-			const parsedMetricsMap = parseMetricLines(execution.output);
-			const parsedMetrics = parsedMetricsMap.size > 0 ? Object.fromEntries(parsedMetricsMap.entries()) : null;
-			const parsedPrimary = parsedMetricsMap.get(session.primaryMetric) ?? null;
-			const parsedAsi = parseAsiLines(execution.output);
-			runtime.lastRunAsi = parsedAsi;
-
-			storage.markRunCompleted({
-				runId: insertedRun.id,
-				completedAt,
-				durationMs,
-				exitCode: execution.exitCode,
-				timedOut: execution.killed,
-				parsedPrimary,
-				parsedMetrics,
-				parsedAsi,
-			});
-
-			const passed = execution.exitCode === 0 && !execution.killed;
-			const resultDetails: RunDetails = {
-				runNumber: insertedRun.id,
-				runDirectory,
-				benchmarkLogPath,
-				command: resolvedCommand,
-				exitCode: execution.exitCode,
-				durationSeconds,
-				passed,
-				crashed: execution.exitCode !== 0 || execution.killed,
-				timedOut: execution.killed,
-				tailOutput: displayTruncation.content,
-				parsedMetrics,
-				parsedPrimary,
-				parsedAsi,
-				metricName: session.primaryMetric,
-				metricUnit: session.metricUnit,
-				preRunDirtyPaths,
-				abandonedPriorRun,
-				truncation: llmTruncation.truncated ? llmTruncation : undefined,
-				fullOutputPath: execution.logPath,
-			};
-
-			runtime.lastRunSummary = {
-				command: resolvedCommand,
-				durationSeconds,
-				parsedAsi,
-				parsedMetrics,
-				parsedPrimary,
-				passed,
-				preRunDirtyPaths,
-				runDirectory,
-				runNumber: insertedRun.id,
-				exitCode: execution.exitCode,
-				timedOut: execution.killed,
-			};
-			runtime.autoResumeArmed = true;
-			runtime.lastAutoResumePendingRunNumber = null;
-
-			// Refresh state to reflect any prior abandonment changes (logged set unchanged).
-			const refreshedSession = storage.getSessionById(session.id);
-			if (refreshedSession) {
-				runtime.state = buildExperimentState(refreshedSession, storage.listLoggedRuns(session.id));
-			}
-			options.dashboard.updateWidget(ctx, runtime);
-			options.dashboard.requestRender();
-
-			const headerLines: string[] = [];
-			if (abandonedPriorRun !== null) {
-				headerLines.push(`Note: abandoned prior pending run #${abandonedPriorRun} before starting this run.`);
-			}
-			const warningPrefix = headerLines.length > 0 ? `${headerLines.join("\n")}\n\n` : "";
-
-			return {
-				content: [
-					{
-						type: "text",
-						text: warningPrefix + buildRunText(resultDetails, llmTruncation.content, runtime.state.bestMetric),
-					},
-				],
-				details: resultDetails,
-			};
 			} finally {
 				mutation.settle();
 			}

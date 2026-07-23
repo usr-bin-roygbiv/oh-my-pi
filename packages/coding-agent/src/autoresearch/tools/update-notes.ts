@@ -32,48 +32,48 @@ export function createUpdateNotesTool(
 			const mutation = beginAutoresearchMutation(options, ctx, signal);
 			try {
 				await mutation.authorizeMutation();
-			const storage = await openAutoresearchStorageIfExists(ctx.cwd);
-			const currentBranch = (await git.branch.current(ctx.cwd, mutation.signal)) ?? null;
-			await mutation.authorizeMutation();
-			const session = storage?.getActiveSessionForBranch(currentBranch) ?? null;
-			if (!storage || !session) {
+				const storage = await openAutoresearchStorageIfExists(ctx.cwd);
+				const currentBranch = (await git.branch.current(ctx.cwd, mutation.signal)) ?? null;
+				await mutation.authorizeMutation();
+				const session = storage?.getActiveSessionForBranch(currentBranch) ?? null;
+				if (!storage || !session) {
+					return {
+						content: [
+							{
+								type: "text",
+								text: "Error: no active autoresearch session for the current branch. Call init_experiment first.",
+							},
+						],
+					};
+				}
+
+				const nextNotes =
+					params.append_idea !== undefined && params.append_idea.trim().length > 0
+						? appendIdea(session.notes, params.append_idea.trim())
+						: params.body;
+
+				mutation.assertRuntimeCurrent();
+				storage.updateSession(session.id, { notes: nextNotes });
+				const refreshed = storage.getSessionById(session.id);
+				const loggedRuns = storage.listLoggedRuns(session.id);
+				const runtime = options.getRuntime(ctx);
+				if (refreshed) {
+					runtime.state = buildExperimentState(refreshed, loggedRuns);
+				}
+				options.dashboard.updateWidget(ctx, runtime);
+
 				return {
 					content: [
 						{
 							type: "text",
-							text: "Error: no active autoresearch session for the current branch. Call init_experiment first.",
+							text:
+								params.append_idea !== undefined
+									? `Appended idea (${nextNotes.length} chars total).`
+									: `Notes updated (${nextNotes.length} chars).`,
 						},
 					],
+					details: { notes: nextNotes },
 				};
-			}
-
-			const nextNotes =
-				params.append_idea !== undefined && params.append_idea.trim().length > 0
-					? appendIdea(session.notes, params.append_idea.trim())
-					: params.body;
-
-			mutation.assertRuntimeCurrent();
-			storage.updateSession(session.id, { notes: nextNotes });
-			const refreshed = storage.getSessionById(session.id);
-			const loggedRuns = storage.listLoggedRuns(session.id);
-			const runtime = options.getRuntime(ctx);
-			if (refreshed) {
-				runtime.state = buildExperimentState(refreshed, loggedRuns);
-			}
-			options.dashboard.updateWidget(ctx, runtime);
-
-			return {
-				content: [
-					{
-						type: "text",
-						text:
-							params.append_idea !== undefined
-								? `Appended idea (${nextNotes.length} chars total).`
-								: `Notes updated (${nextNotes.length} chars).`,
-					},
-				],
-				details: { notes: nextNotes },
-			};
 			} finally {
 				mutation.settle();
 			}

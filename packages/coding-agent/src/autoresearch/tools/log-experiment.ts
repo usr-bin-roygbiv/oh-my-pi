@@ -68,229 +68,229 @@ export function createLogExperimentTool(
 			const mutation = beginAutoresearchMutation(options, ctx, signal);
 			try {
 				await mutation.authorizeMutation();
-			const storage = await openAutoresearchStorageIfExists(ctx.cwd);
-			const currentBranch = (await git.branch.current(ctx.cwd, mutation.signal)) ?? null;
-			await mutation.authorizeMutation();
-			const session = storage?.getActiveSessionForBranch(currentBranch) ?? null;
-			if (!storage || !session) {
-				return {
-					content: [
-						{
-							type: "text",
-							text: "Error: no active autoresearch session for the current branch. Call init_experiment first.",
-						},
-					],
-				};
-			}
-			const pendingRun = storage.getPendingRun(session.id);
-			if (!pendingRun) {
-				return {
-					content: [{ type: "text", text: "Error: no pending run available. Run run_experiment first." }],
-				};
-			}
-
-			const runtime = options.getRuntime(ctx);
-
-			const flaggedRuns: LogDetails["flaggedRuns"] = [];
-			const onAutoresearchBranch = currentBranch?.startsWith("autoresearch/") ?? false;
-
-			let allModified: string[];
-			if (onAutoresearchBranch) {
-				// On a dedicated autoresearch branch every iteration starts from a clean
-				// worktree (init_experiment baseline + previous keep commit / discard reset),
-				// so any currently-dirty path is the agent's iteration change. Off-branch we
-				// can't tell user dirt apart from agent edits, so we keep the (lossy)
-				// preRunDirtyPaths filter.
-				const statusText = await tryGitStatus(ctx.cwd, mutation.signal);
-				const workDirPrefix = await tryGitPrefix(ctx.cwd, mutation.signal);
-				allModified = parseWorkDirDirtyPaths(statusText, workDirPrefix);
-			} else {
-				const { modifiedTracked, modifiedUntracked } = await detectModifiedPaths(
-					ctx.cwd,
-					pendingRun.preRunDirtyPaths,
-					mutation.signal,
-				);
-				allModified = [...modifiedTracked, ...modifiedUntracked];
-			}
-			await mutation.authorizeMutation();
-			const scopeDeviations = computeScopeDeviations(allModified, session);
-
-			const justification = params.justification?.trim() || null;
-			const warnings: string[] = [];
-
-			const headSha = await tryReadHeadSha(ctx.cwd, mutation.signal);
-			await mutation.authorizeMutation();
-			const explicitCommit = params.commit?.trim();
-			let commitHash = explicitCommit && explicitCommit.length > 0 ? explicitCommit : headSha;
-
-			let gitNote: string | null = null;
-			if (params.status === "keep") {
-				if (onAutoresearchBranch && allModified.length > 0) {
-					const commitResult = await commitKeptExperiment(
-						ctx.cwd,
-						params.description,
-						params.status,
-						params.metric,
-						params.metrics ?? {},
-						allModified,
-						session.primaryMetric,
-						mutation.signal,
-					);
-					if (commitResult.error) {
-						return {
-							content: [{ type: "text", text: `Error: ${commitResult.error}` }],
-						};
-					}
-					gitNote = commitResult.note ?? null;
-					const newSha = await tryReadHeadSha(ctx.cwd, mutation.signal);
-					await mutation.authorizeMutation();
-					if (newSha) commitHash = newSha;
-				} else if (!onAutoresearchBranch) {
-					warnings.push(
-						"Auto-commit skipped: not on a dedicated autoresearch branch. Modified files remain in the worktree.",
-					);
-				} else if (allModified.length === 0) {
-					gitNote = "nothing to commit";
-				}
-				if (scopeDeviations.length > 0) {
-					if (justification === null) {
-						warnings.push(
-							`Kept with unjustified scope deviations: ${scopeDeviations.join(", ")}. Pass \`justification\` next time or \`flag_runs\` this entry on a future log_experiment if it was a mistake.`,
-						);
-					} else {
-						warnings.push(`Kept with scope deviations (justified): ${scopeDeviations.join(", ")}`);
-					}
-				}
-			} else {
-				const revertResult = await revertFailedExperiment(
-					ctx.cwd,
-					pendingRun.preRunDirtyPaths,
-					onAutoresearchBranch,
-					mutation.signal,
-				);
-				if (revertResult.error) {
+				const storage = await openAutoresearchStorageIfExists(ctx.cwd);
+				const currentBranch = (await git.branch.current(ctx.cwd, mutation.signal)) ?? null;
+				await mutation.authorizeMutation();
+				const session = storage?.getActiveSessionForBranch(currentBranch) ?? null;
+				if (!storage || !session) {
 					return {
-						content: [{ type: "text", text: `Error: ${revertResult.error}` }],
+						content: [
+							{
+								type: "text",
+								text: "Error: no active autoresearch session for the current branch. Call init_experiment first.",
+							},
+						],
 					};
 				}
-				gitNote = revertResult.note ?? null;
-			}
-			await mutation.authorizeMutation();
-			for (const flag of params.flag_runs ?? []) {
-				const target = storage.getRunById(flag.run_id);
-				if (!target || target.sessionId !== session.id) continue;
-				storage.flagRun(flag.run_id, flag.reason);
-				flaggedRuns.push({ runId: flag.run_id, reason: flag.reason });
-			}
-			mutation.assertRuntimeCurrent();
+				const pendingRun = storage.getPendingRun(session.id);
+				if (!pendingRun) {
+					return {
+						content: [{ type: "text", text: "Error: no pending run available. Run run_experiment first." }],
+					};
+				}
 
-			const metric = params.metric;
-			const secondaryMetrics: NumericMetricMap = mergeMetrics(
-				pendingRun.parsedMetrics,
-				params.metrics,
-				session.primaryMetric,
-			);
-			const asi: ASIData | undefined = mergeAsi(pendingRun.parsedAsi, sanitizeAsi(params.asi));
+				const runtime = options.getRuntime(ctx);
 
-			if (pendingRun.parsedPrimary !== null && metric !== pendingRun.parsedPrimary) {
-				warnings.push(
-					`Logged metric ${metric} differs from parsed primary ${pendingRun.parsedPrimary}. Both values stored.`,
+				const flaggedRuns: LogDetails["flaggedRuns"] = [];
+				const onAutoresearchBranch = currentBranch?.startsWith("autoresearch/") ?? false;
+
+				let allModified: string[];
+				if (onAutoresearchBranch) {
+					// On a dedicated autoresearch branch every iteration starts from a clean
+					// worktree (init_experiment baseline + previous keep commit / discard reset),
+					// so any currently-dirty path is the agent's iteration change. Off-branch we
+					// can't tell user dirt apart from agent edits, so we keep the (lossy)
+					// preRunDirtyPaths filter.
+					const statusText = await tryGitStatus(ctx.cwd, mutation.signal);
+					const workDirPrefix = await tryGitPrefix(ctx.cwd, mutation.signal);
+					allModified = parseWorkDirDirtyPaths(statusText, workDirPrefix);
+				} else {
+					const { modifiedTracked, modifiedUntracked } = await detectModifiedPaths(
+						ctx.cwd,
+						pendingRun.preRunDirtyPaths,
+						mutation.signal,
+					);
+					allModified = [...modifiedTracked, ...modifiedUntracked];
+				}
+				await mutation.authorizeMutation();
+				const scopeDeviations = computeScopeDeviations(allModified, session);
+
+				const justification = params.justification?.trim() || null;
+				const warnings: string[] = [];
+
+				const headSha = await tryReadHeadSha(ctx.cwd, mutation.signal);
+				await mutation.authorizeMutation();
+				const explicitCommit = params.commit?.trim();
+				let commitHash = explicitCommit && explicitCommit.length > 0 ? explicitCommit : headSha;
+
+				let gitNote: string | null = null;
+				if (params.status === "keep") {
+					if (onAutoresearchBranch && allModified.length > 0) {
+						const commitResult = await commitKeptExperiment(
+							ctx.cwd,
+							params.description,
+							params.status,
+							params.metric,
+							params.metrics ?? {},
+							allModified,
+							session.primaryMetric,
+							mutation.signal,
+						);
+						if (commitResult.error) {
+							return {
+								content: [{ type: "text", text: `Error: ${commitResult.error}` }],
+							};
+						}
+						gitNote = commitResult.note ?? null;
+						const newSha = await tryReadHeadSha(ctx.cwd, mutation.signal);
+						await mutation.authorizeMutation();
+						if (newSha) commitHash = newSha;
+					} else if (!onAutoresearchBranch) {
+						warnings.push(
+							"Auto-commit skipped: not on a dedicated autoresearch branch. Modified files remain in the worktree.",
+						);
+					} else if (allModified.length === 0) {
+						gitNote = "nothing to commit";
+					}
+					if (scopeDeviations.length > 0) {
+						if (justification === null) {
+							warnings.push(
+								`Kept with unjustified scope deviations: ${scopeDeviations.join(", ")}. Pass \`justification\` next time or \`flag_runs\` this entry on a future log_experiment if it was a mistake.`,
+							);
+						} else {
+							warnings.push(`Kept with scope deviations (justified): ${scopeDeviations.join(", ")}`);
+						}
+					}
+				} else {
+					const revertResult = await revertFailedExperiment(
+						ctx.cwd,
+						pendingRun.preRunDirtyPaths,
+						onAutoresearchBranch,
+						mutation.signal,
+					);
+					if (revertResult.error) {
+						return {
+							content: [{ type: "text", text: `Error: ${revertResult.error}` }],
+						};
+					}
+					gitNote = revertResult.note ?? null;
+				}
+				await mutation.authorizeMutation();
+				for (const flag of params.flag_runs ?? []) {
+					const target = storage.getRunById(flag.run_id);
+					if (!target || target.sessionId !== session.id) continue;
+					storage.flagRun(flag.run_id, flag.reason);
+					flaggedRuns.push({ runId: flag.run_id, reason: flag.reason });
+				}
+				mutation.assertRuntimeCurrent();
+
+				const metric = params.metric;
+				const secondaryMetrics: NumericMetricMap = mergeMetrics(
+					pendingRun.parsedMetrics,
+					params.metrics,
+					session.primaryMetric,
 				);
-			}
+				const asi: ASIData | undefined = mergeAsi(pendingRun.parsedAsi, sanitizeAsi(params.asi));
 
-			const loggedAt = Date.now();
-			const tentativeRun = storage.markRunLogged({
-				runId: pendingRun.id,
-				status: params.status,
-				description: params.description,
-				metric,
-				metrics: secondaryMetrics,
-				asi: asi ?? null,
-				commitHash,
-				confidence: null,
-				modifiedPaths: allModified,
-				scopeDeviations,
-				justification,
-				loggedAt,
-			});
+				if (pendingRun.parsedPrimary !== null && metric !== pendingRun.parsedPrimary) {
+					warnings.push(
+						`Logged metric ${metric} differs from parsed primary ${pendingRun.parsedPrimary}. Both values stored.`,
+					);
+				}
 
-			// Recompute confidence with this run included
-			const refreshedSession = storage.getSessionById(session.id) ?? session;
-			const loggedRuns = storage.listLoggedRuns(session.id);
-			const stateForConfidence = buildExperimentState(refreshedSession, loggedRuns);
-			const confidence = computeConfidence(
-				stateForConfidence.results,
-				stateForConfidence.currentSegment,
-				stateForConfidence.bestDirection,
-			);
-			storage.updateRunConfidence(tentativeRun.id, confidence);
-
-			const finalState = buildExperimentState(refreshedSession, storage.listLoggedRuns(session.id));
-			runtime.state = finalState;
-			runtime.runningExperiment = null;
-			runtime.lastRunSummary = null;
-			runtime.lastRunDuration = null;
-			runtime.lastRunAsi = null;
-			runtime.lastRunArtifactDir = null;
-			runtime.lastRunNumber = null;
-			runtime.autoResumeArmed = true;
-			runtime.lastAutoResumePendingRunNumber = null;
-
-			const experiment: ExperimentResult = {
-				runNumber: tentativeRun.id,
-				commit: (commitHash ?? "").slice(0, 12),
-				metric,
-				metrics: secondaryMetrics,
-				status: params.status,
-				description: params.description,
-				timestamp: loggedAt,
-				segment: pendingRun.segment,
-				confidence,
-				asi,
-				modifiedPaths: allModified,
-				scopeDeviations,
-				justification,
-				flagged: false,
-				flaggedReason: null,
-			};
-
-			const segmentRunCount = currentResults(finalState.results, finalState.currentSegment).length;
-			if (finalState.maxExperiments !== null && segmentRunCount >= finalState.maxExperiments) {
-				runtime.autoresearchMode = false;
-				options.pi.appendEntry(
-					"autoresearch-control",
-					runtime.goal ? { mode: "off", goal: runtime.goal } : { mode: "off" },
-				);
-				await options.pi.setActiveTools(
-					options.pi.getActiveTools().filter(name => !EXPERIMENT_TOOL_NAMES.includes(name)),
-				);
-			}
-
-			options.dashboard.updateWidget(ctx, runtime);
-			options.dashboard.requestRender();
-
-			const wallClockSeconds = pendingRun.durationMs !== null ? pendingRun.durationMs / 1000 : null;
-			const text = buildLogText(
-				finalState,
-				experiment,
-				segmentRunCount,
-				wallClockSeconds,
-				gitNote,
-				warnings,
-				flaggedRuns,
-			);
-
-			return {
-				content: [{ type: "text", text }],
-				details: {
-					experiment,
-					state: finalState,
-					wallClockSeconds,
+				const loggedAt = Date.now();
+				const tentativeRun = storage.markRunLogged({
+					runId: pendingRun.id,
+					status: params.status,
+					description: params.description,
+					metric,
+					metrics: secondaryMetrics,
+					asi: asi ?? null,
+					commitHash,
+					confidence: null,
+					modifiedPaths: allModified,
 					scopeDeviations,
 					justification,
+					loggedAt,
+				});
+
+				// Recompute confidence with this run included
+				const refreshedSession = storage.getSessionById(session.id) ?? session;
+				const loggedRuns = storage.listLoggedRuns(session.id);
+				const stateForConfidence = buildExperimentState(refreshedSession, loggedRuns);
+				const confidence = computeConfidence(
+					stateForConfidence.results,
+					stateForConfidence.currentSegment,
+					stateForConfidence.bestDirection,
+				);
+				storage.updateRunConfidence(tentativeRun.id, confidence);
+
+				const finalState = buildExperimentState(refreshedSession, storage.listLoggedRuns(session.id));
+				runtime.state = finalState;
+				runtime.runningExperiment = null;
+				runtime.lastRunSummary = null;
+				runtime.lastRunDuration = null;
+				runtime.lastRunAsi = null;
+				runtime.lastRunArtifactDir = null;
+				runtime.lastRunNumber = null;
+				runtime.autoResumeArmed = true;
+				runtime.lastAutoResumePendingRunNumber = null;
+
+				const experiment: ExperimentResult = {
+					runNumber: tentativeRun.id,
+					commit: (commitHash ?? "").slice(0, 12),
+					metric,
+					metrics: secondaryMetrics,
+					status: params.status,
+					description: params.description,
+					timestamp: loggedAt,
+					segment: pendingRun.segment,
+					confidence,
+					asi,
+					modifiedPaths: allModified,
+					scopeDeviations,
+					justification,
+					flagged: false,
+					flaggedReason: null,
+				};
+
+				const segmentRunCount = currentResults(finalState.results, finalState.currentSegment).length;
+				if (finalState.maxExperiments !== null && segmentRunCount >= finalState.maxExperiments) {
+					runtime.autoresearchMode = false;
+					options.pi.appendEntry(
+						"autoresearch-control",
+						runtime.goal ? { mode: "off", goal: runtime.goal } : { mode: "off" },
+					);
+					await options.pi.setActiveTools(
+						options.pi.getActiveTools().filter(name => !EXPERIMENT_TOOL_NAMES.includes(name)),
+					);
+				}
+
+				options.dashboard.updateWidget(ctx, runtime);
+				options.dashboard.requestRender();
+
+				const wallClockSeconds = pendingRun.durationMs !== null ? pendingRun.durationMs / 1000 : null;
+				const text = buildLogText(
+					finalState,
+					experiment,
+					segmentRunCount,
+					wallClockSeconds,
+					gitNote,
+					warnings,
 					flaggedRuns,
-				},
-			};
+				);
+
+				return {
+					content: [{ type: "text", text }],
+					details: {
+						experiment,
+						state: finalState,
+						wallClockSeconds,
+						scopeDeviations,
+						justification,
+						flaggedRuns,
+					},
+				};
 			} finally {
 				mutation.settle();
 			}
