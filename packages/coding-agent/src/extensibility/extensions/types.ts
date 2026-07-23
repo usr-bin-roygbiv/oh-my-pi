@@ -92,8 +92,8 @@ import type {
 	SessionStopEvent,
 	SessionStopEventResult,
 	SessionSwitchEvent,
-	SessionTreeEvent,
 	SessionTransitionEndEvent,
+	SessionTreeEvent,
 	TodoReminderEvent,
 	ToolCallEventResult,
 	ToolResultEventResult,
@@ -614,9 +614,9 @@ export type {
 	SessionShutdownEvent,
 	SessionStartEvent,
 	SessionSwitchEvent,
-	SessionTreeEvent,
 	SessionTransitionEndEvent,
 	SessionTransitionKind,
+	SessionTreeEvent,
 	TreePreparation,
 } from "../shared-events";
 

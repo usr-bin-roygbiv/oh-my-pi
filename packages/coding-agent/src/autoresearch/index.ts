@@ -9,8 +9,8 @@ import * as git from "../utils/git";
 import commandResumeTemplate from "./command-resume.md" with { type: "text" };
 import {
 	assertContributionGoalUnchanged,
-	buildContributionPrDraft,
 	buildContributionCompareUrl,
+	buildContributionPrDraft,
 	buildContributionReviewUrl,
 	type ContributionCandidate,
 	ContributionError,

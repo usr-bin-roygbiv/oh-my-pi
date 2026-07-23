@@ -51,11 +51,8 @@ import type {
 	SessionBeforeBranchEvent,
 	SessionBeforeSwitchEvent,
 	SessionBeforeTreeEvent,
-	SessionBranchEvent,
 	SessionShutdownEvent,
 	SessionStartEvent,
-	SessionSwitchEvent,
-	SessionTreeEvent,
 	ToolDefinition,
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import * as git from "@oh-my-pi/pi-coding-agent/utils/git";
@@ -2244,6 +2241,7 @@ describe("process-local contribution lifecycle", () => {
 		const startedTransition = transitionPromise as Promise<void> | null;
 		if (!startedTransition) throw new Error("Expected session transition to start during log reset");
 		const [transitionResult] = await Promise.allSettled([startedTransition]);
+		await commandRequired(harness, "contribute").handler("off", harness.ctx);
 
 		expect(firstLifecycleEvent).toBe("aborted");
 		expect(resetSignal).toBeDefined();
@@ -2348,6 +2346,7 @@ describe("process-local contribution lifecycle", () => {
 		const startedTransition = transitionPromise as Promise<void> | null;
 		if (!startedTransition) throw new Error("Expected session transition to start during notes branch read");
 		const [transitionResult] = await Promise.allSettled([startedTransition]);
+		await commandRequired(harness, "contribute").handler("off", harness.ctx);
 
 		expect(branchSignal).toBeDefined();
 		expect(branchSignal?.aborted).toBe(true);
@@ -2425,7 +2424,7 @@ describe("process-local contribution lifecycle", () => {
 			const planDisplayedBeforeRelease = harness.notifications.some(notification =>
 				notification.message.startsWith("Contribution publication plan (push outcome pending):"),
 			);
-			let transitionResult: { cancel?: boolean } | void;
+			let transitionResult: { cancel?: boolean } | undefined;
 			let transitionSettled = false;
 			const transitionPromise = (
 				transition === "session_before_switch"
@@ -2649,7 +2648,7 @@ describe("process-local contribution lifecycle", () => {
 	for (const invalidation of ["off", "session switch"] as const) {
 		it(`invalidates a confirmed start during final confirmation on ${invalidation} without mutation`, async () => {
 			let harness!: IntegrationHarness;
-			let beforeSwitch: Promise<{ cancel?: boolean } | void> | undefined;
+			let beforeSwitch: Promise<{ cancel?: boolean } | undefined> | undefined;
 			harness = createIntegrationHarness(cwd.path(), {
 				async onConfirm(callNumber): Promise<void> {
 					if (callNumber !== 2) return;
@@ -2710,7 +2709,7 @@ describe("process-local contribution lifecycle", () => {
 		const priorModel = requiredBundledModel("anthropic", "claude-sonnet-4-5");
 		const selectedModel = requiredBundledModel("anthropic", "claude-sonnet-4-6");
 		let harness!: IntegrationHarness;
-		let transitionResult: { cancel?: boolean } | void;
+		let transitionResult: { cancel?: boolean } | undefined;
 		let transitionSettled = false;
 		let transitionPromise: Promise<void> | null = null;
 		harness = createIntegrationHarness(cwd.path(), {
@@ -3363,6 +3362,7 @@ describe("process-local contribution lifecycle", () => {
 		await startContribution(harness);
 		const shutdown = handlerRequired<SessionShutdownEvent>(harness, "session_shutdown");
 		await shutdown({ type: "session_shutdown" } as SessionShutdownEvent, harness.ctx as ExtensionContext);
+		await commandRequired(harness, "contribute").handler("off", harness.ctx);
 		expect(harness.appendEntries).toEqual([]);
 		expect(harness.activeTools).toEqual(["read", "bash"]);
 
