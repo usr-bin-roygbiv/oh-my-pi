@@ -13780,6 +13780,17 @@ export class AgentSession {
 		options: { skipElide: boolean; hasProgress: () => boolean },
 	): Promise<boolean> {
 		if (signal.aborted) return false;
+		// Tier 0 — a snapcompact pass whose just-written frame archive is itself
+		// the over-budget cost (each pass re-renders the carried-forward text
+		// into MORE frames, so the archive grows past the recovery band and the
+		// elide/image tiers below can never shrink it): rebuild the archive at
+		// a threshold-derived frame budget.
+		const frameRescued = await this.#rescueSnapcompactFrameOverflow(
+			this.sessionManager.getBranch(),
+			this.settings.getGroup("compaction"),
+			signal,
+		);
+		if (frameRescued && options.hasProgress()) return true;
 		let elided = 0;
 		let elidedTokens = 0;
 		let elideSink = "placeholders";
@@ -13834,6 +13845,124 @@ export class AgentSession {
 	/** Notice fragment for a dead-end elide tier: what was freed and where it went. */
 	#describeElideRescue(elided: number, tokensFreed: number, sink: string): string {
 		return `elided ${elided} heavy block${elided === 1 ? "" : "s"} (~${tokensFreed.toLocaleString()} tokens) to ${sink}`;
+	}
+
+	/**
+	 * Frame budget for {@link #rescueSnapcompactFrameOverflow}: targets
+	 * `COMPACTION_RECOVERY_BAND × threshold` (the same band
+	 * {@link #compactionCreatedHeadroom} re-tests), not the window-fit budget
+	 * {@link #computeSnapcompactMaxFrames} sizes against — a rebuilt archive
+	 * must land back under the maintenance trigger, or the next settle
+	 * re-enters the same dead-end. Cap reserve mirrors
+	 * #computeSnapcompactMaxFrames (text edges + summary template).
+	 */
+	#computeSnapcompactRescueMaxFrames(settings: CompactionSettings): number {
+		const ctxWindow = this.model?.contextWindow ?? 0;
+		if (ctxWindow <= 0) return Math.min(snapcompact.MAX_FRAMES_DEFAULT, snapcompact.maxFramesForDataBudget());
+		const thresholdTokens = resolveThresholdTokens(ctxWindow, settings);
+		const recoveryBandTokens = Math.floor(thresholdTokens * COMPACTION_RECOVERY_BAND);
+		const baseTokens = computeNonMessageTokens(this);
+		const shape = snapcompact.resolveShape(this.model, this.settings.get("snapcompact.shape"));
+		const edgeCap = snapcompact.geometry(shape).capacity;
+		const textEdgeTokens = Math.ceil((2 * edgeCap * 1.15) / 4);
+		const SUMMARY_TEMPLATE_TOKENS = 2000;
+		const frameBudget = recoveryBandTokens - baseTokens - textEdgeTokens - SUMMARY_TEMPLATE_TOKENS;
+		if (frameBudget < snapcompact.FRAME_TOKEN_ESTIMATE) return 1;
+		return Math.max(1, Math.floor(frameBudget / snapcompact.FRAME_TOKEN_ESTIMATE));
+	}
+
+	/**
+	 * Dead-end rescue for a branch whose latest snapcompact CompactionEntry is
+	 * itself billed past the maintenance threshold
+	 * (`FRAME_TOKEN_ESTIMATE × frames`). Reaching the `!preparation` dead-end
+	 * proves everything after that entry is already kept-recent (nothing to
+	 * summarize), so the archive is the irreducible cost — and the elide/image
+	 * tiers can never touch it: `collectShakeRegions` and `dropImages()` only
+	 * inspect "message"/"custom_message" entries, so a `type: "compaction"`
+	 * entry falls through both and the session re-warns on every resume (the
+	 * shape issue #4786's rescue does not cover).
+	 *
+	 * Rebuilds the SAME archive locally — no LLM, no network — by re-running
+	 * `snapcompact.compact()` over the entry's carried-forward source text at
+	 * a maxFrames derived from the trigger threshold instead of the window:
+	 * `planArchive` truncates the oldest chars to fit, so the rebuilt entry
+	 * genuinely shrinks. The rebuilt entry keeps the stale entry's
+	 * `firstKeptEntryId`, so the kept tail is untouched, and persisting
+	 * through `appendCompaction()` lets the write-time superseded-compaction
+	 * elision drop the stale frame payload from the JSONL automatically.
+	 */
+	async #rescueSnapcompactFrameOverflow(
+		branchEntries: SessionEntry[],
+		settings: CompactionSettings,
+		signal: AbortSignal,
+	): Promise<boolean> {
+		if (signal.aborted) return false;
+		// Re-rendering frames needs a vision-capable model, same gate as the
+		// snapcompact strategy path.
+		if (!this.model?.input.includes("image")) return false;
+		const staleEntry = getLatestCompactionEntry(branchEntries);
+		if (!staleEntry) return false;
+		const archive = snapcompact.getPreservedArchive(staleEntry.preserveData);
+		if (!archive || archive.frames.length <= 1) return false;
+		const archiveText = snapcompact.archiveSourceText(archive);
+		if (!archiveText) return false;
+		const maxFrames = this.#computeSnapcompactRescueMaxFrames(settings);
+		if (maxFrames >= archive.frames.length) return false;
+
+		const staleDetails = staleEntry.details as snapcompact.CompactionDetails | undefined;
+		const fileOps = snapcompact.createFileOps();
+		for (const file of staleDetails?.readFiles ?? []) fileOps.read.add(file);
+		for (const file of staleDetails?.modifiedFiles ?? []) fileOps.edited.add(file);
+		const shapeSetting = this.settings.get("snapcompact.shape");
+		const shape = snapcompact.resolveShapeForText(archiveText, this.model, shapeSetting);
+		let result: snapcompact.CompactionResult;
+		try {
+			result = await snapcompact.compact(
+				{
+					firstKeptEntryId: staleEntry.firstKeptEntryId,
+					messagesToSummarize: [],
+					turnPrefixMessages: [],
+					tokensBefore: staleEntry.tokensBefore,
+					previousSummary: staleEntry.summary,
+					previousPreserveData: staleEntry.preserveData,
+					fileOps,
+				},
+				{
+					convertToLlm,
+					model: this.model,
+					...(shapeSetting === "auto" ? {} : { shape }),
+					maxFrames,
+				},
+			);
+		} catch (error) {
+			logger.warn("Dead-end snapcompact frame rescue failed", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+			return false;
+		}
+		if (signal.aborted) return false;
+		const rebuilt = snapcompact.getPreservedArchive(result.preserveData);
+		if (!rebuilt || rebuilt.frames.length >= archive.frames.length) return false;
+
+		this.sessionManager.appendCompaction(
+			result.summary,
+			result.shortSummary,
+			result.firstKeptEntryId,
+			result.tokensBefore,
+			result.details,
+			false,
+			result.preserveData,
+		);
+		const sessionContext = this.buildDisplaySessionContext();
+		this.agent.replaceMessages(sessionContext.messages);
+		this.#rebasePendingContextSnapshotAfterCompaction();
+		this.#closeCodexProviderSessionsForHistoryRewrite();
+		this.emitNotice(
+			"info",
+			`Compaction dead-end recovery: rebuilt the trailing snapcompact archive at a smaller frame budget (${archive.frames.length} → ${rebuilt.frames.length} frames) so maintenance could make progress.`,
+			"compaction",
+		);
+		return true;
 	}
 
 	/**
@@ -14049,22 +14178,41 @@ export class AgentSession {
 				// strategy pass (it tried and found nothing); skip entirely on the
 				// idle timer (it re-checks usage on its own cadence).
 				let rescueRewroteHistory = false;
+				// A trailing snapcompact CompactionEntry is invisible to both rescue
+				// tiers below (they only inspect message entries) and to
+				// prepareCompaction itself (last-entry-is-compaction guard), so a
+				// frame archive billed past the threshold dead-ends here on every
+				// resume. Rebuild it at a threshold-derived frame budget first; when
+				// that lands, the branch is already fully compacted — there is
+				// nothing left to summarize, so skip the elide/image tiers (provably
+				// no-ops on this shape) and the no-progress warning entirely.
+				let frameOverflowRescued = false;
 				if (reason !== "idle") {
-					await this.#rescueCompactionDeadEnd(autoCompactionSignal, {
-						skipElide: fallbackFromShake,
-						hasProgress: () => {
-							// Only reached when a tier actually freed something, so the
-							// branch has been rewritten either way.
-							rescueRewroteHistory = true;
-							pathEntriesForCompaction = this.sessionManager.getBranch();
-							preparation = prepareCompaction(
-								pathEntriesForCompaction,
-								compactionSettings,
-								autoCompactionCandidates,
-							);
-							return preparation !== undefined;
-						},
-					});
+					frameOverflowRescued = await this.#rescueSnapcompactFrameOverflow(
+						pathEntriesForCompaction,
+						compactionSettings,
+						autoCompactionSignal,
+					);
+					if (frameOverflowRescued) {
+						rescueRewroteHistory = true;
+						pathEntriesForCompaction = this.sessionManager.getBranch();
+					} else {
+						await this.#rescueCompactionDeadEnd(autoCompactionSignal, {
+							skipElide: fallbackFromShake,
+							hasProgress: () => {
+								// Only reached when a tier actually freed something, so the
+								// branch has been rewritten either way.
+								rescueRewroteHistory = true;
+								pathEntriesForCompaction = this.sessionManager.getBranch();
+								preparation = prepareCompaction(
+									pathEntriesForCompaction,
+									compactionSettings,
+									autoCompactionCandidates,
+								);
+								return preparation !== undefined;
+							},
+						});
+					}
 				}
 				if (!preparation) {
 					await this.#emitSessionEvent({
@@ -14075,9 +14223,16 @@ export class AgentSession {
 						willRetry: false,
 						skipped: true,
 					});
-					const noProgressDeadEnd = reason !== "idle";
+					const noProgressDeadEnd = reason !== "idle" && !frameOverflowRescued;
 					let continuationScheduled = false;
-					if (!suppressContinuation && this.agent.hasQueuedMessages()) {
+					if (frameOverflowRescued) {
+						continuationScheduled = this.#scheduleCompactionContinuation({
+							generation,
+							autoContinue: shouldAutoContinue && this.#compactionCreatedHeadroom(),
+							terminalTextAnswer,
+							suppressContinuation,
+						});
+					} else if (!suppressContinuation && this.agent.hasQueuedMessages()) {
 						this.#scheduleAgentContinue({
 							delayMs: 100,
 							generation,

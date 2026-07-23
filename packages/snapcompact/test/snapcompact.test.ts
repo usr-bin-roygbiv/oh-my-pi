@@ -944,6 +944,34 @@ describe("compact", () => {
 		expect(archive?.frames.length).toBe(5);
 	});
 
+	it("re-compacting with a smaller maxFrames than the previous archive shrinks the frame count", async () => {
+		const first = await snapcompact.compact(
+			makePreparation({
+				messagesToSummarize: [
+					createUserMessage(`HEAD SENTINEL. ${"Important fact number one. ".repeat(1000)}TAIL SENTINEL.`),
+				],
+			}),
+			{ frameSize: TEST_FRAME_SIZE, maxFrames: 7 },
+		);
+		const firstArchive = snapcompact.getPreservedArchive(first.preserveData);
+		expect(firstArchive?.frames.length).toBe(7);
+
+		// No new messages: rebuild the SAME archive at a reduced budget — the
+		// dead-end rescue path for a trailing over-threshold archive.
+		const shrunk = await snapcompact.compact(
+			makePreparation({
+				messagesToSummarize: [],
+				previousSummary: first.summary,
+				previousPreserveData: first.preserveData,
+			}),
+			{ frameSize: TEST_FRAME_SIZE, maxFrames: 3 },
+		);
+		const shrunkArchive = snapcompact.getPreservedArchive(shrunk.preserveData);
+		expect(shrunkArchive?.frames.length).toBeGreaterThan(0);
+		expect(shrunkArchive?.frames.length).toBeLessThanOrEqual(3);
+		expect(shrunkArchive?.textHead ?? shrunkArchive?.text).toContain("HEAD SENTINEL.");
+	});
+
 	it("keeps the original text head across later compactions", async () => {
 		const first = await snapcompact.compact(
 			makePreparation({

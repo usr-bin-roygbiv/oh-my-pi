@@ -3,6 +3,7 @@
 ## [Unreleased]
 ### Fixed
 
+- Fixed auto-compaction re-triggering the "Compaction freed too little context" warning on every resume when the branch's last entry was an over-threshold snapcompact archive: the dead-end rescue now rebuilds the trailing archive locally at a threshold-derived frame budget (superseding the stale frame payload) instead of pausing, since the elide/image tiers can never touch a compaction entry (#4786).
 - Fixed the setup wizard hiding the selected row on short terminals (e.g. 24x80): the provider sign-in, theme, and web-search lists now fit their windows to the visible height, and decorative chrome (sign-in hint, theme mock preview) yields to the list when space is tight.
 
 ## [17.0.8] - 2026-07-22
