@@ -183,6 +183,7 @@ export interface PublishContributionCandidateOptions {
 	readonly candidate: ContributionCandidate;
 	readonly approvedDraft: ContributionPrDraft;
 	readonly signal?: AbortSignal;
+	readonly authorizePush?: () => void;
 	readonly request?: ContributionGitHubRequest;
 	readonly git?: ContributionPublicationGit;
 }
@@ -590,7 +591,7 @@ export async function publishContributionCandidate(
 	}
 
 	const targetRef = `refs/heads/${options.branchName}`;
-	const refspec = `${options.candidate.commit}:${targetRef}`;
+	const refspec = `HEAD:${targetRef}`;
 	const compareUrl = buildContributionCompareUrl(currentRemote, options.branchName);
 	const reviewUrl = buildContributionReviewUrl(currentRemote, options.baseProof.baseSha, options.candidate.commit);
 	const prDraft = buildContributionPrDraft(
@@ -613,6 +614,7 @@ export async function publishContributionCandidate(
 			"The contribution candidate does not descend from the frozen official base.",
 		);
 	}
+	options.authorizePush?.();
 	try {
 		await publicationGit.push(options.cwd, {
 			remote: options.confirmedRemoteUrl,

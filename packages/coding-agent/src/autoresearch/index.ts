@@ -143,9 +143,51 @@ function describeContributionError(error: unknown): string {
 export const createAutoresearchExtension: ExtensionFactory = api => {
 	const runtimeStore = createRuntimeStore();
 	const dashboard = createDashboardController();
+	const contributionStartAuthorizations = new Map<string, symbol>();
+	const contributionPublicationControllers = new Map<string, AbortController>();
+
+	const invalidateContributionOperations = (sessionKey: string): void => {
+		contributionStartAuthorizations.delete(sessionKey);
+		const controller = contributionPublicationControllers.get(sessionKey);
+		if (!controller) return;
+		contributionPublicationControllers.delete(sessionKey);
+		controller.abort();
+	};
 
 	const getSessionKey = (ctx: ExtensionContext): string => ctx.sessionManager.getSessionId();
 	const getRuntime = (ctx: ExtensionContext): AutoresearchRuntime => runtimeStore.ensure(getSessionKey(ctx));
+	const assertContributionStartIdentity = (
+		ctx: ExtensionContext,
+		runtime: AutoresearchRuntime,
+		sessionKey: string,
+		token: symbol,
+	): void => {
+		if (
+			getSessionKey(ctx) !== sessionKey ||
+			getRuntime(ctx) !== runtime ||
+			contributionStartAuthorizations.get(sessionKey) !== token
+		) {
+			throw new Error("Contribution start authorization changed.");
+		}
+	};
+	const assertContributionStartFresh = (
+		ctx: ExtensionContext,
+		runtime: AutoresearchRuntime,
+		sessionKey: string,
+		token: symbol,
+		contribution: AutoresearchRuntime["contribution"],
+		state: AutoresearchRuntime["state"],
+	): void => {
+		assertContributionStartIdentity(ctx, runtime, sessionKey, token);
+		if (
+			runtime.contribution !== contribution ||
+			runtime.state !== state ||
+			runtime.autoresearchMode ||
+			runtime.autoResumeArmed
+		) {
+			throw new Error("Contribution start state changed.");
+		}
+	};
 
 	const loadActiveSession = async (
 		ctx: ExtensionContext,
@@ -158,6 +200,7 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 	};
 
 	const rehydrate = async (ctx: ExtensionContext): Promise<void> => {
+		invalidateContributionOperations(getSessionKey(ctx));
 		const runtime = getRuntime(ctx);
 		const control = reconstructControlState(ctx.sessionManager.getBranch());
 		const contributionRunning = runtime.contribution.status === "running";
@@ -249,6 +292,7 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 	};
 
 	const stopContributionRuntime = async (ctx: ExtensionContext, runtime: AutoresearchRuntime): Promise<string[]> => {
+		invalidateContributionOperations(getSessionKey(ctx));
 		if (runtime.contribution.status === "off") return [];
 		const contribution = runtime.contribution;
 		const warnings: string[] = [];
@@ -522,6 +566,7 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 			}
 
 			if (command === "off") {
+				invalidateContributionOperations(getSessionKey(ctx));
 				if (runtime.contribution.status === "off") {
 					ctx.ui.notify("Contribution mode is already off.", "info");
 					return;
@@ -622,11 +667,46 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 					contribution.branch,
 					contribution.baseProof,
 				);
+				const reviewSessionKey = getSessionKey(ctx);
+				const reviewAuthorization = contribution.authorization;
+				const reviewBranch = contribution.branch;
+				const reviewSessionId = contribution.sessionId;
+				const assertContributionIdentity = (): void => {
+					const currentRuntime = getRuntime(ctx);
+					const current = currentRuntime.contribution;
+					if (
+						getSessionKey(ctx) !== reviewSessionKey ||
+						currentRuntime !== runtime ||
+						current.status !== "running" ||
+						current.authorization !== reviewAuthorization ||
+						current.branch !== reviewBranch ||
+						current.sessionId !== reviewSessionId
+					) {
+						throw new Error("Contribution publication authorization changed.");
+					}
+				};
 				const approved = await ctx.ui.confirm(
 					"Push exact contribution candidate for review?",
-					`${approvedDraft.body}\n\nThis approval pushes only candidate ${currentHead} with \`${currentHead}:refs/heads/${contribution.branch}\` to the confirmed fork URL ${contribution.remoteUrl} (${contribution.remoteName}), and requires that remote branch to be absent. It does not create or approve a pull request. The SHA-bound human sentence remains empty and must be written by the human reviewer.`,
+					`${approvedDraft.body}\n\nThis approval pushes only the verified current HEAD candidate ${currentHead} with \`HEAD:refs/heads/${contribution.branch}\` to the confirmed fork URL ${contribution.remoteUrl} (${contribution.remoteName}), and requires that remote branch to be absent. It does not create or approve a pull request. The SHA-bound human sentence remains empty and must be written by the human reviewer.`,
 				);
 				if (!approved) return;
+				try {
+					assertContributionIdentity();
+				} catch (error) {
+					ctx.ui.notify(`Contribution review failed: ${describeContributionError(error)}`, "error");
+					return;
+				}
+				const priorPublicationController = contributionPublicationControllers.get(reviewSessionKey);
+				priorPublicationController?.abort();
+				const publicationController = new AbortController();
+				contributionPublicationControllers.set(reviewSessionKey, publicationController);
+				const authorizePublication = (): void => {
+					throwIfAborted(publicationController.signal);
+					if (contributionPublicationControllers.get(reviewSessionKey) !== publicationController) {
+						throw new Error("Contribution publication authorization changed.");
+					}
+					assertContributionIdentity();
+				};
 
 				let publication: PublishedContributionCandidate;
 				try {
@@ -643,11 +723,18 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 						goal: contribution.goal,
 						candidate,
 						approvedDraft,
+						signal: publicationController.signal,
+						authorizePush: authorizePublication,
 						git: contributionPublicationGit,
 					});
+					authorizePublication();
 				} catch (error) {
 					ctx.ui.notify(`Contribution review failed: ${describeContributionError(error)}`, "error");
 					return;
+				} finally {
+					if (contributionPublicationControllers.get(reviewSessionKey) === publicationController) {
+						contributionPublicationControllers.delete(reviewSessionKey);
+					}
 				}
 
 				runtime.contribution = {
@@ -707,6 +794,8 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 			);
 			if (!preflightConfirmed) return;
 
+			let contributionStartSessionKey: string | null = null;
+			let contributionStartToken: symbol | null = null;
 			try {
 				const control = reconstructControlState(ctx.sessionManager.getBranch());
 				const resumingAfterReview = runtime.contribution.status === "review";
@@ -780,11 +869,20 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 				if (!selectedRemote) return;
 				await verifyContributionFork(ctx.cwd, selectedRemote.remote);
 				const branchName = await allocateAutoresearchBranchName(api, ctx.cwd, `contribute-${goal.title}`);
+				const startSessionKey = getSessionKey(ctx);
+				const startToken = Symbol("contribution-start-authorization");
+				const startContribution = runtime.contribution;
+				const startState = runtime.state;
+				contributionStartSessionKey = startSessionKey;
+				contributionStartToken = startToken;
+				contributionStartAuthorizations.set(startSessionKey, startToken);
+				assertContributionStartFresh(ctx, runtime, startSessionKey, startToken, startContribution, startState);
 				const finalConfirmed = await ctx.ui.confirm(
 					"Start exact upstream contribution session?",
 					`Goal: ${goal.title}\nOfficial main commit/base: ${goal.commitSha}\nGoal blob: ${goal.blobSha}\nGoal SHA-256: ${goal.sha256}\nModel: ${selectedModel.provider}/${selectedModel.id}\nConfirmed fork: ${selectedRemote.name} (${selectedRemote.url})\nFresh local candidate branch: ${branchName}\n\nThis native OMP session continues indefinitely until /contribute off, an input/review gate, interruption, or session exit. It consumes model tokens, runs tests/commands under normal approval policy, and may create commits on the candidate branch. /contribute review requires another exact approval before an absent candidate branch is pushed to this fork; it never opens a pull request.\n\nOn confirmation only: recheck the official base and fork, switch model, create this exact branch from the frozen base commit, activate the existing autoresearch tools, then start the turn. Global approval policy is unchanged.`,
 				);
 				if (!finalConfirmed) return;
+				assertContributionStartFresh(ctx, runtime, startSessionKey, startToken, startContribution, startState);
 
 				const recheckedGoal = await fetchOfficialContributionGoal(ctx.cwd);
 				assertContributionGoalUnchanged(goal, recheckedGoal);
@@ -822,22 +920,30 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 				let branchCreated = false;
 				let toolsTouched = false;
 				try {
+					assertContributionStartFresh(ctx, runtime, startSessionKey, startToken, startContribution, startState);
 					modelChanged = true;
-					if (!(await api.setModel(selectedModel))) {
+					const modelAccepted = await api.setModel(selectedModel);
+					assertContributionStartFresh(ctx, runtime, startSessionKey, startToken, startContribution, startState);
+					if (!modelAccepted) {
 						throw new Error(`Authenticated model switch failed: ${selectedModel.provider}/${selectedModel.id}`);
 					}
+					assertContributionStartFresh(ctx, runtime, startSessionKey, startToken, startContribution, startState);
 					await git.branch.checkoutNewAt(ctx.cwd, branchName, frozenBaseProof.baseSha);
 					branchCreated = true;
+					assertContributionStartFresh(ctx, runtime, startSessionKey, startToken, startContribution, startState);
 					await verifyContributionBase(ctx.cwd, goal);
 					if ((await git.branch.current(ctx.cwd)) !== branchName) {
 						throw new Error("Contribution checkout did not land on the frozen candidate branch.");
 					}
+					assertContributionStartFresh(ctx, runtime, startSessionKey, startToken, startContribution, startState);
 					toolsTouched = true;
 					await api.setActiveTools([...new Set([...previousTools, ...EXPERIMENT_TOOL_NAMES])]);
+					assertContributionStartFresh(ctx, runtime, startSessionKey, startToken, startContribution, startState);
 					await verifyContributionBase(ctx.cwd, goal);
 					if ((await git.branch.current(ctx.cwd)) !== branchName) {
 						throw new Error("Contribution checkout changed during tool activation.");
 					}
+					assertContributionStartFresh(ctx, runtime, startSessionKey, startToken, startContribution, startState);
 					const contribution: ContributionRunningState = {
 						status: "running",
 						authorization: Symbol("contribution-authorization"),
@@ -857,6 +963,10 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 					runtime.autoResumeArmed = true;
 					runtime.lastAutoResumePendingRunNumber = null;
 					dashboard.updateWidget(ctx, runtime);
+					assertContributionStartIdentity(ctx, runtime, startSessionKey, startToken);
+					if (runtime.contribution !== contribution) {
+						throw new Error("Contribution start state changed before the initial turn.");
+					}
 					api.sendUserMessage(goal.title);
 				} catch (error) {
 					const rollbackErrors: string[] = [];
@@ -893,6 +1003,14 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 				}
 			} catch (error) {
 				ctx.ui.notify(`Contribution preflight failed: ${describeContributionError(error)}`, "error");
+			} finally {
+				if (
+					contributionStartSessionKey !== null &&
+					contributionStartToken !== null &&
+					contributionStartAuthorizations.get(contributionStartSessionKey) === contributionStartToken
+				) {
+					contributionStartAuthorizations.delete(contributionStartSessionKey);
+				}
 			}
 		},
 	});
