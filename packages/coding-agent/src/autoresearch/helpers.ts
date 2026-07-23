@@ -1,4 +1,5 @@
 import * as git from "../utils/git";
+import { throwIfAborted } from "../tools/tool-errors";
 import type { ASIData, ASIValue, MetricDirection, NumericMetricMap } from "./types";
 
 export const METRIC_LINE_PREFIX = "METRIC";
@@ -201,18 +202,20 @@ function sanitizeAsiValue(value: unknown): ASIValue | undefined {
 	return undefined;
 }
 
-export async function tryGitStatus(cwd: string): Promise<string> {
+export async function tryGitStatus(cwd: string, signal?: AbortSignal): Promise<string> {
 	try {
-		return await git.status(cwd, { porcelainV1: true, untrackedFiles: "all", z: true });
+		return await git.status(cwd, { porcelainV1: true, untrackedFiles: "all", z: true, signal });
 	} catch {
+		throwIfAborted(signal);
 		return "";
 	}
 }
 
-export async function tryGitPrefix(cwd: string): Promise<string> {
+export async function tryGitPrefix(cwd: string, signal?: AbortSignal): Promise<string> {
 	try {
-		return await git.show.prefix(cwd);
+		return await git.show.prefix(cwd, signal);
 	} catch {
+		throwIfAborted(signal);
 		return "";
 	}
 }

@@ -236,7 +236,7 @@ title/body and asks for a second confirmation. That confirmation authorizes only
 this push:
 
 ```text
-HEAD:refs/heads/<candidate-branch>
+<validated-candidate-SHA>:refs/heads/<candidate-branch>
 ```
 
 The destination is the verified push-effective URL for the previously confirmed
@@ -246,6 +246,9 @@ ordinary `insteadOf` redirection while retaining the verified destination.
 A force-with-lease expecting an absent remote branch prevents overwriting an
 existing ref. Nothing is pushed to the official repository. The command never
 creates, approves, or merges a pull request.
+Once that immutable push begins, lifecycle commands drain it rather than canceling
+an ambiguously completed transport. A successful push always retains the review
+URLs and draft handoff before the transition completes.
 
 After the push, OMP stops the research loop and prints:
 

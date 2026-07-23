@@ -13,6 +13,7 @@ import { dedupeStrings, normalizePathSpec } from "../helpers";
 import { buildExperimentState } from "../state";
 import { openAutoresearchStorage, openAutoresearchStorageIfExists, type SessionRow } from "../storage";
 import type { AutoresearchToolFactoryOptions, ExperimentState } from "../types";
+import { beginAutoresearchMutation } from "./mutation-authorization";
 
 export const HARNESS_FILENAME = "autoresearch.sh";
 export const DEFAULT_HARNESS_COMMAND = `bash ${HARNESS_FILENAME}`;
@@ -46,16 +47,8 @@ interface PreparedNewSegment {
 	complete(state: ExperimentState): string | null;
 }
 
-interface InitExperimentMutationAuthorization {
-	readonly signal: AbortSignal;
-	authorizeMutation(ctx: ExtensionContext, signal?: AbortSignal): Promise<void>;
-	assertRuntimeCurrent(ctx: ExtensionContext, signal?: AbortSignal): void;
-	settle(): void;
-}
-
 interface InitExperimentToolFactoryOptions extends AutoresearchToolFactoryOptions {
 	forceUncapped?(ctx: ExtensionContext): boolean;
-	captureMutationAuthorization?(ctx: ExtensionContext): InitExperimentMutationAuthorization | null;
 	prepareNewSegment?(ctx: ExtensionContext, signal?: AbortSignal): Promise<PreparedNewSegment | null>;
 	onSessionUpdated?(ctx: ExtensionContext, state: ExperimentState): void;
 }
@@ -72,18 +65,10 @@ export function createInitExperimentTool(
 		defaultInactive: true,
 		concurrency: () => "exclusive",
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-			const mutationAuthorization = options.captureMutationAuthorization?.(ctx) ?? null;
-			const operationSignal = mutationAuthorization
-				? signal
-					? AbortSignal.any([signal, mutationAuthorization.signal])
-					: mutationAuthorization.signal
-				: signal;
+			const mutation = beginAutoresearchMutation(options, ctx, signal);
+			const operationSignal = mutation.signal;
 			try {
-				const authorizeMutation = async (): Promise<void> => {
-					throwIfAborted(operationSignal);
-					await mutationAuthorization?.authorizeMutation(ctx, operationSignal);
-					throwIfAborted(operationSignal);
-				};
+				const authorizeMutation = (): Promise<void> => mutation.authorizeMutation();
 				const prepareNewSegment = options.prepareNewSegment;
 				const preparedNewSegment =
 					params.new_segment === true && prepareNewSegment
@@ -209,7 +194,7 @@ export function createInitExperimentTool(
 				const loggedRuns = storage.listLoggedRuns(session.id);
 				const state = buildExperimentState(session, loggedRuns);
 				throwIfAborted(operationSignal);
-				mutationAuthorization?.assertRuntimeCurrent(ctx, operationSignal);
+				mutation.assertRuntimeCurrent();
 				throwIfAborted(operationSignal);
 				runtime.state = state;
 				runtime.goal = session.goal;
@@ -290,7 +275,7 @@ export function createInitExperimentTool(
 					},
 				};
 			} finally {
-				mutationAuthorization?.settle();
+				mutation.settle();
 			}
 		},
 		renderCall(args, _options, theme): Text {

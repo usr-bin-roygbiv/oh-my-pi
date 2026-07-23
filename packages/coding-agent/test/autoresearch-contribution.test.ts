@@ -610,7 +610,7 @@ describe("contribution fork validation and publication", () => {
 		expect(draft.body.match(/\bEMPTY\b/g)?.length ?? 0).toBeGreaterThanOrEqual(3);
 	});
 
-	it("re-reads the exact fork URL, verifies ancestry, and pushes only the exact HEAD refspec", async () => {
+	it("re-reads the exact fork URL, verifies ancestry, and pushes only the frozen candidate SHA", async () => {
 		const calls: string[] = [];
 		const pushes: Array<{
 			cwd: string;
@@ -678,11 +678,11 @@ describe("contribution fork validation and publication", () => {
 				cwd: "/work/repo",
 				remote: "origin",
 				verifiedRemoteUrl: FORK_URL,
-				refspec: `HEAD:refs/heads/${CONTRIBUTION_BRANCH}`,
+				refspec: `${CURRENT_HEAD}:refs/heads/${CONTRIBUTION_BRANCH}`,
 				forceWithLease: `refs/heads/${CONTRIBUTION_BRANCH}:`,
 			},
 		]);
-		expect(published.refspec).toBe(`HEAD:refs/heads/${CONTRIBUTION_BRANCH}`);
+		expect(published.refspec).toBe(`${CURRENT_HEAD}:refs/heads/${CONTRIBUTION_BRANCH}`);
 		expect(published.compareUrl).toContain("/compare/main...alice:");
 		expect(published.reviewUrl).toBe(
 			`https://github.com/${OFFICIAL_CONTRIBUTION_OWNER}/${OFFICIAL_CONTRIBUTION_REPO}/compare/${COMMIT_SHA}...alice:${CURRENT_HEAD}?expand=1`,
@@ -730,6 +730,92 @@ describe("contribution fork validation and publication", () => {
 
 		expect(events).toEqual(["push URL verified", "HEAD moved", "source resolved"]);
 		expect(publishedCommit).toBe(CURRENT_HEAD);
+	});
+
+	it("pushes the validated commit through a real bare remote even when HEAD moves", async () => {
+		const source = TempDir.createSync("@pi-contribution-sha-source-");
+		const remote = TempDir.createSync("@pi-contribution-sha-remote-");
+		try {
+			await $`git init --bare ${remote.path()}`.quiet();
+			await $`git -C ${source.path()} init -b main`.quiet();
+			await Bun.write(`${source.path()}/proof.txt`, "base\n");
+			await $`git -C ${source.path()} add proof.txt`.quiet();
+			await $`git -C ${source.path()} -c user.name=OMP -c user.email=omp@example.invalid commit -m base`.quiet();
+			const baseSha = (await $`git -C ${source.path()} rev-parse HEAD`.quiet()).text().trim();
+			await $`git -C ${source.path()} checkout -b ${CONTRIBUTION_BRANCH}`.quiet();
+			await Bun.write(`${source.path()}/proof.txt`, "candidate A\n");
+			await $`git -C ${source.path()} add proof.txt`.quiet();
+			await $`git -C ${source.path()} -c user.name=OMP -c user.email=omp@example.invalid commit -m candidate-a`.quiet();
+			const candidateSha = (await $`git -C ${source.path()} rev-parse HEAD`.quiet()).text().trim();
+			await Bun.write(`${source.path()}/proof.txt`, "candidate B\n");
+			await $`git -C ${source.path()} add proof.txt`.quiet();
+			await $`git -C ${source.path()} -c user.name=OMP -c user.email=omp@example.invalid commit -m candidate-b`.quiet();
+			const movedSha = (await $`git -C ${source.path()} rev-parse HEAD`.quiet()).text().trim();
+			await $`git -C ${source.path()} reset --hard ${candidateSha}`.quiet();
+
+			const goal = makeGoal({ commitSha: baseSha });
+			const candidate = makeCandidate({ commit: candidateSha });
+			const baseProof: ContributionBaseProof = {
+				clean: true,
+				baseSha,
+				currentHead: baseSha,
+				initialGoalCommitSha: baseSha,
+			};
+			const approvedDraft = buildContributionPrDraft(
+				goal,
+				candidate,
+				validateContributionForkRemote(FORK_URL),
+				CONTRIBUTION_BRANCH,
+				baseProof,
+			);
+			const publicationGit: ContributionPublicationGit = {
+				readRemoteUrl: async () => FORK_URL,
+				readPushRemoteUrl: async () => FORK_URL,
+				readBranch: async () => CONTRIBUTION_BRANCH,
+				readHead: (cwd, signal) => git.head.sha(cwd, signal),
+				readStatus: cwd => git.status(cwd, { porcelainV1: true, untrackedFiles: "all", z: true }),
+				isAncestor: (cwd, ancestor, descendant, signal) => git.isAncestor(cwd, ancestor, descendant, signal),
+				push: async (cwd, options) => {
+					await $`git -C ${cwd} reset --hard ${movedSha}`.quiet();
+					await git.push(cwd, {
+						remote: `file://${remote.path()}`,
+						refspec: options.refspec,
+						forceWithLease: options.forceWithLease,
+						signal: options.signal,
+					});
+				},
+			};
+
+			const published = await publishContributionCandidate({
+				cwd: source.path(),
+				remoteName: "origin",
+				confirmedRemoteUrl: FORK_URL,
+				confirmedPushRemoteUrl: FORK_URL,
+				branchName: CONTRIBUTION_BRANCH,
+				currentBranch: CONTRIBUTION_BRANCH,
+				worktreeClean: true,
+				goal,
+				candidate,
+				currentSegment: 2,
+				currentHead: candidateSha,
+				baseProof,
+				approvedDraft,
+				git: publicationGit,
+				request: async () => ({ fork: true, parent: "can1357/oh-my-pi", source: "can1357/oh-my-pi" }),
+			});
+			const remoteSha = (
+				await $`git --git-dir ${remote.path()} rev-parse refs/heads/${CONTRIBUTION_BRANCH}`.quiet()
+			)
+				.text()
+				.trim();
+
+			expect(published.refspec).toBe(`${candidateSha}:refs/heads/${CONTRIBUTION_BRANCH}`);
+			expect(await git.head.sha(source.path())).toBe(movedSha);
+			expect(remoteSha).toBe(candidateSha);
+		} finally {
+			source.removeSync();
+			remote.removeSync();
+		}
 	});
 
 	it("rejects a push-effective URL rewrite away from the confirmed fork", async () => {
@@ -880,7 +966,7 @@ describe("contribution fork validation and publication", () => {
 		expect(calls).toEqual([`ancestor:${COMMIT_SHA}:${CURRENT_HEAD}`]);
 	});
 
-	it("rejects HEAD or clean-worktree drift during the awaited final ancestry check before literal-HEAD push", async () => {
+	it("rejects HEAD or clean-worktree drift during final ancestry before immutable-SHA push", async () => {
 		for (const drift of ["HEAD", "worktree"] as const) {
 			let currentHead = CURRENT_HEAD;
 			let statusOutput = "";
@@ -2140,6 +2226,16 @@ describe("process-local contribution lifecycle", () => {
 			expect(
 				harness.notifications.some(notification => notification.message.startsWith("Immutable SHA review:")),
 			).toBe(true);
+			if (invalidation === "off") {
+				expect(
+					harness.notifications.some(notification =>
+						notification.message.startsWith("Contribution candidate was pushed; review handoff preserved."),
+					),
+				).toBe(true);
+				expect(harness.notifications.some(notification => notification.message === "Contribution mode stopped.")).toBe(
+					false,
+				);
+			}
 			await commandRequired(harness, "contribute").handler("status", harness.ctx);
 			expect(harness.notifications.at(-1)?.message).toStartWith("Contribution review ready:");
 		});
@@ -2916,7 +3012,7 @@ describe("process-local contribution lifecycle", () => {
 			{
 				remote: "origin",
 				verifiedRemoteUrl: FORK_URL,
-				refspec: `HEAD:refs/heads/${branch}`,
+				refspec: `${CURRENT_HEAD}:refs/heads/${branch}`,
 				forceWithLease: `refs/heads/${branch}:`,
 			},
 		]);
@@ -2924,8 +3020,8 @@ describe("process-local contribution lifecycle", () => {
 		expect(harness.confirmCalls.at(-1)?.message).toContain("Observed the focused scenario pass");
 		expect(harness.confirmCalls.at(-1)?.message).toContain(CONTRIBUTION_HUMAN_SUMMARY_PLACEHOLDER);
 		const reviewConfirmation = harness.confirmCalls.at(-1)?.message ?? "";
-		expect(reviewConfirmation).toContain(`HEAD:refs/heads/${branch}`);
-		expect(reviewConfirmation).not.toContain(`${CURRENT_HEAD}:refs/heads/${branch}`);
+		expect(reviewConfirmation).toContain(`${CURRENT_HEAD}:refs/heads/${branch}`);
+		expect(reviewConfirmation).not.toContain(`HEAD:refs/heads/${branch}`);
 		expect(harness.activeTools).toEqual(["read", "bash"]);
 		expect(storage.getSessionById(session.id)?.closedAt).not.toBeNull();
 		expect(harness.githubEndpoints.every(endpoint => endpoint.startsWith("/repos/"))).toBe(true);

@@ -605,7 +605,7 @@ export async function publishContributionCandidate(
 	}
 
 	const targetRef = `refs/heads/${options.branchName}`;
-	const refspec = `HEAD:${targetRef}`;
+	const refspec = `${options.candidate.commit}:${targetRef}`;
 	const compareUrl = buildContributionCompareUrl(currentRemote, options.branchName);
 	const reviewUrl = buildContributionReviewUrl(currentRemote, options.baseProof.baseSha, options.candidate.commit);
 	const prDraft = buildContributionPrDraft(

@@ -6,8 +6,9 @@ import { type } from "arktype";
 import type { ToolDefinition } from "../../extensibility/extensions";
 import type { Theme } from "../../modes/theme/theme";
 import { replaceTabs, truncateToWidth } from "../../tools/render-utils";
+import { throwIfAborted } from "../../tools/tool-errors";
 import * as git from "../../utils/git";
-import { computeRunModifiedPaths, getCurrentAutoresearchBranch, parseWorkDirDirtyPaths } from "../git";
+import { computeRunModifiedPaths, parseWorkDirDirtyPaths } from "../git";
 import {
 	ensureNumericMetricMap,
 	formatNum,
@@ -33,6 +34,7 @@ import type {
 	LogDetails,
 	NumericMetricMap,
 } from "../types";
+import { beginAutoresearchMutation } from "./mutation-authorization";
 
 const EXPERIMENT_TOOL_NAMES = ["init_experiment", "run_experiment", "log_experiment", "update_notes"];
 
@@ -62,9 +64,13 @@ export function createLogExperimentTool(
 			"Log the result of the latest run_experiment. Records the metric, optional ASI metadata, modified paths, and scope deviations. On `keep`, modified files are committed; on `discard`/`crash`/`checks_failed`, the worktree is reverted. Pass `flag_runs` to mark earlier runs as suspect; flagged runs are excluded from baseline and best-metric math.",
 		parameters: logExperimentSchema,
 		defaultInactive: true,
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			const mutation = beginAutoresearchMutation(options, ctx, signal);
+			try {
+				await mutation.authorizeMutation();
 			const storage = await openAutoresearchStorageIfExists(ctx.cwd);
-			const currentBranch = (await git.branch.current(ctx.cwd)) ?? null;
+			const currentBranch = (await git.branch.current(ctx.cwd, mutation.signal)) ?? null;
+			await mutation.authorizeMutation();
 			const session = storage?.getActiveSessionForBranch(currentBranch) ?? null;
 			if (!storage || !session) {
 				return {
@@ -86,15 +92,7 @@ export function createLogExperimentTool(
 			const runtime = options.getRuntime(ctx);
 
 			const flaggedRuns: LogDetails["flaggedRuns"] = [];
-			for (const flag of params.flag_runs ?? []) {
-				const target = storage.getRunById(flag.run_id);
-				if (!target || target.sessionId !== session.id) continue;
-				storage.flagRun(flag.run_id, flag.reason);
-				flaggedRuns.push({ runId: flag.run_id, reason: flag.reason });
-			}
-
-			const branchName = await getCurrentAutoresearchBranch(options.pi, ctx.cwd);
-			const onAutoresearchBranch = branchName !== null;
+			const onAutoresearchBranch = currentBranch?.startsWith("autoresearch/") ?? false;
 
 			let allModified: string[];
 			if (onAutoresearchBranch) {
@@ -103,22 +101,25 @@ export function createLogExperimentTool(
 				// so any currently-dirty path is the agent's iteration change. Off-branch we
 				// can't tell user dirt apart from agent edits, so we keep the (lossy)
 				// preRunDirtyPaths filter.
-				const statusText = await tryGitStatus(ctx.cwd);
-				const workDirPrefix = await tryGitPrefix(ctx.cwd);
+				const statusText = await tryGitStatus(ctx.cwd, mutation.signal);
+				const workDirPrefix = await tryGitPrefix(ctx.cwd, mutation.signal);
 				allModified = parseWorkDirDirtyPaths(statusText, workDirPrefix);
 			} else {
 				const { modifiedTracked, modifiedUntracked } = await detectModifiedPaths(
 					ctx.cwd,
 					pendingRun.preRunDirtyPaths,
+					mutation.signal,
 				);
 				allModified = [...modifiedTracked, ...modifiedUntracked];
 			}
+			await mutation.authorizeMutation();
 			const scopeDeviations = computeScopeDeviations(allModified, session);
 
 			const justification = params.justification?.trim() || null;
 			const warnings: string[] = [];
 
-			const headSha = await tryReadHeadSha(ctx.cwd);
+			const headSha = await tryReadHeadSha(ctx.cwd, mutation.signal);
+			await mutation.authorizeMutation();
 			const explicitCommit = params.commit?.trim();
 			let commitHash = explicitCommit && explicitCommit.length > 0 ? explicitCommit : headSha;
 
@@ -133,6 +134,7 @@ export function createLogExperimentTool(
 						params.metrics ?? {},
 						allModified,
 						session.primaryMetric,
+						mutation.signal,
 					);
 					if (commitResult.error) {
 						return {
@@ -140,7 +142,8 @@ export function createLogExperimentTool(
 						};
 					}
 					gitNote = commitResult.note ?? null;
-					const newSha = await tryReadHeadSha(ctx.cwd);
+					const newSha = await tryReadHeadSha(ctx.cwd, mutation.signal);
+					await mutation.authorizeMutation();
 					if (newSha) commitHash = newSha;
 				} else if (!onAutoresearchBranch) {
 					warnings.push(
@@ -163,6 +166,7 @@ export function createLogExperimentTool(
 					ctx.cwd,
 					pendingRun.preRunDirtyPaths,
 					onAutoresearchBranch,
+					mutation.signal,
 				);
 				if (revertResult.error) {
 					return {
@@ -171,6 +175,14 @@ export function createLogExperimentTool(
 				}
 				gitNote = revertResult.note ?? null;
 			}
+			await mutation.authorizeMutation();
+			for (const flag of params.flag_runs ?? []) {
+				const target = storage.getRunById(flag.run_id);
+				if (!target || target.sessionId !== session.id) continue;
+				storage.flagRun(flag.run_id, flag.reason);
+				flaggedRuns.push({ runId: flag.run_id, reason: flag.reason });
+			}
+			mutation.assertRuntimeCurrent();
 
 			const metric = params.metric;
 			const secondaryMetrics: NumericMetricMap = mergeMetrics(
@@ -279,6 +291,9 @@ export function createLogExperimentTool(
 					flaggedRuns,
 				},
 			};
+			} finally {
+				mutation.settle();
+			}
 		},
 		renderCall(args, _options, theme): Text {
 			const color = args.status === "keep" ? "success" : args.status === "discard" ? "warning" : "error";
@@ -312,16 +327,19 @@ async function commitKeptExperiment(
 	metrics: NumericMetricMap,
 	files: string[],
 	primaryMetric: string,
+	signal?: AbortSignal,
 ): Promise<KeepCommitResult> {
 	if (files.length === 0) return { note: "nothing to commit" };
 	try {
-		await git.stage.files(cwd, files);
+		await git.stage.files(cwd, files, signal);
+		throwIfAborted(signal);
 	} catch (err) {
+		throwIfAborted(signal);
 		return { error: `git add failed: ${err instanceof Error ? err.message : String(err)}` };
 	}
-	if (!(await git.diff.has(cwd, { cached: true, files }))) {
-		return { note: "nothing to commit" };
-	}
+	const hasStagedDiff = await git.diff.has(cwd, { cached: true, files, signal });
+	throwIfAborted(signal);
+	if (!hasStagedDiff) return { note: "nothing to commit" };
 	const payload: { [key: string]: string | number } = {
 		status,
 		[primaryMetric]: metric,
@@ -331,10 +349,12 @@ async function commitKeptExperiment(
 	}
 	const commitMessage = `${description}\n\nResult: ${JSON.stringify(payload)}`;
 	try {
-		const commitResult = await git.commit(cwd, commitMessage, { files });
+		const commitResult = await git.commit(cwd, commitMessage, { files, signal });
+		throwIfAborted(signal);
 		const summary = `${commitResult.stdout}${commitResult.stderr}`.split("\n").find(line => line.trim().length > 0);
 		return { note: summary?.trim() ?? "committed" };
 	} catch (err) {
+		throwIfAborted(signal);
 		return { error: `git commit failed: ${err instanceof Error ? err.message : String(err)}` };
 	}
 }
@@ -343,33 +363,41 @@ async function revertFailedExperiment(
 	cwd: string,
 	preRunDirtyPaths: string[],
 	onAutoresearchBranch: boolean,
+	signal?: AbortSignal,
 ): Promise<KeepCommitResult> {
 	if (onAutoresearchBranch) {
 		// Discard reverts only the current iteration's uncommitted changes — never
 		// rewinds prior `keep` commits. Reset to HEAD so any kept improvements
 		// already on the branch survive.
 		try {
-			await git.reset(cwd, { hard: true, target: "HEAD" });
-			await git.clean(cwd);
+			await git.reset(cwd, { hard: true, target: "HEAD", signal });
+			throwIfAborted(signal);
+			await git.clean(cwd, { signal });
+			throwIfAborted(signal);
 			return { note: "worktree reset to HEAD" };
 		} catch (err) {
+			throwIfAborted(signal);
 			return { error: `git reset/clean failed: ${err instanceof Error ? err.message : String(err)}` };
 		}
 	}
 
-	const statusText = await tryGitStatus(cwd);
-	const workDirPrefix = await tryGitPrefix(cwd);
+	const statusText = await tryGitStatus(cwd, signal);
+	const workDirPrefix = await tryGitPrefix(cwd, signal);
+	throwIfAborted(signal);
 	const { tracked, untracked } = computeRunModifiedPaths(preRunDirtyPaths, statusText, workDirPrefix);
 	const total = tracked.length + untracked.length;
 	if (total === 0) return { note: "nothing to revert" };
 	if (tracked.length > 0) {
 		try {
-			await git.restore(cwd, { files: tracked, source: "HEAD", staged: true, worktree: true });
+			await git.restore(cwd, { files: tracked, source: "HEAD", staged: true, worktree: true, signal });
+			throwIfAborted(signal);
 		} catch (err) {
+			throwIfAborted(signal);
 			return { error: `git restore failed: ${err instanceof Error ? err.message : String(err)}` };
 		}
 	}
 	for (const filePath of untracked) {
+		throwIfAborted(signal);
 		try {
 			fs.rmSync(path.join(cwd, filePath), { force: true, recursive: true });
 		} catch {
@@ -382,9 +410,11 @@ async function revertFailedExperiment(
 async function detectModifiedPaths(
 	cwd: string,
 	preRunDirtyPaths: string[],
+	signal?: AbortSignal,
 ): Promise<{ modifiedTracked: string[]; modifiedUntracked: string[] }> {
-	const statusText = await tryGitStatus(cwd);
-	const workDirPrefix = await tryGitPrefix(cwd);
+	const statusText = await tryGitStatus(cwd, signal);
+	const workDirPrefix = await tryGitPrefix(cwd, signal);
+	throwIfAborted(signal);
 	const { tracked, untracked } = computeRunModifiedPaths(preRunDirtyPaths, statusText, workDirPrefix);
 	return { modifiedTracked: tracked, modifiedUntracked: untracked };
 }
@@ -419,10 +449,11 @@ function mergeMetrics(
 	return merged;
 }
 
-async function tryReadHeadSha(cwd: string): Promise<string | null> {
+async function tryReadHeadSha(cwd: string, signal?: AbortSignal): Promise<string | null> {
 	try {
-		return (await git.head.sha(cwd)) ?? null;
+		return (await git.head.sha(cwd, signal)) ?? null;
 	} catch {
+		throwIfAborted(signal);
 		return null;
 	}
 }

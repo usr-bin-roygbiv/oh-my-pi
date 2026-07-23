@@ -195,7 +195,15 @@ export interface DashboardController {
 	updateWidget(ctx: ExtensionContext, runtime: AutoresearchRuntime): void;
 }
 
+export interface AutoresearchMutationAuthorization {
+	readonly signal: AbortSignal;
+	authorizeMutation(ctx: ExtensionContext, signal?: AbortSignal): Promise<void>;
+	assertRuntimeCurrent(ctx: ExtensionContext, signal?: AbortSignal): void;
+	settle(): void;
+}
+
 export interface AutoresearchToolFactoryOptions {
+	captureMutationAuthorization?(ctx: ExtensionContext): AutoresearchMutationAuthorization | null;
 	dashboard: DashboardController;
 	getRuntime(ctx: ExtensionContext): AutoresearchRuntime;
 	pi: ExtensionAPI;

@@ -7,6 +7,7 @@ import * as git from "../../utils/git";
 import { buildExperimentState } from "../state";
 import { openAutoresearchStorageIfExists } from "../storage";
 import type { AutoresearchToolFactoryOptions } from "../types";
+import { beginAutoresearchMutation } from "./mutation-authorization";
 
 const updateNotesSchema = type({
 	body: type("string").describe("replacement notes body"),
@@ -27,9 +28,13 @@ export function createUpdateNotesTool(
 			"Persist the durable autoresearch playbook (goal, scope notes, hypotheses, ideas backlog) on the active session. Pass `body` to replace the entire notes blob, or `append_idea` to append a single bullet under an `## Ideas` section.",
 		parameters: updateNotesSchema,
 		defaultInactive: true,
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			const mutation = beginAutoresearchMutation(options, ctx, signal);
+			try {
+				await mutation.authorizeMutation();
 			const storage = await openAutoresearchStorageIfExists(ctx.cwd);
-			const currentBranch = (await git.branch.current(ctx.cwd)) ?? null;
+			const currentBranch = (await git.branch.current(ctx.cwd, mutation.signal)) ?? null;
+			await mutation.authorizeMutation();
 			const session = storage?.getActiveSessionForBranch(currentBranch) ?? null;
 			if (!storage || !session) {
 				return {
@@ -47,6 +52,7 @@ export function createUpdateNotesTool(
 					? appendIdea(session.notes, params.append_idea.trim())
 					: params.body;
 
+			mutation.assertRuntimeCurrent();
 			storage.updateSession(session.id, { notes: nextNotes });
 			const refreshed = storage.getSessionById(session.id);
 			const loggedRuns = storage.listLoggedRuns(session.id);
@@ -68,6 +74,9 @@ export function createUpdateNotesTool(
 				],
 				details: { notes: nextNotes },
 			};
+			} finally {
+				mutation.settle();
+			}
 		},
 		renderCall(args, _options, theme): Text {
 			const preview = args.append_idea ?? args.body.slice(0, 100);

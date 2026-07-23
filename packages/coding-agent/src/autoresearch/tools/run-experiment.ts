@@ -8,6 +8,7 @@ import type { ToolDefinition } from "../../extensibility/extensions";
 import type { Theme } from "../../modes/theme/theme";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, TailBuffer, truncateTail } from "../../session/streaming-output";
 import { replaceTabs, shortenPath } from "../../tools/render-utils";
+import { throwIfAborted } from "../../tools/tool-errors";
 import * as git from "../../utils/git";
 import { parseWorkDirDirtyPaths } from "../git";
 import {
@@ -24,6 +25,7 @@ import { buildExperimentState } from "../state";
 import { openAutoresearchStorageIfExists } from "../storage";
 import type { AutoresearchToolFactoryOptions, RunDetails, RunExperimentProgressDetails } from "../types";
 import { DEFAULT_HARNESS_COMMAND } from "./init-experiment";
+import { beginAutoresearchMutation } from "./mutation-authorization";
 
 const runExperimentSchema = type({
 	"timeout_seconds?": type("number").describe("timeout in seconds (default 600)"),
@@ -55,8 +57,13 @@ export function createRunExperimentTool(
 		parameters: runExperimentSchema,
 		defaultInactive: true,
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
+			const mutation = beginAutoresearchMutation(options, ctx, signal);
+			const operationSignal = mutation.signal;
+			try {
+				await mutation.authorizeMutation();
 			const storage = await openAutoresearchStorageIfExists(ctx.cwd);
-			const currentBranch = (await git.branch.current(ctx.cwd)) ?? null;
+			const currentBranch = (await git.branch.current(ctx.cwd, operationSignal)) ?? null;
+			await mutation.authorizeMutation();
 			const session = storage?.getActiveSessionForBranch(currentBranch) ?? null;
 			if (!storage || !session) {
 				return {
@@ -79,9 +86,10 @@ export function createRunExperimentTool(
 			})();
 
 			const resolvedCommand = DEFAULT_HARNESS_COMMAND;
-			const preRunStatus = await tryGitStatus(ctx.cwd);
-			const workDirPrefix = await tryGitPrefix(ctx.cwd);
+			const preRunStatus = await tryGitStatus(ctx.cwd, operationSignal);
+			const workDirPrefix = await tryGitPrefix(ctx.cwd, operationSignal);
 			const preRunDirtyPaths = parseWorkDirDirtyPaths(preRunStatus, workDirPrefix);
+			await mutation.authorizeMutation();
 
 			const startedAt = Date.now();
 			const insertedRun = storage.insertRun({
@@ -120,7 +128,7 @@ export function createRunExperimentTool(
 					cwd: ctx.cwd,
 					logPath: benchmarkLogPath,
 					timeoutMs,
-					signal,
+					signal: operationSignal,
 					onProgress: details => {
 						onUpdate?.({
 							content: [{ type: "text", text: details.tailOutput }],
@@ -139,6 +147,7 @@ export function createRunExperimentTool(
 				options.dashboard.updateWidget(ctx, runtime);
 				options.dashboard.requestRender();
 			}
+			await mutation.authorizeMutation();
 
 			const completedAt = Date.now();
 			const durationMs = completedAt - startedAt;
@@ -233,6 +242,9 @@ export function createRunExperimentTool(
 				],
 				details: resultDetails,
 			};
+			} finally {
+				mutation.settle();
+			}
 		},
 		renderCall(_args, _options, theme): Text {
 			return new Text(
@@ -317,9 +329,7 @@ async function executeProcess(opts: {
 			},
 		});
 		await closeLogSink();
-		if (opts.signal?.aborted) {
-			throw new Error("aborted");
-		}
+		throwIfAborted(opts.signal);
 
 		const output = await fs.promises.readFile(opts.logPath, "utf8");
 

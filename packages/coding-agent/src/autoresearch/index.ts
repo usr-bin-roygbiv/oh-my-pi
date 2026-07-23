@@ -51,7 +51,13 @@ import { createInitExperimentTool } from "./tools/init-experiment";
 import { createLogExperimentTool } from "./tools/log-experiment";
 import { createRunExperimentTool } from "./tools/run-experiment";
 import { createUpdateNotesTool } from "./tools/update-notes";
-import type { AutoresearchRuntime, ContributionRunningState, ExperimentResult, PendingRunSummary } from "./types";
+import type {
+	AutoresearchMutationAuthorization,
+	AutoresearchRuntime,
+	ContributionRunningState,
+	ExperimentResult,
+	PendingRunSummary,
+} from "./types";
 
 const EXPERIMENT_TOOL_NAMES = ["init_experiment", "run_experiment", "log_experiment", "update_notes"];
 
@@ -71,8 +77,14 @@ interface ContributionStartTransaction {
 	readonly settlement: PromiseWithResolvers<void>;
 }
 
-interface InitExperimentOperation {
+interface AutoresearchMutationOperation {
 	readonly controller: AbortController;
+	readonly settlement: PromiseWithResolvers<void>;
+}
+
+interface ContributionPublicationOperation {
+	readonly controller: AbortController;
+	phase: "pre-push" | "pushing" | "committed";
 	readonly settlement: PromiseWithResolvers<void>;
 }
 
@@ -162,25 +174,44 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 	const runtimeStore = createRuntimeStore();
 	const dashboard = createDashboardController();
 	const contributionStartTransactions = new Map<string, ContributionStartTransaction>();
-	const contributionPublicationControllers = new Map<string, AbortController>();
-	const initExperimentOperations = new Map<string, InitExperimentOperation>();
+	const contributionPublicationOperations = new Map<string, ContributionPublicationOperation>();
+	const autoresearchMutationOperations = new Map<string, Set<AutoresearchMutationOperation>>();
+	const closedMutationAdmission = new Set<string>();
 
 	const invalidateContributionOperations = (sessionKey: string): Promise<void> | undefined => {
+		const settlements: Promise<void>[] = [];
 		const startTransaction = contributionStartTransactions.get(sessionKey);
-		if (startTransaction) startTransaction.token = null;
-		const controller = contributionPublicationControllers.get(sessionKey);
-		if (controller) {
-			contributionPublicationControllers.delete(sessionKey);
-			controller.abort();
+		if (startTransaction) {
+			startTransaction.token = null;
+			if (startTransaction.phase === "activating") settlements.push(startTransaction.settlement.promise);
 		}
-		return startTransaction?.phase === "activating" ? startTransaction.settlement.promise : undefined;
+		const publication = contributionPublicationOperations.get(sessionKey);
+		if (publication) {
+			if (publication.phase === "pre-push") {
+				publication.controller.abort(new ToolAbortError("Contribution publication authorization changed."));
+			}
+			settlements.push(publication.settlement.promise);
+		}
+		return settlements.length > 0 ? Promise.allSettled(settlements).then(() => undefined) : undefined;
 	};
 
-	const invalidateInitExperimentOperation = (sessionKey: string): Promise<void> | undefined => {
-		const operation = initExperimentOperations.get(sessionKey);
-		if (!operation) return undefined;
-		operation.controller.abort(new ToolAbortError("Autoresearch init authorization changed before mutation."));
-		return operation.settlement.promise;
+	const drainAutoresearchMutationOperations = async (
+		sessionKey: string,
+		keepAdmissionClosed = false,
+	): Promise<void> => {
+		closedMutationAdmission.add(sessionKey);
+		try {
+			while (true) {
+				const operations = [...(autoresearchMutationOperations.get(sessionKey) ?? [])];
+				if (operations.length === 0) return;
+				for (const operation of operations) {
+					operation.controller.abort(new ToolAbortError("Autoresearch mutation authorization changed."));
+				}
+				await Promise.allSettled(operations.map(operation => operation.settlement.promise));
+			}
+		} finally {
+			if (!keepAdmissionClosed) closedMutationAdmission.delete(sessionKey);
+		}
 	};
 
 	const getSessionKey = (ctx: ExtensionContext): string => ctx.sessionManager.getSessionId();
@@ -230,8 +261,11 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 	};
 
 	const rehydrate = async (ctx: ExtensionContext): Promise<void> => {
-		const activationSettlement = invalidateContributionOperations(getSessionKey(ctx));
+		const sessionKey = getSessionKey(ctx);
+		await drainAutoresearchMutationOperations(sessionKey, true);
+		const activationSettlement = invalidateContributionOperations(sessionKey);
 		if (activationSettlement) await activationSettlement;
+		try {
 		const runtime = getRuntime(ctx);
 		const control = reconstructControlState(ctx.sessionManager.getBranch());
 		const contributionRunning = runtime.contribution.status === "running";
@@ -293,6 +327,9 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 		if (toolsChanged) {
 			await api.setActiveTools(nextActiveTools);
 		}
+		} finally {
+			closedMutationAdmission.delete(sessionKey);
+		}
 	};
 
 	const setMode = (
@@ -325,33 +362,125 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 	const stopContributionRuntime = async (
 		ctx: ExtensionContext,
 		runtime: AutoresearchRuntime,
-		awaitActivationRollback = false,
+		keepMutationAdmissionClosed = false,
 	): Promise<string[]> => {
 		const sessionKey = getSessionKey(ctx);
-		const initSettlement = invalidateInitExperimentOperation(sessionKey);
-		const activationSettlement = invalidateContributionOperations(sessionKey);
-		if (initSettlement) await initSettlement;
-		if (awaitActivationRollback && activationSettlement) await activationSettlement;
-		if (runtime.contribution.status === "off") return [];
-		const contribution = runtime.contribution;
-		const warnings: string[] = [];
-		runtime.contribution = { status: "off" };
-		runtime.autoresearchMode = false;
-		runtime.autoResumeArmed = false;
-		runtime.state = createExperimentState();
-		runtime.goal = null;
+		const initialContribution = runtime.contribution;
+		const mutationSettlement = drainAutoresearchMutationOperations(sessionKey, true);
+		const contributionSettlement = invalidateContributionOperations(sessionKey);
 		try {
-			await closeContributionSession(ctx, contribution);
-		} catch (error) {
-			warnings.push(`session close: ${describeContributionError(error)}`);
+			await Promise.allSettled(
+				contributionSettlement ? [mutationSettlement, contributionSettlement] : [mutationSettlement],
+			);
+			if (
+				initialContribution.status === "running" &&
+				runtime.contribution.status === "review" &&
+				runtime.contribution.authorization === initialContribution.authorization
+			) {
+				return [];
+			}
+			if (runtime.contribution.status === "off") return [];
+			const contribution = runtime.contribution;
+			const warnings: string[] = [];
+			runtime.contribution = { status: "off" };
+			runtime.autoresearchMode = false;
+			runtime.autoResumeArmed = false;
+			runtime.state = createExperimentState();
+			runtime.goal = null;
+			try {
+				await closeContributionSession(ctx, contribution);
+			} catch (error) {
+				warnings.push(`session close: ${describeContributionError(error)}`);
+			}
+			try {
+				const experimentTools = new Set(EXPERIMENT_TOOL_NAMES);
+				await api.setActiveTools(api.getActiveTools().filter(name => !experimentTools.has(name)));
+			} catch (error) {
+				warnings.push(`tool deactivation: ${describeContributionError(error)}`);
+			}
+			return warnings;
+		} finally {
+			if (!keepMutationAdmissionClosed) closedMutationAdmission.delete(sessionKey);
 		}
-		try {
-			const experimentTools = new Set(EXPERIMENT_TOOL_NAMES);
-			await api.setActiveTools(api.getActiveTools().filter(name => !experimentTools.has(name)));
-		} catch (error) {
-			warnings.push(`tool deactivation: ${describeContributionError(error)}`);
+	};
+
+	const captureMutationAuthorization = (ctx: ExtensionContext): AutoresearchMutationAuthorization => {
+		const sessionKey = getSessionKey(ctx);
+		if (closedMutationAdmission.has(sessionKey)) {
+			throw new ToolAbortError("Autoresearch mutations are paused for a lifecycle transition.");
 		}
-		return warnings;
+		if (contributionStartTransactions.has(sessionKey)) {
+			throw new Error("Contribution startup is already active for this session.");
+		}
+		const capturedRuntime = getRuntime(ctx);
+		const captured = capturedRuntime.contribution;
+		if (captured.status === "review") {
+			throw new Error("Contribution review state does not authorize autoresearch mutation.");
+		}
+		const operation: AutoresearchMutationOperation = {
+			controller: new AbortController(),
+			settlement: Promise.withResolvers<void>(),
+		};
+		let operations = autoresearchMutationOperations.get(sessionKey);
+		if (!operations) {
+			operations = new Set();
+			autoresearchMutationOperations.set(sessionKey, operations);
+		}
+		operations.add(operation);
+		let settled = false;
+		const assertProcessIdentity = (currentCtx: ExtensionContext): void => {
+			const currentRuntime = getRuntime(currentCtx);
+			const current = currentRuntime.contribution;
+			if (getSessionKey(currentCtx) !== sessionKey || currentRuntime !== capturedRuntime) {
+				throw new Error("Autoresearch mutation authorization changed before mutation.");
+			}
+			if (captured.status === "off") {
+				if (current.status !== "off") {
+					throw new Error("Contribution startup overtook autoresearch mutation before mutation.");
+				}
+				return;
+			}
+			if (
+				current.status !== "running" ||
+				current.authorization !== captured.authorization ||
+				current.branch !== captured.branch ||
+				current.sessionId !== captured.sessionId
+			) {
+				throw new Error("Contribution mutation authorization changed before mutation.");
+			}
+		};
+		return {
+			signal: operation.controller.signal,
+			async authorizeMutation(currentCtx, signal): Promise<void> {
+				throwIfAborted(signal);
+				assertProcessIdentity(currentCtx);
+				if (captured.status === "running") {
+					const storage = await openAutoresearchStorageIfExists(currentCtx.cwd);
+					const currentBranch = await git.branch.current(currentCtx.cwd, signal);
+					const session = storage?.getActiveSessionForBranch(captured.branch) ?? null;
+					if (
+						currentBranch !== captured.branch ||
+						(captured.sessionId === null ? session !== null : session?.id !== captured.sessionId)
+					) {
+						throw new Error("Contribution branch or experiment session changed before mutation.");
+					}
+				}
+				assertProcessIdentity(currentCtx);
+				throwIfAborted(signal);
+			},
+			assertRuntimeCurrent(currentCtx, signal): void {
+				throwIfAborted(signal);
+				assertProcessIdentity(currentCtx);
+			},
+			settle(): void {
+				if (settled) return;
+				settled = true;
+				const currentOperations = autoresearchMutationOperations.get(sessionKey);
+				currentOperations?.delete(operation);
+				if (currentOperations?.size === 0) autoresearchMutationOperations.delete(sessionKey);
+				operation.settlement.resolve();
+			},
+		};
 	};
 
 	api.registerTool(
@@ -359,74 +488,7 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 			dashboard,
 			getRuntime,
 			pi: api,
-			captureMutationAuthorization(ctx) {
-				const sessionKey = getSessionKey(ctx);
-				if (contributionStartTransactions.has(sessionKey)) {
-					throw new Error("Contribution startup is already active for this session.");
-				}
-				if (initExperimentOperations.has(sessionKey)) {
-					throw new Error("An init_experiment operation is already active for this session.");
-				}
-				const captured = getRuntime(ctx).contribution;
-				const operation: InitExperimentOperation = {
-					controller: new AbortController(),
-					settlement: Promise.withResolvers<void>(),
-				};
-				initExperimentOperations.set(sessionKey, operation);
-				let settled = false;
-				const assertProcessIdentity = (currentCtx: ExtensionContext): void => {
-					const current = getRuntime(currentCtx).contribution;
-					if (getSessionKey(currentCtx) !== sessionKey) {
-						throw new Error("Autoresearch init authorization changed before mutation.");
-					}
-					if (captured.status !== "running") {
-						if (current.status === "running") {
-							throw new Error("Contribution startup overtook autoresearch init before mutation.");
-						}
-						return;
-					}
-					if (
-						current.status !== "running" ||
-						current.authorization !== captured.authorization ||
-						current.branch !== captured.branch ||
-						current.sessionId !== captured.sessionId
-					) {
-						throw new Error("Contribution init authorization changed before mutation.");
-					}
-				};
-				return {
-					signal: operation.controller.signal,
-					async authorizeMutation(currentCtx, signal): Promise<void> {
-						throwIfAborted(signal);
-						assertProcessIdentity(currentCtx);
-						if (captured.status === "running") {
-							const storage = await openAutoresearchStorageIfExists(currentCtx.cwd);
-							const currentBranch = await git.branch.current(currentCtx.cwd, signal);
-							const session = storage?.getActiveSessionForBranch(captured.branch) ?? null;
-							if (
-								currentBranch !== captured.branch ||
-								(captured.sessionId === null ? session !== null : session?.id !== captured.sessionId)
-							) {
-								throw new Error("Contribution branch or experiment session changed before mutation.");
-							}
-						}
-						assertProcessIdentity(currentCtx);
-						throwIfAborted(signal);
-					},
-					assertRuntimeCurrent(currentCtx, signal): void {
-						throwIfAborted(signal);
-						assertProcessIdentity(currentCtx);
-					},
-					settle(): void {
-						if (settled) return;
-						settled = true;
-						if (initExperimentOperations.get(sessionKey) === operation) {
-							initExperimentOperations.delete(sessionKey);
-						}
-						operation.settlement.resolve();
-					},
-				};
-			},
+			captureMutationAuthorization,
 			forceUncapped: ctx => getRuntime(ctx).contribution.status === "running",
 			onSessionUpdated(ctx, state): void {
 				const runtime = getRuntime(ctx);
@@ -492,9 +554,9 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 		}),
 	);
 
-	api.registerTool(createRunExperimentTool({ dashboard, getRuntime, pi: api }));
-	api.registerTool(createLogExperimentTool({ dashboard, getRuntime, pi: api }));
-	api.registerTool(createUpdateNotesTool({ dashboard, getRuntime, pi: api }));
+	api.registerTool(createRunExperimentTool({ captureMutationAuthorization, dashboard, getRuntime, pi: api }));
+	api.registerTool(createLogExperimentTool({ captureMutationAuthorization, dashboard, getRuntime, pi: api }));
+	api.registerTool(createUpdateNotesTool({ captureMutationAuthorization, dashboard, getRuntime, pi: api }));
 
 	api.registerCommand("autoresearch", {
 		description: "Toggle builtin autoresearch mode, or pass off / clear, or a goal message.",
@@ -637,14 +699,17 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 			}
 
 			if (command === "off") {
-				invalidateContributionOperations(getSessionKey(ctx));
-				if (runtime.contribution.status === "off") {
-					ctx.ui.notify("Contribution mode is already off.", "info");
-					return;
-				}
+				const wasOff = runtime.contribution.status === "off";
 				const warnings = await stopContributionRuntime(ctx, runtime);
 				dashboard.updateWidget(ctx, runtime);
-				if (warnings.length > 0) {
+				if (runtime.contribution.status === "review") {
+					ctx.ui.notify(
+						`Contribution candidate was pushed; review handoff preserved.\nImmutable SHA review: ${runtime.contribution.publication.reviewUrl}\nMutable branch compare: ${runtime.contribution.publication.compareUrl}`,
+						"info",
+					);
+				} else if (wasOff) {
+					ctx.ui.notify("Contribution mode is already off.", "info");
+				} else if (warnings.length > 0) {
 					ctx.ui.notify(`Contribution mode stopped with cleanup warnings: ${warnings.join("; ")}`, "warning");
 				} else {
 					ctx.ui.notify("Contribution mode stopped.", "info");
@@ -784,7 +849,7 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 				};
 				const approved = await ctx.ui.confirm(
 					"Push exact contribution candidate for review?",
-					`${approvedDraft.body}\n\nThis approval pushes only the verified current HEAD candidate ${currentHead} with \`HEAD:refs/heads/${contribution.branch}\` through the confirmed fork remote ${contribution.remoteName}. Its verified push-effective destination is ${reviewPushRemoteUrl}, and the candidate branch must be absent. A command-scoped explicit pushurl prevents Git URL rewrite rules from changing that destination. This does not create or approve a pull request. The SHA-bound human sentence remains empty and must be written by the human reviewer.`,
+					`${approvedDraft.body}\n\nThis approval pushes only the verified candidate ${currentHead} with \`${currentHead}:refs/heads/${contribution.branch}\` through the confirmed fork remote ${contribution.remoteName}. Its verified push-effective destination is ${reviewPushRemoteUrl}, and the candidate branch must be absent. A command-scoped explicit pushurl prevents Git URL rewrite rules from changing that destination. This does not create or approve a pull request. The SHA-bound human sentence remains empty and must be written by the human reviewer.`,
 				);
 				if (!approved) return;
 				try {
@@ -793,84 +858,96 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 					ctx.ui.notify(`Contribution review failed: ${describeContributionError(error)}`, "error");
 					return;
 				}
-				const priorPublicationController = contributionPublicationControllers.get(reviewSessionKey);
-				priorPublicationController?.abort();
-				const publicationController = new AbortController();
-				contributionPublicationControllers.set(reviewSessionKey, publicationController);
+				if (contributionPublicationOperations.has(reviewSessionKey)) {
+					ctx.ui.notify("A contribution publication is already active for this session.", "error");
+					return;
+				}
+				const publicationOperation: ContributionPublicationOperation = {
+					controller: new AbortController(),
+					phase: "pre-push",
+					settlement: Promise.withResolvers<void>(),
+				};
+				contributionPublicationOperations.set(reviewSessionKey, publicationOperation);
 				const authorizePublication = (): void => {
-					throwIfAborted(publicationController.signal);
-					if (contributionPublicationControllers.get(reviewSessionKey) !== publicationController) {
+					throwIfAborted(publicationOperation.controller.signal);
+					if (contributionPublicationOperations.get(reviewSessionKey) !== publicationOperation) {
 						throw new Error("Contribution publication authorization changed.");
 					}
 					assertContributionIdentity();
 				};
-
-				let publication: PublishedContributionCandidate;
-				try {
-					publication = await publishContributionCandidate({
-						cwd: ctx.cwd,
-						remoteName: contribution.remoteName,
-						confirmedRemoteUrl: contribution.remoteUrl,
-						confirmedPushRemoteUrl: reviewPushRemoteUrl,
-						branchName: contribution.branch,
-						currentBranch,
-						currentHead,
-						baseProof: contribution.baseProof,
-						worktreeClean: statusOutput.length === 0,
-						currentSegment: runtime.state.currentSegment,
-						goal: contribution.goal,
-						candidate,
-						approvedDraft,
-						signal: publicationController.signal,
-						authorizePush: authorizePublication,
-						git: contributionPublicationGit,
-					});
+				const authorizePush = (): void => {
 					authorizePublication();
-				} catch (error) {
-					ctx.ui.notify(`Contribution review failed: ${describeContributionError(error)}`, "error");
-					return;
-				} finally {
-					if (contributionPublicationControllers.get(reviewSessionKey) === publicationController) {
-						contributionPublicationControllers.delete(reviewSessionKey);
-					}
-				}
-
-				runtime.contribution = {
-					...contribution,
-					status: "review",
-					candidateHead: currentHead,
-					publication,
+					publicationOperation.phase = "pushing";
 				};
-				runtime.autoresearchMode = false;
-				runtime.autoResumeArmed = false;
 
-				const cleanupWarnings: string[] = [];
 				try {
-					await closeContributionSession(ctx, contribution);
-				} catch (error) {
-					cleanupWarnings.push(`session close: ${describeContributionError(error)}`);
-				}
-				try {
-					const experimentTools = new Set(EXPERIMENT_TOOL_NAMES);
-					await api.setActiveTools(api.getActiveTools().filter(name => !experimentTools.has(name)));
-				} catch (error) {
-					cleanupWarnings.push(`tool deactivation: ${describeContributionError(error)}`);
-				}
-				try {
-					dashboard.updateWidget(ctx, runtime);
-				} catch (error) {
-					cleanupWarnings.push(`dashboard update: ${describeContributionError(error)}`);
-				}
-				if (cleanupWarnings.length > 0) {
+					let publication: PublishedContributionCandidate;
+					try {
+						publication = await publishContributionCandidate({
+							cwd: ctx.cwd,
+							remoteName: contribution.remoteName,
+							confirmedRemoteUrl: contribution.remoteUrl,
+							confirmedPushRemoteUrl: reviewPushRemoteUrl,
+							branchName: contribution.branch,
+							currentBranch,
+							currentHead,
+							baseProof: contribution.baseProof,
+							worktreeClean: statusOutput.length === 0,
+							currentSegment: runtime.state.currentSegment,
+							goal: contribution.goal,
+							candidate,
+							approvedDraft,
+							signal: publicationOperation.controller.signal,
+							authorizePush,
+							git: contributionPublicationGit,
+						});
+					} catch (error) {
+						ctx.ui.notify(`Contribution review failed: ${describeContributionError(error)}`, "error");
+						return;
+					}
+					publicationOperation.phase = "committed";
+					runtime.contribution = {
+						...contribution,
+						status: "review",
+						candidateHead: currentHead,
+						publication,
+					};
+					runtime.autoresearchMode = false;
+					runtime.autoResumeArmed = false;
+
+					const cleanupWarnings: string[] = [];
+					try {
+						await closeContributionSession(ctx, contribution);
+					} catch (error) {
+						cleanupWarnings.push(`session close: ${describeContributionError(error)}`);
+					}
+					try {
+						const experimentTools = new Set(EXPERIMENT_TOOL_NAMES);
+						await api.setActiveTools(api.getActiveTools().filter(name => !experimentTools.has(name)));
+					} catch (error) {
+						cleanupWarnings.push(`tool deactivation: ${describeContributionError(error)}`);
+					}
+					try {
+						dashboard.updateWidget(ctx, runtime);
+					} catch (error) {
+						cleanupWarnings.push(`dashboard update: ${describeContributionError(error)}`);
+					}
+					if (cleanupWarnings.length > 0) {
+						ctx.ui.notify(
+							`Contribution candidate was pushed, but cleanup needs attention: ${cleanupWarnings.join("; ")}`,
+							"warning",
+						);
+					}
 					ctx.ui.notify(
-						`Contribution candidate was pushed, but cleanup needs attention: ${cleanupWarnings.join("; ")}`,
-						"warning",
+						`Immutable SHA review: ${publication.reviewUrl}\nMutable branch compare: ${publication.compareUrl}\n\nPR draft (human sentence intentionally empty):\n${publication.prDraft.title}\n\n${publication.prDraft.body}`,
+						"info",
 					);
+				} finally {
+					if (contributionPublicationOperations.get(reviewSessionKey) === publicationOperation) {
+						contributionPublicationOperations.delete(reviewSessionKey);
+					}
+					publicationOperation.settlement.resolve();
 				}
-				ctx.ui.notify(
-					`Immutable SHA review: ${publication.reviewUrl}\nMutable branch compare: ${publication.compareUrl}\n\nPR draft (human sentence intentionally empty):\n${publication.prDraft.title}\n\n${publication.prDraft.body}`,
-					"info",
-				);
 				return;
 			}
 
@@ -891,8 +968,7 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 				"Run bounded read-only discovery of official goal provenance, authenticated models, the clean base, active autoresearch state, and GitHub fork remotes? No model, branch, tools, or durable contribution state will change.",
 			);
 			if (!preflightConfirmed) return;
-			const preflightInitSettlement = invalidateInitExperimentOperation(getSessionKey(ctx));
-			if (preflightInitSettlement) await preflightInitSettlement;
+			await drainAutoresearchMutationOperations(getSessionKey(ctx));
 
 			let contributionStartSessionKey: string | null = null;
 			let contributionStartTransaction: ContributionStartTransaction | null = null;
@@ -995,8 +1071,7 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 					`Goal: ${goal.title}\nOfficial main commit/base: ${goal.commitSha}\nGoal blob: ${goal.blobSha}\nGoal SHA-256: ${goal.sha256}\nModel: ${selectedModel.provider}/${selectedModel.id}\nConfirmed fork: ${selectedRemote.name} (${selectedRemote.url})\nVerified push-effective destination: ${selectedRemote.pushUrl}\nFresh local candidate branch: ${branchName}\n\nThis native OMP session continues indefinitely until /contribute off, an input/review gate, interruption, or session exit. It consumes model tokens, runs tests/commands under normal approval policy, and may create commits on the candidate branch. /contribute review requires another exact approval before an absent candidate branch is pushed to this fork; it never opens a pull request.\n\nOn confirmation only: recheck the official base and fork, switch model, create this exact branch from the frozen base commit, activate the existing autoresearch tools, then start the turn. Global approval policy is unchanged.`,
 				);
 				if (!finalConfirmed) return;
-				const confirmedInitSettlement = invalidateInitExperimentOperation(startSessionKey);
-				if (confirmedInitSettlement) await confirmedInitSettlement;
+				await drainAutoresearchMutationOperations(startSessionKey);
 				assertContributionStartFresh(
 					ctx,
 					runtime,
