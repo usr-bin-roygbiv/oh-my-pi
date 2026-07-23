@@ -153,19 +153,22 @@ The first confirmation authorizes bounded, read-only preflight only. Preflight:
 - fetches the official `main` goal and provenance;
 - verifies clean local `HEAD` equals that official-main commit;
 - rejects active/resumable autoresearch state or an existing autoresearch branch;
-- lists authenticated models and safe GitHub fork remotes;
+- lists authenticated models and GitHub remotes whose fetch and push-effective
+  destinations resolve to the same safe fork;
 - verifies the selected repository is a GitHub fork of `can1357/oh-my-pi`.
 
 The final confirmation discloses the exact goal title, official-main commit/base,
 goal blob SHA, goal SHA-256, selected `provider/model`, fork remote name and URL,
-and fresh candidate branch. It also discloses that the foreground session can run
+push-effective destination, and fresh candidate branch. It also discloses that the
+foreground session can run
 indefinitely, consumes model tokens, executes tests and commands under normal
 approval policy, and may create commits. Confirm only those exact values and
 costs. The command does not estimate or cap provider charges.
 
-After confirmation OMP rechecks the goal, base, fork URL, fork metadata, and fresh
-branch name; switches model; creates the candidate branch at the frozen base;
-activates existing autoresearch tools; and starts the goal turn. It never weakens
+After confirmation OMP rechecks the goal, base, fork URL, push-effective URL,
+fork metadata, and fresh branch name; switches model; creates the candidate branch
+at the frozen base; activates existing autoresearch tools; and starts the goal
+turn. It never weakens
 approval mode.
 
 Use:
@@ -227,18 +230,21 @@ Prepare an unflagged `keep` result in the current segment, with its commit at ex
 ```
 
 Review revalidates the recorded branch, exact candidate `HEAD`, frozen-base
-ancestry, current-segment kept result, clean worktree, unchanged remote URL, and
-GitHub fork metadata. It builds the exact PR title/body and asks for a second
-confirmation. That confirmation authorizes only this push:
+ancestry, current-segment kept result, clean worktree, unchanged fetch and
+push-effective remote URLs, and GitHub fork metadata. It builds the exact PR
+title/body and asks for a second confirmation. That confirmation authorizes only
+this push:
 
 ```text
 HEAD:refs/heads/<candidate-branch>
 ```
 
-The destination is the previously confirmed fork URL. A force-with-lease expecting
-an absent remote branch prevents overwriting an existing ref. Nothing is pushed to
-the official repository. The command never creates, approves, or merges a pull
-request.
+The destination is the verified push-effective URL for the previously confirmed
+fork. A unique command-scoped remote with an explicit `pushurl` prevents
+`url.*.pushInsteadOf` or a configured `pushurl` from redirecting the operation.
+A force-with-lease expecting an absent remote branch prevents overwriting an
+existing ref. Nothing is pushed to the official repository. The command never
+creates, approves, or merges a pull request.
 
 After the push, OMP stops the research loop and prints:
 

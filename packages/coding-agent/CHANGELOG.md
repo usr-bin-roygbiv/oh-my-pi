@@ -3,7 +3,7 @@
 ## [Unreleased]
 ### Added
 
-- Added opt-in `/contribute` spare-machine research with fork-only exact-SHA publication and a human-gated pull-request handoff.
+- Added opt-in `/contribute` spare-machine research with push-effective fork verification, rewrite-isolated exact-SHA publication, and a human-gated pull-request handoff.
 
 ## [17.1.2] - 2026-07-24
 
