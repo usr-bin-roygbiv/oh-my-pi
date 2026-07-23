@@ -16,6 +16,7 @@ on:
           - check
           - coding-agent-runtime
           - smoke
+          - format-patch
 
 permissions:
   contents: read
@@ -49,7 +50,7 @@ jobs:
           test "$actual" = "$TARGET_SHA"
       - uses: ./.github/actions/bun-install
       - name: Build native addon
-        if: inputs.suite != 'check'
+        if: inputs.suite != 'check' && inputs.suite != 'format-patch'
         run: bun run build:native
       - name: Focused contribution contract
         if: inputs.suite == 'contract'
@@ -57,6 +58,20 @@ jobs:
       - name: Workspace type and format checks
         if: inputs.suite == 'check'
         run: bun run ci:check:full
+      - name: Format affected TypeScript
+        if: inputs.suite == 'format-patch'
+        run: bunx biome format --write packages/coding-agent/src/autoresearch/contribution.ts packages/coding-agent/src/autoresearch/index.ts packages/coding-agent/src/autoresearch/tools/init-experiment.ts packages/coding-agent/test/autoresearch-contribution.test.ts
+      - name: Capture formatting patch
+        if: inputs.suite == 'format-patch'
+        run: git diff --binary -- packages/coding-agent/src/autoresearch/contribution.ts packages/coding-agent/src/autoresearch/index.ts packages/coding-agent/src/autoresearch/tools/init-experiment.ts packages/coding-agent/test/autoresearch-contribution.test.ts > /tmp/format.patch
+      - name: Upload formatting patch
+        if: inputs.suite == 'format-patch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: format-patch-${{ inputs.target_sha }}
+          path: /tmp/format.patch
+          if-no-files-found: error
+          retention-days: 1
       - name: Coding-agent runtime tests
         if: inputs.suite == 'coding-agent-runtime'
         run: bun run ci:test:coding-agent:runtime
