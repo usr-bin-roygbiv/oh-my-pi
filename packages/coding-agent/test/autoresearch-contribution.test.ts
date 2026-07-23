@@ -1342,10 +1342,11 @@ function createIntegrationHarness(cwd: string, options: IntegrationHarnessOption
 	const statusMock = Object.assign(
 		async (...args: Parameters<typeof git.status>) => {
 			const callback = nextStatusRequest;
+			const response = statusText;
 			nextStatusRequest = null;
 			await callback?.(args[1]?.signal);
-			gitEvents.push(`status:${statusText}`);
-			return statusText;
+			gitEvents.push(`status:${response}`);
+			return response;
 		},
 		{ parse: git.status.parse, summary: git.status.summary },
 	);
@@ -2127,11 +2128,15 @@ describe("process-local contribution lifecycle", () => {
 		await Bun.write(`${cwd.path()}/autoresearch.sh`, "#!/usr/bin/env bash\necho METRIC runtime_ms=1\n");
 		const init = harness.tools.get("init_experiment");
 		if (!init) throw new Error("Expected init_experiment tool");
+		harness.setCurrentBranch("autoresearch/ordinary");
+		harness.setStatusText(" M autoresearch.sh\0");
 		const statusEntered = Promise.withResolvers<AbortSignal | undefined>();
 		const statusAbortObserved = Promise.withResolvers<void>();
 		const releaseStatus = Promise.withResolvers<void>();
 		harness.setNextStatusRequest(async signal => {
 			statusEntered.resolve(signal);
+			harness.setCurrentBranch("main");
+			harness.setStatusText("");
 			if (signal?.aborted) {
 				statusAbortObserved.resolve();
 			} else {
