@@ -635,6 +635,8 @@ export async function openAutoresearchStorage(
 	const cached = storageCache.get(dbPath);
 	if (cached) return cached;
 	await beforeCreate?.();
+	const createdWhileWaiting = storageCache.get(dbPath);
+	if (createdWhileWaiting) return createdWhileWaiting;
 	fs.mkdirSync(path.dirname(dbPath), { recursive: true });
 	const storage = new AutoresearchStorage(dbPath, projectDir);
 	storageCache.set(dbPath, storage);
