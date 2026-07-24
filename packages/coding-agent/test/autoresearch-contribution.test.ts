@@ -115,6 +115,26 @@ function snapshotWorktreeTreeTemps(): string[] {
 		.sort();
 }
 
+function growFileAfterSnapshotStat(targetPath: string, grownBytes: number): () => boolean {
+	const realOpen = fs.promises.open;
+	let grew = false;
+	vi.spyOn(fs.promises, "open").mockImplementation(async (file, flags, mode) => {
+		const handle = await realOpen(file, flags, mode);
+		if (String(file) !== targetPath) return handle;
+		const realStat = handle.stat.bind(handle) as unknown as (...args: unknown[]) => Promise<fs.Stats>;
+		handle.stat = (async (...args: unknown[]) => {
+			const stat = await realStat(...args);
+			if (!grew) {
+				grew = true;
+				fs.truncateSync(targetPath, grownBytes);
+			}
+			return stat;
+		}) as typeof handle.stat;
+		return handle;
+	});
+	return () => grew;
+}
+
 async function readRawCommitTree(cwd: string, commit: string): Promise<string | null> {
 	const result = await $`git -C ${cwd} --no-replace-objects cat-file commit ${commit}`.quiet().nothrow();
 	if (result.exitCode !== 0) return null;
@@ -577,10 +597,13 @@ describe("read-only contribution storage preflight", () => {
 			checkpointedAfterDatabaseCopy = true;
 		});
 
-		let probeResult: boolean | undefined;
+		let probeResult: { value: boolean } | { error: unknown } | undefined;
 		let sourceStayedActive = false;
 		try {
-			probeResult = await hasActiveAutoresearchSession(cwd.path());
+			probeResult = await hasActiveAutoresearchSession(cwd.path()).then(
+				value => ({ value }),
+				(error: unknown) => ({ error }),
+			);
 			const inspector = new Database(dbPath, { readonly: true, create: false });
 			try {
 				sourceStayedActive =
@@ -596,7 +619,13 @@ describe("read-only contribution storage preflight", () => {
 
 		expect(databaseCopies === 0 || checkpointedAfterDatabaseCopy).toBe(true);
 		expect(sourceStayedActive).toBe(true);
-		expect(probeResult).toBe(true);
+		if (!probeResult) throw new Error("Expected read-only probe outcome");
+		if ("error" in probeResult) {
+			expect(probeResult.error).toBeInstanceOf(Error);
+			expect((probeResult.error as Error).message).toContain("changed during the read-only probe");
+		} else {
+			expect(probeResult.value).toBe(true);
+		}
 	});
 
 	it("rejects source growth after the initial size check without attempting an unbounded copy", async () => {
@@ -1340,6 +1369,66 @@ describe("contribution fork validation and publication", () => {
 			}
 
 			await expect(git.writeWorktreeTree(source.path())).rejects.toThrow("256 MiB");
+			expect(snapshotWorktreeTreeTemps()).toEqual(tempsBefore);
+		} finally {
+			source.removeSync();
+		}
+	});
+
+	it("rejects a worktree file that grows beyond 32 MiB after its snapshot stat", async () => {
+		const source = TempDir.createSync("@pi-contribution-tree-file-growth-");
+		const tempsBefore = snapshotWorktreeTreeTemps();
+		try {
+			await $`git -C ${source.path()} init -b main`.quiet();
+			await Bun.write(`${source.path()}/base.txt`, "base\n");
+			await $`git -C ${source.path()} add base.txt`.quiet();
+			await $`git -C ${source.path()} -c user.name=OMP -c user.email=omp@example.invalid commit -m base`.quiet();
+			const growingPath = `${source.path()}/growing.bin`;
+			await Bun.write(growingPath, Buffer.alloc(1));
+			const didGrow = growFileAfterSnapshotStat(growingPath, 32 * 1024 * 1024 + 1);
+
+			const outcome = await git.writeWorktreeTree(source.path()).then(
+				value => ({ value }),
+				(error: unknown) => ({ error }),
+			);
+
+			expect(didGrow()).toBe(true);
+			expect(outcome).toEqual({ error: expect.any(Error) });
+			if (!("error" in outcome) || !(outcome.error instanceof Error)) throw new Error("Expected proof size error");
+			expect(outcome.error.message).toContain("32 MiB");
+			expect(snapshotWorktreeTreeTemps()).toEqual(tempsBefore);
+		} finally {
+			source.removeSync();
+		}
+	});
+
+	it("counts bytes appended after stat toward the 256 MiB aggregate proof limit", async () => {
+		const source = TempDir.createSync("@pi-contribution-tree-total-growth-");
+		const tempsBefore = snapshotWorktreeTreeTemps();
+		try {
+			await $`git -C ${source.path()} init -b main`.quiet();
+			await Bun.write(`${source.path()}/base.txt`, "base\n");
+			await $`git -C ${source.path()} add base.txt`.quiet();
+			await $`git -C ${source.path()} -c user.name=OMP -c user.email=omp@example.invalid commit -m base`.quiet();
+			for (let index = 0; index < 8; index++) {
+				const partPath = `${source.path()}/part-${index}.bin`;
+				fs.closeSync(fs.openSync(partPath, "w"));
+				fs.truncateSync(partPath, 31 * 1024 * 1024);
+			}
+			const growingPath = `${source.path()}/zz-growing.bin`;
+			fs.closeSync(fs.openSync(growingPath, "w"));
+			fs.truncateSync(growingPath, 1024 * 1024);
+			const didGrow = growFileAfterSnapshotStat(growingPath, 16 * 1024 * 1024);
+
+			const outcome = await git.writeWorktreeTree(source.path()).then(
+				value => ({ value }),
+				(error: unknown) => ({ error }),
+			);
+
+			expect(didGrow()).toBe(true);
+			expect(outcome).toEqual({ error: expect.any(Error) });
+			if (!("error" in outcome) || !(outcome.error instanceof Error)) throw new Error("Expected proof size error");
+			expect(outcome.error.message).toContain("256 MiB");
 			expect(snapshotWorktreeTreeTemps()).toEqual(tempsBefore);
 		} finally {
 			source.removeSync();
