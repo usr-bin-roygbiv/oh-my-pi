@@ -330,7 +330,11 @@ describe("wrapLeakedThinkingStream", () => {
 			const withCall = msg({ content: [signedBlock, call] });
 			inner.push({ type: "toolcall_start", contentIndex: 1, partial: withCall });
 			inner.push({ type: "toolcall_end", contentIndex: 1, toolCall: call, partial: withCall });
-			inner.push({ type: "done", reason: "toolUse", message: msg({ content: [signedBlock, call], stopReason: "toolUse" }) });
+			inner.push({
+				type: "done",
+				reason: "toolUse",
+				message: msg({ content: [signedBlock, call], stopReason: "toolUse" }),
+			});
 		});
 
 		expect(result.content.map(b => b.type)).toEqual(["thinking", "toolCall"]);
@@ -350,9 +354,7 @@ describe("wrapLeakedThinkingStream", () => {
 			inner.push({ type: "done", reason: "stop", message: msg({ content: [block] }) });
 		});
 
-		expect(thinks(result).map(b => [b.thinking, b.thinkingSignature])).toEqual([
-			["recovered reasoning", signature],
-		]);
+		expect(thinks(result).map(b => [b.thinking, b.thinkingSignature])).toEqual([["recovered reasoning", signature]]);
 	});
 
 	it("preserves native tool-call ids and streamed partial JSON while healing", async () => {
