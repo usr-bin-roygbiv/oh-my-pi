@@ -174,7 +174,9 @@ export function createRunExperimentTool(
 							operationSignal,
 						);
 						if (!sameContributionExecutionProof(contributionProof, postExecutionProof)) {
-							throw new Error("Contribution harness, invocation, HEAD, or worktree bytes changed during execution.");
+							throw new Error(
+								"Contribution harness, invocation, HEAD, or worktree bytes changed during execution.",
+							);
 						}
 					}
 				} finally {

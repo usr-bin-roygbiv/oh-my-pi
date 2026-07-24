@@ -1137,7 +1137,7 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 				}
 				releaseAdmission();
 			}
-		}
+		},
 	});
 
 	api.registerCommand("contribute", {
@@ -1519,7 +1519,10 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 			}
 			const contributionStartSession = getSessionKey(ctx);
 			if (autoresearchCommandOperations.has(contributionStartSession)) {
-				ctx.ui.notify("Wait for the active autoresearch lifecycle operation before starting contribution mode.", "error");
+				ctx.ui.notify(
+					"Wait for the active autoresearch lifecycle operation before starting contribution mode.",
+					"error",
+				);
 				return;
 			}
 			if (!ctx.hasUI) {
@@ -2063,7 +2066,8 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 		}
 		const storage = await openAutoresearchStorageIfExists(ctx.cwd);
 		if (!lifecycleIdentityIsCurrent(ctx, identity)) return;
-		const nextState = session && storage ? buildExperimentState(session, storage.listLoggedRuns(session.id)) : runtime.state;
+		const nextState =
+			session && storage ? buildExperimentState(session, storage.listLoggedRuns(session.id)) : runtime.state;
 		const pendingRow = session && storage ? storage.getPendingRun(session.id) : null;
 		const pendingRun = pendingRunSummaryFromRow(pendingRow);
 		if (!lifecycleIdentityIsCurrent(ctx, identity)) return;

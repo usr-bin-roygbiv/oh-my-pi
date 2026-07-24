@@ -35,13 +35,13 @@ import {
 	verifyContributionBase,
 	verifyContributionFork,
 } from "@oh-my-pi/pi-coding-agent/autoresearch/contribution";
+import * as autoresearchStorage from "@oh-my-pi/pi-coding-agent/autoresearch/storage";
 import {
 	closeAllAutoresearchStorages,
 	hasActiveAutoresearchSession,
 	openAutoresearchStorage,
 	type SessionRow,
 } from "@oh-my-pi/pi-coding-agent/autoresearch/storage";
-import * as autoresearchStorage from "@oh-my-pi/pi-coding-agent/autoresearch/storage";
 import * as bashExecutor from "@oh-my-pi/pi-coding-agent/exec/bash-executor";
 import type {
 	AgentEndEvent,
@@ -88,7 +88,9 @@ function snapshotFileSizes(root: string): string[] {
 	if (!fs.existsSync(root)) return [];
 	const files: string[] = [];
 	const visit = (directory: string): void => {
-		for (const entry of fs.readdirSync(directory, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+		for (const entry of fs
+			.readdirSync(directory, { withFileTypes: true })
+			.sort((a, b) => a.name.localeCompare(b.name))) {
 			const entryPath = `${directory}/${entry.name}`;
 			if (entry.isDirectory()) visit(entryPath);
 			else if (entry.isFile()) files.push(`${entryPath.slice(root.length + 1)}:${fs.statSync(entryPath).size}`);
@@ -183,9 +185,7 @@ function makeGoal(overrides: Partial<ContributionGoal> = {}): ContributionGoal {
 	};
 }
 
-function makeCandidate(
-	overrides: Partial<ContributionCandidate> & { treeSha?: string } = {},
-): ContributionCandidate {
+function makeCandidate(overrides: Partial<ContributionCandidate> & { treeSha?: string } = {}): ContributionCandidate {
 	return {
 		status: "keep",
 		runNumber: 7,
@@ -1052,9 +1052,10 @@ describe("contribution fork validation and publication", () => {
 					request: async () => ({ fork: true, parent: "can1357/oh-my-pi", source: "can1357/oh-my-pi" }),
 				}),
 			).rejects.toMatchObject({ code: "push_failed" });
-			const remoteRef = await $`git --git-dir ${remote.path()} show-ref --verify --quiet refs/heads/${CONTRIBUTION_BRANCH}`
-				.quiet()
-				.nothrow();
+			const remoteRef =
+				await $`git --git-dir ${remote.path()} show-ref --verify --quiet refs/heads/${CONTRIBUTION_BRANCH}`
+					.quiet()
+					.nothrow();
 			expect(await Bun.file(hookMarker).text()).toBe("rejected");
 			expect(remoteRef.exitCode).not.toBe(0);
 		} finally {
@@ -1108,21 +1109,19 @@ describe("contribution fork validation and publication", () => {
 			const callBunFile = Bun.file as unknown as (input: unknown) => unknown;
 			let graftRead = false;
 			let graftInstalled = false;
-			vi.spyOn(Bun, "file").mockImplementation(
-				((input: unknown) => {
-					if (String(input) !== graftPath) return callBunFile(input) as never;
-					return {
-						text: () =>
-							new Promise<string>(resolve => {
-								graftRead = true;
-								resolve("");
-								fs.mkdirSync(`${source.path()}/.git/info`, { recursive: true });
-								fs.writeFileSync(graftPath, `${unrelatedSha} ${baseSha}\n`);
-								graftInstalled = true;
-							}),
-					} as never;
-				}) as typeof Bun.file,
-			);
+			vi.spyOn(Bun, "file").mockImplementation(((input: unknown) => {
+				if (String(input) !== graftPath) return callBunFile(input) as never;
+				return {
+					text: () =>
+						new Promise<string>(resolve => {
+							graftRead = true;
+							resolve("");
+							fs.mkdirSync(`${source.path()}/.git/info`, { recursive: true });
+							fs.writeFileSync(graftPath, `${unrelatedSha} ${baseSha}\n`);
+							graftInstalled = true;
+						}),
+				} as never;
+			}) as typeof Bun.file);
 
 			const isRawAncestor = await git.isAncestor(source.path(), baseSha, unrelatedSha);
 
@@ -2309,13 +2308,13 @@ async function prepareKeptContribution(
 						...(options.invocationProof === "missing"
 							? {}
 							: {
-								[CONTRIBUTION_INVOCATION_SHA256_ASI_KEY]:
-									options.invocationProof === "timeout-changed"
-										? TIMEOUT_CHANGED_INVOCATION_SHA256
-										: options.invocationProof === "config-changed"
-											? CONFIG_CHANGED_INVOCATION_SHA256
-											: INVOCATION_SHA256,
-							}),
+									[CONTRIBUTION_INVOCATION_SHA256_ASI_KEY]:
+										options.invocationProof === "timeout-changed"
+											? TIMEOUT_CHANGED_INVOCATION_SHA256
+											: options.invocationProof === "config-changed"
+												? CONFIG_CHANGED_INVOCATION_SHA256
+												: INVOCATION_SHA256,
+								}),
 					},
 	});
 	storage.markRunLogged({
@@ -2428,12 +2427,9 @@ describe("process-local contribution lifecycle", () => {
 			await startContribution(harness);
 			contributionStarted = true;
 			const transitionId = `named-${transition}-stop`;
-			let result: Promise<{ cancel?: boolean } | void> | { cancel?: boolean } | void;
+			let result: Promise<{ cancel?: boolean } | undefined> | { cancel?: boolean } | void;
 			if (transition === "switch") {
-				result = handlerRequired<SessionBeforeSwitchEvent, { cancel?: boolean }>(
-					harness,
-					"session_before_switch",
-				)(
+				result = handlerRequired<SessionBeforeSwitchEvent, { cancel?: boolean }>(harness, "session_before_switch")(
 					{
 						type: "session_before_switch",
 						transitionId,
@@ -2443,10 +2439,7 @@ describe("process-local contribution lifecycle", () => {
 					harness.ctx as ExtensionContext,
 				);
 			} else if (transition === "branch") {
-				result = handlerRequired<SessionBeforeBranchEvent, { cancel?: boolean }>(
-					harness,
-					"session_before_branch",
-				)(
+				result = handlerRequired<SessionBeforeBranchEvent, { cancel?: boolean }>(harness, "session_before_branch")(
 					{ type: "session_before_branch", transitionId, entryId: "named-transition-source" },
 					harness.ctx as ExtensionContext,
 				);
@@ -2521,7 +2514,8 @@ describe("process-local contribution lifecycle", () => {
 			selectedModelId: selectedModel.id,
 			setActiveToolsFailureAt: 1,
 			onSetActiveTools(_callNumber, names) {
-				if (names.length !== initialTools.length || names.some((name, index) => name !== initialTools[index])) return;
+				if (names.length !== initialTools.length || names.some((name, index) => name !== initialTools[index]))
+					return;
 				rollbackEntered.resolve();
 				return releaseRollback.promise;
 			},
@@ -2973,14 +2967,18 @@ describe("process-local contribution lifecycle", () => {
 			};
 		});
 
-		await Promise.allSettled([run.execute("self-mutating-harness", {}, undefined, undefined, harness.ctx as ExtensionContext)]);
+		await Promise.allSettled([
+			run.execute("self-mutating-harness", {}, undefined, undefined, harness.ctx as ExtensionContext),
+		]);
 		const pending = storage.getPendingRun(session.id);
 
-		expect({ executionCalls, completedAt: pending?.completedAt, logged: storage.listLoggedRuns(session.id) }).toEqual({
-			executionCalls: 1,
-			completedAt: null,
-			logged: [],
-		});
+		expect({ executionCalls, completedAt: pending?.completedAt, logged: storage.listLoggedRuns(session.id) }).toEqual(
+			{
+				executionCalls: 1,
+				completedAt: null,
+				logged: [],
+			},
+		);
 	});
 
 	it("leaves a self-modifying contribution harness incomplete and ineligible for logging", async () => {
@@ -4306,13 +4304,7 @@ describe("process-local contribution lifecycle", () => {
 		vi.spyOn(git, "reset").mockResolvedValue();
 		vi.spyOn(git, "clean").mockResolvedValue();
 
-		await run.execute(
-			"spoofed-red",
-			{ timeout_seconds: 1 },
-			undefined,
-			undefined,
-			harness.ctx as ExtensionContext,
-		);
+		await run.execute("spoofed-red", { timeout_seconds: 1 }, undefined, undefined, harness.ctx as ExtensionContext);
 		await log.execute(
 			"log-spoofed-red",
 			{
@@ -4329,13 +4321,7 @@ describe("process-local contribution lifecycle", () => {
 			undefined,
 			harness.ctx as ExtensionContext,
 		);
-		await run.execute(
-			"spoofed-green",
-			{ timeout_seconds: 2 },
-			undefined,
-			undefined,
-			harness.ctx as ExtensionContext,
-		);
+		await run.execute("spoofed-green", { timeout_seconds: 2 }, undefined, undefined, harness.ctx as ExtensionContext);
 		harness.setHeadSha(CURRENT_HEAD);
 		await log.execute(
 			"log-spoofed-green",

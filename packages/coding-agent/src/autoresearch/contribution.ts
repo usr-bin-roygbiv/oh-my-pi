@@ -668,14 +668,7 @@ export async function publishContributionCandidate(
 		options.branchName,
 		options.baseProof,
 	);
-	if (
-		!(await publicationGit.isAncestor(
-			options.cwd,
-			options.baseProof.baseSha,
-			candidateSha,
-			options.signal,
-		))
-	) {
+	if (!(await publicationGit.isAncestor(options.cwd, options.baseProof.baseSha, candidateSha, options.signal))) {
 		throw new ContributionError(
 			"candidate_not_descendant",
 			"The contribution candidate does not descend from the frozen official base.",
