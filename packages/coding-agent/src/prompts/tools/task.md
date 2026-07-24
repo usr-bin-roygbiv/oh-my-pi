@@ -14,6 +14,9 @@ Agents marked BLOCKING run inline — results return in this call; non-blocking 
 - **Agent typing:** Pick each item's `agent` type. Read-only research MUST use `agent: "scout"` (faster model). Use default worker only when no specialist fits.
 - **No overhead:** Each `task` MUST instruct its agent to skip formatters, linters, and project-wide test suites. Run those once at the end.
 - **One-pass:** Prefer agents that investigate AND edit in one pass; spin a read-only scout only when affected files are genuinely unknown.
+- **Overlap is safe:** Concurrent edits to the same files auto-resolve{{#if ircEnabled}}; worst case, agents coordinate directly over IRC{{/if}}. NEVER shrink or serialize a batch to avoid file overlap. Two prerequisites:
+  1. Every task MUST skip validation (build/lint/tests) — validating mid-flight blocks agents on each other's edits.
+  2. Decide cross-task contracts up front (e.g. the interface A implements and B consumes) and state them in the {{#if batchEnabled}}batch `context`{{else}}task{{/if}}, not left for agents to negotiate.
 
 # Inputs
 {{#if batchEnabled}}
