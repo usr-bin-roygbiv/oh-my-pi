@@ -47,18 +47,26 @@ describe("issue #6510 — opencode-zen Anthropic auth + context_management", () 
 		expect(options.defaultHeaders.Authorization).toBeUndefined();
 	});
 
-	it("omits context_management on Zen thinking requests", async () => {
+	it("omits context_management and its beta on Zen thinking requests", async () => {
+		let capturedBeta: string | null = null;
+		const fetchMock = (async (_input: string | URL | Request, init?: RequestInit) => {
+			capturedBeta = new Headers(init?.headers).get("anthropic-beta");
+			return new Response(
+				JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: "captured" } }),
+				{ status: 400, headers: { "Content-Type": "application/json" } },
+			);
+		}) as typeof fetch;
 		const { promise, resolve } = Promise.withResolvers<unknown>();
-		streamAnthropic(
+		await streamAnthropic(
 			ZEN_ANTHROPIC_MODEL,
 			{ systemPrompt: [], messages: [{ role: "user", content: "continue", timestamp: 0 }] },
 			{
 				apiKey: "sk-zen-test",
-				signal: AbortSignal.abort(),
 				thinkingEnabled: true,
+				fetch: fetchMock,
 				onPayload: payload => resolve(payload),
 			},
-		);
+		).result();
 
 		const payload = (await promise) as {
 			thinking?: { type?: string };
@@ -66,5 +74,6 @@ describe("issue #6510 — opencode-zen Anthropic auth + context_management", () 
 		};
 		expect(payload.thinking?.type).toBe("enabled");
 		expect(payload.context_management).toBeUndefined();
+		expect(capturedBeta ?? "").not.toContain("context-management-2025-06-27");
 	});
 });

@@ -1870,15 +1870,17 @@ const streamAnthropicOnce = (
 				// `context_management.clear_thinking_20251015` requires this beta. OAuth
 				// requests carry it in `claudeCodeAgentBetaDefaults`; API-key requests
 				// need it added explicitly so the field is honored instead of rejected
-				// (#3288). Skip transports where this package cannot deliver the beta
-				// in the form their adapter accepts: Copilot strips Anthropic betas,
-				// and Vertex rawPredict needs betas in the body (`anthropic_beta`),
-				// not as an `anthropic-beta` HTTP header.
+				// (#3288). Skip transports where this package cannot deliver or the
+				// provider cannot accept the beta: Copilot strips Anthropic betas;
+				// Vertex rawPredict needs betas in the body (`anthropic_beta`), not as
+				// an `anthropic-beta` HTTP header; and OpenCode Zen rejects the related
+				// `context_management` field (#6510).
 				if (
 					model.reasoning &&
 					options?.thinkingEnabled &&
 					model.provider !== "github-copilot" &&
 					model.provider !== "google-vertex" &&
+					model.provider !== "opencode-zen" &&
 					!extraBetas.includes(contextManagementBeta)
 				) {
 					extraBetas.push(contextManagementBeta);
