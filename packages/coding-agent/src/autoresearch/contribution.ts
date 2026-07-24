@@ -16,6 +16,13 @@ export const CONTRIBUTION_RESULT_PLACEHOLDER =
 	"[EMPTY — required: describe the observed result before opening the pull request]" as const;
 export const CONTRIBUTION_HARNESS_SHA256_ASI_KEY = "_omp_contribution_harness_sha256" as const;
 export const CONTRIBUTION_WORKTREE_TREE_ASI_KEY = "_omp_contribution_worktree_tree" as const;
+export const CONTRIBUTION_INVOCATION_SHA256_ASI_KEY = "_omp_contribution_invocation_sha256" as const;
+export const CONTRIBUTION_HARNESS_MAX_BYTES = 1024 * 1024;
+export const CONTRIBUTION_RESERVED_ASI_KEYS = [
+	CONTRIBUTION_HARNESS_SHA256_ASI_KEY,
+	CONTRIBUTION_WORKTREE_TREE_ASI_KEY,
+	CONTRIBUTION_INVOCATION_SHA256_ASI_KEY,
+] as const;
 
 const CONTRIBUTION_GOAL_MAX_BASE64_LENGTH =
 	Math.ceil(CONTRIBUTION_GOAL_MAX_BYTES / 3) * 4 +
@@ -111,6 +118,8 @@ export interface ContributionPreflightGit {
 		},
 	): Promise<string>;
 	headSha(cwd: string, signal?: AbortSignal): Promise<string | null>;
+	writeWorktreeTree?(cwd: string, signal?: AbortSignal): Promise<string>;
+	readRawCommitTree?(cwd: string, commit: string, signal?: AbortSignal): Promise<string | null>;
 }
 
 export interface VerifyContributionBaseOptions {
@@ -131,6 +140,7 @@ export interface ContributionCandidate {
 	readonly segment: number;
 	readonly runNumber: number | null;
 	readonly commit: string;
+	readonly treeSha: string;
 	readonly scenario: string;
 	readonly description: string;
 	readonly metric: number;
@@ -161,6 +171,7 @@ export interface ContributionPublicationGit {
 	readHead(cwd: string, signal?: AbortSignal): Promise<string | null>;
 	readStatus(cwd: string, signal?: AbortSignal): Promise<string>;
 	isAncestor(cwd: string, ancestor: string, descendant: string, signal?: AbortSignal): Promise<boolean>;
+	readRawCommitTree(cwd: string, commit: string, signal?: AbortSignal): Promise<string | null>;
 	push(
 		cwd: string,
 		options: {
@@ -169,7 +180,6 @@ export interface ContributionPublicationGit {
 			readonly refspec: string;
 			readonly forceWithLease: string;
 			readonly signal?: AbortSignal;
-			readonly noVerify?: boolean;
 			readonly recurseSubmodules?: "no";
 		},
 	): Promise<void>;
@@ -246,12 +256,15 @@ const DEFAULT_PUBLICATION_GIT: ContributionPublicationGit = {
 	readHead: (cwd, signal) => git.head.sha(cwd, signal),
 	readStatus: (cwd, signal) => git.status(cwd, { porcelainV1: true, untrackedFiles: "all", z: true, signal }),
 	isAncestor: (cwd, ancestor, descendant, signal) => git.isAncestor(cwd, ancestor, descendant, signal),
+	readRawCommitTree: async (cwd, commit, signal) => (await git.rawCommit(cwd, commit, signal))?.treeSha ?? null,
 	push: (cwd, options) => git.push(cwd, options),
 };
 
 const DEFAULT_PREFLIGHT_GIT: ContributionPreflightGit = {
 	status: (cwd, options) => git.status(cwd, options),
 	headSha: (cwd, signal) => git.head.sha(cwd, signal),
+	writeWorktreeTree: (cwd, signal) => git.writeWorktreeTree(cwd, signal),
+	readRawCommitTree: async (cwd, commit, signal) => (await git.rawCommit(cwd, commit, signal))?.treeSha ?? null,
 };
 
 export async function fetchOfficialContributionGoal(
@@ -354,17 +367,45 @@ export async function verifyContributionBase(
 	const preflightGit = options.git ?? DEFAULT_PREFLIGHT_GIT;
 	let statusOutput: string;
 	let currentHead: string | null;
+	const writeWorktreeTree = preflightGit.writeWorktreeTree;
+	const readRawCommitTree = preflightGit.readRawCommitTree;
 	try {
-		[statusOutput, currentHead] = await Promise.all([
-			preflightGit.status(cwd, {
-				porcelainV1: true,
-				untrackedFiles: "all",
-				z: true,
-				signal: options.signal,
-			}),
-			preflightGit.headSha(cwd, options.signal),
-		]);
+		if (writeWorktreeTree === undefined && readRawCommitTree === undefined) {
+			[statusOutput, currentHead] = await Promise.all([
+				preflightGit.status(cwd, {
+					porcelainV1: true,
+					untrackedFiles: "all",
+					z: true,
+					signal: options.signal,
+				}),
+				preflightGit.headSha(cwd, options.signal),
+			]);
+		} else {
+			if (writeWorktreeTree === undefined || readRawCommitTree === undefined) {
+				throw new Error("Contribution preflight tree adapters must be provided together.");
+			}
+			let worktreeTree: string;
+			let officialCommitTree: string | null;
+			[statusOutput, currentHead, worktreeTree, officialCommitTree] = await Promise.all([
+				preflightGit.status(cwd, {
+					porcelainV1: true,
+					untrackedFiles: "all",
+					z: true,
+					signal: options.signal,
+				}),
+				preflightGit.headSha(cwd, options.signal),
+				writeWorktreeTree(cwd, options.signal),
+				readRawCommitTree(cwd, goal.commitSha, options.signal),
+			]);
+			if (officialCommitTree === null || officialCommitTree.toLowerCase() !== worktreeTree.toLowerCase()) {
+				throw new ContributionError(
+					"base_head_mismatch",
+					"Contribution mode requires worktree bytes to exactly match the raw official commit tree.",
+				);
+			}
+		}
 	} catch (error) {
+		if (error instanceof ContributionError) throw error;
 		throw new ContributionError(
 			"base_inspection_failed",
 			`Unable to verify the contribution base: ${error instanceof Error ? error.message : String(error)}`,
@@ -536,6 +577,7 @@ export async function publishContributionCandidate(
 		throw new ContributionError("candidate_head_mismatch", "Contribution review requires the exact current HEAD.");
 	}
 	validateCandidate(options.candidate, options.currentSegment, options.currentHead);
+	const candidateSha = options.candidate.commit;
 	if (options.currentBranch !== options.branchName) {
 		throw new ContributionError(
 			"branch_mismatch",
@@ -600,18 +642,25 @@ export async function publishContributionCandidate(
 	if (
 		currentHead === null ||
 		!CANDIDATE_COMMIT_PATTERN.test(currentHead) ||
-		currentHead.toLowerCase() !== options.candidate.commit.toLowerCase()
+		currentHead.toLowerCase() !== candidateSha
 	) {
 		throw new ContributionError("candidate_head_mismatch", "The approved contribution candidate is no longer HEAD.");
 	}
 	if (statusOutput.length > 0) {
 		throw new ContributionError("worktree_dirty", "The contribution worktree changed after approval.");
 	}
+	const candidateCommitTree = await publicationGit.readRawCommitTree(options.cwd, candidateSha, options.signal);
+	if (candidateCommitTree === null || candidateCommitTree.toLowerCase() !== options.candidate.treeSha) {
+		throw new ContributionError(
+			"candidate_invalid",
+			"The contribution candidate commit does not contain the exact tested tree.",
+		);
+	}
 
 	const targetRef = `refs/heads/${options.branchName}`;
-	const refspec = `${options.candidate.commit}:${targetRef}`;
+	const refspec = `${candidateSha}:${targetRef}`;
 	const compareUrl = buildContributionCompareUrl(currentRemote, options.branchName);
-	const reviewUrl = buildContributionReviewUrl(currentRemote, options.baseProof.baseSha, options.candidate.commit);
+	const reviewUrl = buildContributionReviewUrl(currentRemote, options.baseProof.baseSha, candidateSha);
 	const prDraft = buildContributionPrDraft(
 		options.goal,
 		options.candidate,
@@ -623,7 +672,7 @@ export async function publishContributionCandidate(
 		!(await publicationGit.isAncestor(
 			options.cwd,
 			options.baseProof.baseSha,
-			options.candidate.commit,
+			candidateSha,
 			options.signal,
 		))
 	) {
@@ -644,7 +693,7 @@ export async function publishContributionCandidate(
 			`Contribution review requires the recorded branch ${options.branchName} to remain checked out.`,
 		);
 	}
-	if (finalHead !== options.candidate.commit) {
+	if (finalHead !== candidateSha) {
 		throw new ContributionError("candidate_head_mismatch", "The approved contribution candidate is no longer HEAD.");
 	}
 	if (finalStatusOutput.length > 0) {
@@ -671,7 +720,6 @@ export async function publishContributionCandidate(
 			verifiedRemoteUrl: options.confirmedPushRemoteUrl,
 			refspec,
 			forceWithLease: `${targetRef}:`,
-			noVerify: true,
 			recurseSubmodules: "no",
 			signal: options.signal,
 		});
@@ -942,7 +990,18 @@ function validateCandidate(candidate: ContributionCandidate, currentSegment: num
 			"Contribution review requires an unflagged kept result from the current segment with bounded evidence.",
 		);
 	}
-	if (typeof candidate.commit !== "string" || !CANDIDATE_COMMIT_PATTERN.test(candidate.commit)) {
+	if (
+		typeof candidate.treeSha !== "string" ||
+		!CANDIDATE_COMMIT_PATTERN.test(candidate.treeSha) ||
+		candidate.treeSha !== candidate.treeSha.toLowerCase()
+	) {
+		throw new ContributionError("candidate_invalid", "The kept contribution candidate has no valid tested tree.");
+	}
+	if (
+		typeof candidate.commit !== "string" ||
+		!CANDIDATE_COMMIT_PATTERN.test(candidate.commit) ||
+		candidate.commit !== candidate.commit.toLowerCase()
+	) {
 		throw new ContributionError(
 			currentHead === undefined ? "candidate_invalid" : "candidate_head_mismatch",
 			"The kept contribution candidate has no valid commit.",

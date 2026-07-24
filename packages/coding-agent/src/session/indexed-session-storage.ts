@@ -1,5 +1,6 @@
 import { toError } from "@oh-my-pi/pi-utils";
 import type {
+	SessionFlushOptions,
 	SessionStorage,
 	SessionStorageStat,
 	SessionStorageWriter,
@@ -518,7 +519,7 @@ class IndexedSessionStorageWriter implements SessionStorageWriter {
 		await this.#trackPromise(this.#storage._queueAppend(this.#path, line, mtimeMs, () => this.#error));
 	}
 
-	async flush(): Promise<void> {
+	async flush(_options?: SessionFlushOptions): Promise<void> {
 		if (this.#error) throw this.#error;
 		await this.#pendingChain;
 		if (this.#error) throw this.#error;

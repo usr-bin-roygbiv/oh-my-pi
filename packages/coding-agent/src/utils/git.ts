@@ -86,6 +86,11 @@ export interface CommitDetails {
 	readonly message: string;
 }
 
+export interface RawCommit {
+	readonly treeSha: string;
+	readonly parentShas: readonly string[];
+}
+
 export interface CommitOptions {
 	readonly allowEmpty?: boolean;
 	readonly author?: CommitAuthor;
@@ -1400,7 +1405,7 @@ export async function push(cwd: string, options: PushOptions = {}): Promise<void
 
 /** Checkout a ref. */
 export async function checkout(cwd: string, ref: string, signal?: AbortSignal): Promise<void> {
-	await runEffect(cwd, ["checkout", ref], { signal });
+	await runEffect(cwd, ["--no-replace-objects", "checkout", ref], { signal });
 }
 
 /** Fetch a specific refspec from a remote. Network transfer: defaults to the {@link GIT_NETWORK_TIMEOUT_MS} deadline. */
@@ -1431,21 +1436,26 @@ export async function writeTree(cwd: string, options: Pick<CommandOptions, "env"
 	return (await runText(cwd, ["write-tree"], options)).trim();
 }
 
-/** Materialize the current tracked and untracked worktree bytes as an immutable tree without touching the real index. */
+/** Materialize the current tracked and untracked worktree bytes as an immutable tree without touching real Git state. */
 export async function writeWorktreeTree(cwd: string, signal?: AbortSignal): Promise<string> {
-	const temporaryIndex = path.join(os.tmpdir(), `omp-worktree-tree-${crypto.randomUUID()}.index`);
-	const env = { GIT_INDEX_FILE: temporaryIndex };
+	const repository = await resolveRepository(cwd);
+	if (!repository) throw new Error("Not a Git repository.");
+	const temporaryRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), "omp-worktree-tree-"));
+	const temporaryObjectDirectory = path.join(temporaryRoot, "objects");
+	const env = {
+		GIT_INDEX_FILE: path.join(temporaryRoot, "index"),
+		GIT_OBJECT_DIRECTORY: temporaryObjectDirectory,
+		GIT_ALTERNATE_OBJECT_DIRECTORIES: path.join(repository.commonDir, "objects"),
+	};
 	try {
-		await runEffect(cwd, ["read-tree", "HEAD"], { env, signal });
+		await fs.promises.mkdir(temporaryObjectDirectory);
+		await runEffect(cwd, ["--no-replace-objects", "read-tree", "HEAD"], { env, signal });
 		await runEffect(cwd, ["add", "-A", "--"], { env, signal });
-		const tree = (await runText(cwd, ["write-tree"], { env, signal })).trim();
-		if (!/^[0-9a-f]{40}$/.test(tree)) throw new Error("Git returned an invalid worktree tree object id.");
-		return tree;
+		const treeSha = (await runText(cwd, ["write-tree"], { env, signal })).trim();
+		if (!/^[0-9a-f]{40,64}$/.test(treeSha)) throw new Error("Git returned an invalid worktree tree object id.");
+		return treeSha;
 	} finally {
-		await Promise.all([
-			fs.promises.rm(temporaryIndex, { force: true }),
-			fs.promises.rm(`${temporaryIndex}.lock`, { force: true }),
-		]);
+		await fs.promises.rm(temporaryRoot, { force: true, recursive: true });
 	}
 }
 
@@ -1719,6 +1729,24 @@ export async function commitDetails(cwd: string, revision: string, signal?: Abor
 	};
 }
 
+/** Read an immutable commit object without honoring replacement refs or grafts. */
+export async function rawCommit(cwd: string, commit: string, signal?: AbortSignal): Promise<RawCommit | null> {
+	const args = ["--no-replace-objects", "cat-file", "commit", commit];
+	const result = await git(cwd, args, { readOnly: true, signal });
+	if (result.exitCode !== 0) return null;
+	const headerEnd = result.stdout.indexOf("\n\n");
+	if (headerEnd < 0) return null;
+	const treeShas: string[] = [];
+	const parentShas: string[] = [];
+	for (const header of result.stdout.slice(0, headerEnd).split("\n")) {
+		if (header.startsWith("tree ")) treeShas.push(header.slice(5));
+		else if (header.startsWith("parent ")) parentShas.push(header.slice(7));
+	}
+	if (treeShas.length !== 1 || !/^[0-9a-f]{40,64}$/.test(treeShas[0] ?? "")) return null;
+	if (parentShas.some(parent => !/^[0-9a-f]{40,64}$/.test(parent))) return null;
+	return { treeSha: treeShas[0]!, parentShas };
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // API: log
 // ════════════════════════════════════════════════════════════════════════════
@@ -1743,27 +1771,35 @@ export const revList = {
 	},
 };
 
-/** Return whether `ancestor` is reachable from `descendant`. */
+/** Return whether `ancestor` is reachable through raw commit parents from `descendant`. */
 export async function isAncestor(
 	cwd: string,
 	ancestor: string,
 	descendant: string,
 	signal?: AbortSignal,
 ): Promise<boolean> {
-	ensureAvailable();
 	const repository = await resolveRepository(cwd);
 	if (!repository) throw new Error("Not a Git repository.");
 	try {
-		const grafts = await Bun.file(path.join(repository.commonDir, "info", "grafts")).text();
-		if (grafts.trim().length > 0) return false;
+		await Bun.file(path.join(repository.commonDir, "info", "grafts")).text();
 	} catch (error) {
 		if (!isEnoent(error)) throw error;
 	}
-	const args = ["--no-replace-objects", "merge-base", "--is-ancestor", ancestor, descendant];
-	const result = await git(cwd, args, { readOnly: true, signal });
-	if (result.exitCode === 0) return true;
-	if (result.exitCode === 1) return false;
-	throw new GitCommandError(args, result);
+	const target = ancestor.toLowerCase();
+	const queue = [descendant];
+	const visited = new Set<string>();
+	for (let index = 0; index < queue.length; index += 1) {
+		throwIfAborted(signal);
+		const commitSha = queue[index]!;
+		const normalizedSha = commitSha.toLowerCase();
+		if (visited.has(normalizedSha)) continue;
+		visited.add(normalizedSha);
+		const commit = await rawCommit(cwd, commitSha, signal);
+		if (!commit) throw new Error(`Unable to read raw Git commit ${commitSha}.`);
+		if (normalizedSha === target) return true;
+		queue.push(...commit.parentShas);
+	}
+	return false;
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1773,7 +1809,7 @@ export async function isAncestor(
 export const branch = {
 	/** Current branch name, or null if detached/unavailable. */
 	async current(cwd: string, signal?: AbortSignal): Promise<string | null> {
-		const headState = await resolveHead(cwd);
+		const headState = await resolveHead(cwd, signal);
 		if (headState?.kind === "ref") return headState.branchName ?? headState.ref;
 		const result = await git(cwd, ["symbolic-ref", "--short", "HEAD"], { readOnly: true, signal });
 		if (result.exitCode !== 0) return null;
@@ -1828,12 +1864,12 @@ export const branch = {
 
 	/** Create and checkout a new branch. */
 	async checkoutNew(cwd: string, name: string, signal?: AbortSignal): Promise<void> {
-		await runEffect(cwd, ["checkout", "-b", name], { signal });
+		await runEffect(cwd, ["--no-replace-objects", "checkout", "-b", name], { signal });
 	},
 
 	/** Create and checkout a new branch at an immutable start point. */
 	async checkoutNewAt(cwd: string, name: string, startPoint: string, signal?: AbortSignal): Promise<void> {
-		await runEffect(cwd, ["checkout", "-b", name, startPoint], { signal });
+		await runEffect(cwd, ["--no-replace-objects", "checkout", "-b", name, startPoint], { signal });
 	},
 
 	/** List branches. Pass `{ all: true }` to include remotes. */

@@ -106,6 +106,7 @@ import type * as TypeBox from "../typebox";
 
 export type { AppKeybinding, KeybindingsManager } from "../../config/keybindings";
 export type { ExecOptions, ExecResult } from "../../exec/exec";
+export type { SessionFlushOptions } from "../../session/session-storage";
 export type { AgentToolResult, AgentToolUpdateCallback };
 
 // ============================================================================

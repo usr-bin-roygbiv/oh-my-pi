@@ -10,7 +10,12 @@ import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, TailBuffer, truncateTail } from "
 import { replaceTabs, shortenPath } from "../../tools/render-utils";
 import { throwIfAborted } from "../../tools/tool-errors";
 import * as git from "../../utils/git";
-import { CONTRIBUTION_HARNESS_SHA256_ASI_KEY, CONTRIBUTION_WORKTREE_TREE_ASI_KEY } from "../contribution";
+import {
+	CONTRIBUTION_HARNESS_MAX_BYTES,
+	CONTRIBUTION_HARNESS_SHA256_ASI_KEY,
+	CONTRIBUTION_INVOCATION_SHA256_ASI_KEY,
+	CONTRIBUTION_WORKTREE_TREE_ASI_KEY,
+} from "../contribution";
 import { parseWorkDirDirtyPaths } from "../git";
 import {
 	EXPERIMENT_MAX_BYTES,
@@ -47,6 +52,13 @@ interface ProgressSnapshot {
 	truncation?: RunExperimentProgressDetails["truncation"];
 }
 
+interface ContributionExecutionProof {
+	readonly harnessSha256: string;
+	readonly invocationSha256: string;
+	readonly worktreeTreeSha: string;
+	readonly headSha: string;
+}
+
 export function createRunExperimentTool(
 	options: AutoresearchToolFactoryOptions,
 ): ToolDefinition<typeof runExperimentSchema, RunDetails | RunExperimentProgressDetails> {
@@ -78,12 +90,6 @@ export function createRunExperimentTool(
 				}
 
 				const runtime = options.getRuntime(ctx);
-				let contributionHarnessSha256: string | null = null;
-				if (runtime.contribution.status === "running") {
-					const harnessBytes = await Bun.file(path.join(ctx.cwd, HARNESS_FILENAME)).arrayBuffer();
-					contributionHarnessSha256 = new Bun.CryptoHasher("sha256").update(harnessBytes).digest("hex");
-					await mutation.authorizeMutation();
-				}
 
 				const abandonedPriorRun = (() => {
 					const pending = storage.getPendingRun(session.id);
@@ -127,14 +133,25 @@ export function createRunExperimentTool(
 				options.dashboard.updateWidget(ctx, runtime);
 				options.dashboard.requestRender();
 
-				const timeoutMs = Math.max(0, Math.floor((params.timeout_seconds ?? 600) * 1000));
+				const requestedTimeoutMs = Math.max(0, Math.floor((params.timeout_seconds ?? 600) * 1000));
+				const effectiveTimeoutMs = requestedTimeoutMs > 0 ? requestedTimeoutMs : 2_147_000_000;
 				let execution: ProcessExecutionResult;
+				let contributionProof: ContributionExecutionProof | null = null;
 				try {
+					await mutation.authorizeMutation();
+					if (runtime.contribution.status === "running") {
+						contributionProof = await captureContributionExecutionProof(
+							ctx.cwd,
+							resolvedCommand,
+							effectiveTimeoutMs,
+							operationSignal,
+						);
+					}
 					execution = await executeProcess({
 						command: resolvedCommand,
 						cwd: ctx.cwd,
 						logPath: benchmarkLogPath,
-						timeoutMs,
+						timeoutMs: effectiveTimeoutMs,
 						signal: operationSignal,
 						onProgress: details => {
 							onUpdate?.({
@@ -149,14 +166,22 @@ export function createRunExperimentTool(
 							});
 						},
 					});
+					if (contributionProof !== null) {
+						const postExecutionProof = await captureContributionExecutionProof(
+							ctx.cwd,
+							resolvedCommand,
+							effectiveTimeoutMs,
+							operationSignal,
+						);
+						if (!sameContributionExecutionProof(contributionProof, postExecutionProof)) {
+							throw new Error("Contribution harness, invocation, HEAD, or worktree bytes changed during execution.");
+						}
+					}
 				} finally {
 					runtime.runningExperiment = null;
 					options.dashboard.updateWidget(ctx, runtime);
 					options.dashboard.requestRender();
 				}
-				await mutation.authorizeMutation();
-				const contributionWorktreeTree =
-					contributionHarnessSha256 === null ? null : await git.writeWorktreeTree(ctx.cwd, operationSignal);
 				await mutation.authorizeMutation();
 
 				const completedAt = Date.now();
@@ -178,14 +203,15 @@ export function createRunExperimentTool(
 				const parsedPrimary = parsedMetricsMap.get(session.primaryMetric) ?? null;
 				const parsedAsi = parseAsiLines(execution.output);
 				const storedParsedAsi =
-					contributionHarnessSha256 !== null && contributionWorktreeTree !== null
-						? {
+					contributionProof === null
+						? parsedAsi
+						: {
 								...(parsedAsi ?? {}),
-								[CONTRIBUTION_HARNESS_SHA256_ASI_KEY]: contributionHarnessSha256,
-								[CONTRIBUTION_WORKTREE_TREE_ASI_KEY]: contributionWorktreeTree,
-							}
-						: parsedAsi;
-				runtime.lastRunAsi = parsedAsi;
+								[CONTRIBUTION_HARNESS_SHA256_ASI_KEY]: contributionProof.harnessSha256,
+								[CONTRIBUTION_WORKTREE_TREE_ASI_KEY]: contributionProof.worktreeTreeSha,
+								[CONTRIBUTION_INVOCATION_SHA256_ASI_KEY]: contributionProof.invocationSha256,
+							};
+				runtime.lastRunAsi = storedParsedAsi;
 
 				storage.markRunCompleted({
 					runId: insertedRun.id,
@@ -212,7 +238,7 @@ export function createRunExperimentTool(
 					tailOutput: displayTruncation.content,
 					parsedMetrics,
 					parsedPrimary,
-					parsedAsi,
+					parsedAsi: storedParsedAsi,
 					metricName: session.primaryMetric,
 					metricUnit: session.metricUnit,
 					preRunDirtyPaths,
@@ -224,7 +250,7 @@ export function createRunExperimentTool(
 				runtime.lastRunSummary = {
 					command: resolvedCommand,
 					durationSeconds,
-					parsedAsi,
+					parsedAsi: storedParsedAsi,
 					parsedMetrics,
 					parsedPrimary,
 					passed,
@@ -296,6 +322,59 @@ export function createRunExperimentTool(
 		},
 	};
 }
+async function captureContributionExecutionProof(
+	cwd: string,
+	command: string,
+	effectiveTimeoutMs: number,
+	signal?: AbortSignal,
+): Promise<ContributionExecutionProof> {
+	const headSha = await git.head.sha(cwd, signal);
+	if (headSha === null) throw new Error("Contribution execution requires an immutable HEAD commit.");
+	const harnessSha256 = await hashBoundedFile(
+		path.join(cwd, HARNESS_FILENAME),
+		CONTRIBUTION_HARNESS_MAX_BYTES,
+		signal,
+	);
+	const worktreeTreeSha = await git.writeWorktreeTree(cwd, signal);
+	const invocation = JSON.stringify({ command, effectiveTimeoutMs });
+	const invocationSha256 = new Bun.CryptoHasher("sha256").update(invocation).digest("hex");
+	return { harnessSha256, invocationSha256, worktreeTreeSha, headSha };
+}
+
+async function hashBoundedFile(filePath: string, maxBytes: number, signal?: AbortSignal): Promise<string> {
+	const hasher = new Bun.CryptoHasher("sha256");
+	const reader = Bun.file(filePath).stream().getReader();
+	let totalBytes = 0;
+	try {
+		while (true) {
+			throwIfAborted(signal);
+			const chunk = await reader.read();
+			if (chunk.done) break;
+			totalBytes += chunk.value.byteLength;
+			if (totalBytes > maxBytes) {
+				await reader.cancel();
+				throw new Error(`Contribution harness exceeds the ${formatBytes(maxBytes)} byte limit.`);
+			}
+			hasher.update(chunk.value);
+		}
+	} finally {
+		reader.releaseLock();
+	}
+	return hasher.digest("hex");
+}
+
+function sameContributionExecutionProof(
+	before: ContributionExecutionProof,
+	after: ContributionExecutionProof,
+): boolean {
+	return (
+		before.harnessSha256 === after.harnessSha256 &&
+		before.invocationSha256 === after.invocationSha256 &&
+		before.worktreeTreeSha === after.worktreeTreeSha &&
+		before.headSha === after.headSha
+	);
+}
+
 async function executeProcess(opts: {
 	command: string;
 	cwd: string;
@@ -338,7 +417,7 @@ async function executeProcess(opts: {
 		const result = await executeBash(opts.command, {
 			cwd: opts.cwd,
 			sessionKey: `autoresearch:${opts.cwd}`,
-			timeout: opts.timeoutMs > 0 ? opts.timeoutMs : 2_147_000_000,
+			timeout: opts.timeoutMs,
 			signal: opts.signal,
 			chunkThrottleMs: 0,
 			onChunk: chunk => {

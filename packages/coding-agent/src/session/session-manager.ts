@@ -69,6 +69,7 @@ import { prepareEntryForPersistence } from "./session-persistence";
 import {
 	FileSessionStorage,
 	MemorySessionStorage,
+	type SessionFlushOptions,
 	type SessionStorage,
 	type SessionStorageWriter,
 } from "./session-storage";
@@ -343,6 +344,7 @@ export type ReadonlySessionManager = Pick<
 	| "getTree"
 	| "getUsageStatistics"
 	| "putBlob"
+	| "flush"
 	| "putBlobSync"
 >;
 
@@ -1507,10 +1509,22 @@ export class SessionManager {
 	}
 
 	/** Flush pending writes. Call before switching sessions or on shutdown. */
-	async flush(): Promise<void> {
-		if (!this.#persist || !this.#sessionFile) return;
+	async flush(options?: SessionFlushOptions): Promise<void> {
+		if (!this.#persist || !this.#sessionFile) {
+			if (options?.durable) {
+				throw new Error("Cannot durably flush without a persistent session and open session writer.");
+			}
+			return;
+		}
+		if (options?.durable && !this.#writer?.isOpen()) {
+			throw new Error("Cannot durably flush without a persistent session and open session writer.");
+		}
 		await this.#scheduleDiskWork(async () => {
-			if (this.#writer?.isOpen()) await this.#writer.flush();
+			const writer = this.#writer;
+			if (writer?.isOpen()) await writer.flush(options);
+			else if (options?.durable) {
+				throw new Error("Cannot durably flush without a persistent session and open session writer.");
+			}
 		});
 		// Drain any fire-and-forget backing writes (e.g. `writeTextSync` queued
 		// on IndexedSessionStorage during `flushSync`) so callers relying on

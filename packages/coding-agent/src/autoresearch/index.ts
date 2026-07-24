@@ -4,7 +4,6 @@ import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AutocompleteItem } from "@oh-my-pi/pi-tui";
 import { logger, prompt } from "@oh-my-pi/pi-utils";
 import type { ExtensionContext, ExtensionFactory } from "../extensibility/extensions";
-import type { SessionManager } from "../session/session-manager";
 import { ToolAbortError, throwIfAborted } from "../tools/tool-errors";
 import * as git from "../utils/git";
 import commandResumeTemplate from "./command-resume.md" with { type: "text" };
@@ -14,6 +13,7 @@ import {
 	buildContributionPrDraft,
 	buildContributionReviewUrl,
 	CONTRIBUTION_HARNESS_SHA256_ASI_KEY,
+	CONTRIBUTION_INVOCATION_SHA256_ASI_KEY,
 	CONTRIBUTION_WORKTREE_TREE_ASI_KEY,
 	type ContributionCandidate,
 	ContributionError,
@@ -92,6 +92,22 @@ interface ContributionPublicationOperation {
 	readonly controller: AbortController;
 	phase: "pre-push" | "pushing" | "committed";
 	readonly settlement: PromiseWithResolvers<void>;
+}
+
+interface AsyncLifecycleIdentity {
+	readonly sessionKey: string;
+	readonly epoch: number;
+	readonly runtime: AutoresearchRuntime;
+	readonly contribution: AutoresearchRuntime["contribution"];
+	readonly state: AutoresearchRuntime["state"];
+	readonly autoresearchMode: boolean;
+}
+
+interface TransitionAdmissionHold {
+	readonly sessionKey: string;
+	readonly release: () => void;
+	endReceived: boolean;
+	settled: boolean;
 }
 
 const CONTRIBUTION_PUBLICATION_ENTRY = "autoresearch-contribution-publication";
@@ -241,6 +257,7 @@ function hasExecutableContributionTddProof(
 ): boolean {
 	const command = session.preferredCommand?.trim() ?? "";
 	const candidateHarness = candidate?.parsedAsi?.[CONTRIBUTION_HARNESS_SHA256_ASI_KEY];
+	const candidateInvocation = candidate?.parsedAsi?.[CONTRIBUTION_INVOCATION_SHA256_ASI_KEY];
 	const candidateTree = candidate?.parsedAsi?.[CONTRIBUTION_WORKTREE_TREE_ASI_KEY];
 	if (
 		!candidate ||
@@ -255,6 +272,8 @@ function hasExecutableContributionTddProof(
 		candidate.exitCode !== 0 ||
 		typeof candidateHarness !== "string" ||
 		!/^[0-9a-f]{64}$/.test(candidateHarness) ||
+		typeof candidateInvocation !== "string" ||
+		!/^[0-9a-f]{64}$/.test(candidateInvocation) ||
 		typeof candidateTree !== "string" ||
 		!/^[0-9a-f]{40}$/.test(candidateTree)
 	) {
@@ -262,6 +281,7 @@ function hasExecutableContributionTddProof(
 	}
 	return loggedRuns.some(run => {
 		const redHarness = run.parsedAsi?.[CONTRIBUTION_HARNESS_SHA256_ASI_KEY];
+		const redInvocation = run.parsedAsi?.[CONTRIBUTION_INVOCATION_SHA256_ASI_KEY];
 		return (
 			run.id < candidate.id &&
 			run.sessionId === session.id &&
@@ -271,7 +291,8 @@ function hasExecutableContributionTddProof(
 			!run.flagged &&
 			run.completedAt !== null &&
 			(run.timedOut || (run.exitCode !== null && run.exitCode !== 0)) &&
-			redHarness === candidateHarness
+			redHarness === candidateHarness &&
+			redInvocation === candidateInvocation
 		);
 	});
 }
@@ -282,6 +303,7 @@ const contributionPublicationGit: ContributionPublicationGit = {
 	readBranch: (cwd, signal) => git.branch.current(cwd, signal),
 	readHead: (cwd, signal) => git.head.sha(cwd, signal),
 	readStatus: (cwd, signal) => git.status(cwd, { porcelainV1: true, untrackedFiles: "all", z: true, signal }),
+	readRawCommitTree: async (cwd, sha, signal) => (await git.rawCommit(cwd, sha, signal))?.treeSha ?? null,
 	isAncestor: (cwd, ancestor, descendant, signal) => git.isAncestor(cwd, ancestor, descendant, signal),
 	push: (cwd, options) =>
 		git.push(cwd, {
@@ -289,7 +311,6 @@ const contributionPublicationGit: ContributionPublicationGit = {
 			verifiedRemoteUrl: options.verifiedRemoteUrl,
 			refspec: options.refspec,
 			forceWithLease: options.forceWithLease,
-			noVerify: options.noVerify,
 			recurseSubmodules: options.recurseSubmodules,
 			signal: options.signal,
 		}),
@@ -313,7 +334,14 @@ async function discoverContributionRemotes(cwd: string): Promise<ContributionRem
 }
 
 function contributionEndMustPause(messages: AgentMessage[]): boolean {
+	let firstRelevantIndex = 0;
 	for (let index = messages.length - 1; index >= 0; index -= 1) {
+		if (messages[index]?.role === "user") {
+			firstRelevantIndex = index + 1;
+			break;
+		}
+	}
+	for (let index = firstRelevantIndex; index < messages.length; index += 1) {
 		const message = messages[index];
 		if (message?.role !== "assistant") continue;
 		if (message.stopReason === "aborted" || message.stopReason === "error") return true;
@@ -367,9 +395,11 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 	const contributionPublicationOperations = new Map<string, ContributionPublicationOperation>();
 	const contributionStopOperations = new Map<string, Promise<string[]>>();
 	const autoresearchMutationOperations = new Map<string, Set<AutoresearchMutationOperation>>();
+	const autoresearchCommandOperations = new Map<string, symbol>();
 	const mutationAdmissionHolds = new Map<string, number>();
-	const transitionAdmissionHolds = new Map<string, { readonly sessionKey: string; release(): void }>();
+	const transitionAdmissionHolds = new Map<string, TransitionAdmissionHold>();
 	const rehydrateOperations = new Map<string, Promise<void>>();
+	const lifecycleEpochs = new Map<string, number>();
 
 	const acquireMutationAdmissionHold = (sessionKey: string): (() => void) => {
 		mutationAdmissionHolds.set(sessionKey, (mutationAdmissionHolds.get(sessionKey) ?? 0) + 1);
@@ -415,6 +445,29 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 
 	const getSessionKey = (ctx: ExtensionContext): string => ctx.sessionManager.getSessionId();
 	const getRuntime = (ctx: ExtensionContext): AutoresearchRuntime => runtimeStore.ensure(getSessionKey(ctx));
+	const advanceLifecycleEpoch = (sessionKey: string): void => {
+		lifecycleEpochs.set(sessionKey, (lifecycleEpochs.get(sessionKey) ?? 0) + 1);
+	};
+	const captureLifecycleIdentity = (ctx: ExtensionContext): AsyncLifecycleIdentity => {
+		const sessionKey = getSessionKey(ctx);
+		const runtime = getRuntime(ctx);
+		return {
+			sessionKey,
+			epoch: lifecycleEpochs.get(sessionKey) ?? 0,
+			runtime,
+			contribution: runtime.contribution,
+			state: runtime.state,
+			autoresearchMode: runtime.autoresearchMode,
+		};
+	};
+	const lifecycleIdentityIsCurrent = (ctx: ExtensionContext, identity: AsyncLifecycleIdentity): boolean =>
+		getSessionKey(ctx) === identity.sessionKey &&
+		getRuntime(ctx) === identity.runtime &&
+		(lifecycleEpochs.get(identity.sessionKey) ?? 0) === identity.epoch &&
+		identity.runtime.contribution === identity.contribution &&
+		identity.runtime.state === identity.state &&
+		identity.runtime.autoresearchMode === identity.autoresearchMode &&
+		!mutationAdmissionClosed(identity.sessionKey);
 	const showPersistedPublicationStatus = async (ctx: ExtensionContext): Promise<boolean> => {
 		const publication = reconstructPublicationEntry(ctx.sessionManager.getBranch());
 		if (!publication) return false;
@@ -597,6 +650,7 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 		mode: "on" | "off" | "clear",
 	): void => {
 		const runtime = getRuntime(ctx);
+		advanceLifecycleEpoch(getSessionKey(ctx));
 		runtime.autoresearchMode = enabled;
 		runtime.autoResumeArmed = false;
 		runtime.goal = goal;
@@ -621,6 +675,7 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 		const sessionKey = getSessionKey(ctx);
 		const existing = contributionStopOperations.get(sessionKey);
 		if (existing) return existing;
+		advanceLifecycleEpoch(sessionKey);
 		const releaseAdmission = acquireMutationAdmissionHold(sessionKey);
 		const initialContribution = runtime.contribution;
 		let operation: Promise<string[]>;
@@ -673,6 +728,7 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 	): { cancel: true } | undefined => {
 		const sessionKey = getSessionKey(ctx);
 		if (transitionAdmissionHolds.has(event.transitionId)) return { cancel: true };
+		advanceLifecycleEpoch(sessionKey);
 		const runtime = getRuntime(ctx);
 		const mutationActive = (autoresearchMutationOperations.get(sessionKey)?.size ?? 0) > 0;
 		const contributionWorkActive =
@@ -682,23 +738,41 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 			mutationActive ||
 			runtime.contribution.status !== "off";
 		const busy = mutationAdmissionClosed(sessionKey) || contributionWorkActive;
-		const release = acquireMutationAdmissionHold(sessionKey);
-		transitionAdmissionHolds.set(event.transitionId, { sessionKey, release });
-		if (!busy) return undefined;
+		const hold: TransitionAdmissionHold = {
+			sessionKey,
+			release: acquireMutationAdmissionHold(sessionKey),
+			endReceived: false,
+			settled: !contributionWorkActive,
+		};
+		transitionAdmissionHolds.set(event.transitionId, hold);
 		if (contributionWorkActive) {
-			void stopContributionRuntime(ctx, runtime).catch(error => {
-				logger.warn("Failed to settle contribution lifecycle transition", {
-					error: describeContributionError(error),
-					sessionKey,
+			void stopContributionRuntime(ctx, runtime)
+				.then(() => {
+					if (getSessionKey(ctx) !== sessionKey || getRuntime(ctx) !== runtime) return;
+					dashboard.updateWidget(ctx, runtime);
+					dashboard.requestRender();
+				})
+				.catch(error => {
+					logger.warn("Failed to settle contribution lifecycle transition", {
+						error: describeContributionError(error),
+						sessionKey,
+					});
+				})
+				.finally(() => {
+					hold.settled = true;
+					if (!hold.endReceived || transitionAdmissionHolds.get(event.transitionId) !== hold) return;
+					transitionAdmissionHolds.delete(event.transitionId);
+					hold.release();
 				});
-			});
 		}
-		return { cancel: true };
+		return busy ? { cancel: true } : undefined;
 	};
 
 	const finishSessionTransition = (transitionId: string): void => {
 		const hold = transitionAdmissionHolds.get(transitionId);
 		if (!hold) return;
+		hold.endReceived = true;
+		if (!hold.settled) return;
 		transitionAdmissionHolds.delete(transitionId);
 		hold.release();
 	};
@@ -877,90 +951,126 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 		async handler(args, ctx): Promise<void> {
 			const trimmed = args.trim();
 			const runtime = getRuntime(ctx);
-			if (runtime.contribution.status !== "off") {
+			const sessionKey = getSessionKey(ctx);
+			const contributionLifecycleActive =
+				runtime.contribution.status !== "off" ||
+				contributionStartTransactions.has(sessionKey) ||
+				contributionPublicationOperations.has(sessionKey) ||
+				contributionStopOperations.has(sessionKey) ||
+				autoresearchCommandOperations.has(sessionKey) ||
+				mutationAdmissionClosed(sessionKey);
+			if (contributionLifecycleActive) {
 				ctx.ui.notify("Stop contribution mode with `/contribute off` before using `/autoresearch`.", "error");
 				return;
 			}
 
-			if (trimmed === "" && runtime.autoresearchMode) {
-				setMode(ctx, false, runtime.goal, "off");
-				dashboard.updateWidget(ctx, runtime);
-				const experimentTools = new Set(EXPERIMENT_TOOL_NAMES);
-				await api.setActiveTools(api.getActiveTools().filter(name => !experimentTools.has(name)));
-				ctx.ui.notify("Autoresearch mode disabled", "info");
-				return;
-			}
-
-			if (trimmed === "off") {
-				setMode(ctx, false, runtime.goal, "off");
-				dashboard.updateWidget(ctx, runtime);
-				const experimentTools = new Set(EXPERIMENT_TOOL_NAMES);
-				await api.setActiveTools(api.getActiveTools().filter(name => !experimentTools.has(name)));
-				ctx.ui.notify("Autoresearch mode disabled", "info");
-				return;
-			}
-
-			if (trimmed === "clear" || trimmed.startsWith("clear ")) {
-				const flagPart = trimmed === "clear" ? "" : trimmed.slice("clear ".length).trim();
-				const keepTree = flagPart.includes("--keep-tree");
-				const resetTreeForce = flagPart.includes("--reset-tree");
-				await handleClear(ctx, runtime, { keepTree, resetTreeForce });
-				return;
-			}
-
-			const goalArg = trimmed.length > 0 ? trimmed : null;
-			const branchResult = await ensureAutoresearchBranch(api, ctx.cwd, goalArg ?? runtime.goal);
-			if (!branchResult.ok) {
-				ctx.ui.notify(branchResult.error, "error");
-				return;
-			}
-			if (branchResult.warning) {
-				ctx.ui.notify(branchResult.warning, "warning");
-			}
-
-			// Look up an existing session for the branch we just landed on. A session
-			// recorded under a different autoresearch/* branch is intentionally ignored
-			// — `/autoresearch` on a fresh branch starts a fresh session. Only open the
-			// DB if it already exists; the empty-state path must not create one.
-			const existingStorage = await openAutoresearchStorageIfExists(ctx.cwd);
-			const existingSession = existingStorage?.getActiveSessionForBranch(branchResult.branchName) ?? null;
-			const resumeContext = trimmed;
-			const branchStatusLine = branchResult.branchName
-				? branchResult.created
-					? `Created and checked out dedicated git branch \`${branchResult.branchName}\` before resuming.`
-					: `Using dedicated git branch \`${branchResult.branchName}\`.`
-				: "Continuing on the current branch — no autoresearch branch was created.";
-
-			if (existingSession && existingStorage) {
-				if (goalArg) existingStorage.updateSession(existingSession.id, { goal: goalArg });
-				if (branchResult.branchName) {
-					existingStorage.updateSession(existingSession.id, { branch: branchResult.branchName });
+			const operationToken = Symbol("autoresearch-command-operation");
+			const initialContribution = runtime.contribution;
+			autoresearchCommandOperations.set(sessionKey, operationToken);
+			const releaseAdmission = acquireMutationAdmissionHold(sessionKey);
+			const operationIsCurrent = (): boolean =>
+				getSessionKey(ctx) === sessionKey &&
+				getRuntime(ctx) === runtime &&
+				runtime.contribution === initialContribution &&
+				autoresearchCommandOperations.get(sessionKey) === operationToken;
+			try {
+				if (trimmed === "" && runtime.autoresearchMode) {
+					setMode(ctx, false, runtime.goal, "off");
+					dashboard.updateWidget(ctx, runtime);
+					const experimentTools = new Set(EXPERIMENT_TOOL_NAMES);
+					if (!operationIsCurrent()) return;
+					await api.setActiveTools(api.getActiveTools().filter(name => !experimentTools.has(name)));
+					if (!operationIsCurrent()) return;
+					ctx.ui.notify("Autoresearch mode disabled", "info");
+					return;
 				}
-				const refreshed = existingStorage.getSessionById(existingSession.id) ?? existingSession;
-				runtime.state = buildExperimentState(refreshed, existingStorage.listLoggedRuns(refreshed.id));
-				runtime.goal = refreshed.goal ?? goalArg;
-				setMode(ctx, true, runtime.goal, "on");
-				dashboard.updateWidget(ctx, runtime);
-				await api.setActiveTools([...new Set([...api.getActiveTools(), ...EXPERIMENT_TOOL_NAMES])]);
-				api.sendUserMessage(
-					prompt.render(commandResumeTemplate, {
-						branch_status_line: branchStatusLine,
-						has_resume_context: resumeContext.length > 0,
-						resume_context: resumeContext,
-					}),
-				);
-				return;
-			}
 
-			setMode(ctx, true, goalArg, "on");
-			dashboard.updateWidget(ctx, runtime);
-			await api.setActiveTools([...new Set([...api.getActiveTools(), ...EXPERIMENT_TOOL_NAMES])]);
-			if (goalArg !== null) {
-				api.sendUserMessage(goalArg);
-			} else {
-				ctx.ui.notify("Autoresearch enabled—describe what to optimize in your next message.", "info");
+				if (trimmed === "off") {
+					setMode(ctx, false, runtime.goal, "off");
+					dashboard.updateWidget(ctx, runtime);
+					const experimentTools = new Set(EXPERIMENT_TOOL_NAMES);
+					if (!operationIsCurrent()) return;
+					await api.setActiveTools(api.getActiveTools().filter(name => !experimentTools.has(name)));
+					if (!operationIsCurrent()) return;
+					ctx.ui.notify("Autoresearch mode disabled", "info");
+					return;
+				}
+
+				if (trimmed === "clear" || trimmed.startsWith("clear ")) {
+					const flagPart = trimmed === "clear" ? "" : trimmed.slice("clear ".length).trim();
+					const keepTree = flagPart.includes("--keep-tree");
+					const resetTreeForce = flagPart.includes("--reset-tree");
+					await handleClear(ctx, runtime, { keepTree, resetTreeForce });
+					return;
+				}
+
+				const goalArg = trimmed.length > 0 ? trimmed : null;
+				const branchResult = await ensureAutoresearchBranch(api, ctx.cwd, goalArg ?? runtime.goal);
+				if (!operationIsCurrent()) return;
+				if (!branchResult.ok) {
+					ctx.ui.notify(branchResult.error, "error");
+					return;
+				}
+				if (branchResult.warning) {
+					ctx.ui.notify(branchResult.warning, "warning");
+				}
+
+				// Look up an existing session for the branch we just landed on. A session
+				// recorded under a different autoresearch/* branch is intentionally ignored
+				// — `/autoresearch` on a fresh branch starts a fresh session. Only open the
+				// DB if it already exists; the empty-state path must not create one.
+				const existingStorage = await openAutoresearchStorageIfExists(ctx.cwd);
+				if (!operationIsCurrent()) return;
+				const existingSession = existingStorage?.getActiveSessionForBranch(branchResult.branchName) ?? null;
+				const resumeContext = trimmed;
+				const branchStatusLine = branchResult.branchName
+					? branchResult.created
+						? `Created and checked out dedicated git branch \`${branchResult.branchName}\` before resuming.`
+						: `Using dedicated git branch \`${branchResult.branchName}\`.`
+					: "Continuing on the current branch — no autoresearch branch was created.";
+
+				if (existingSession && existingStorage) {
+					if (!operationIsCurrent()) return;
+					if (goalArg) existingStorage.updateSession(existingSession.id, { goal: goalArg });
+					if (branchResult.branchName) {
+						existingStorage.updateSession(existingSession.id, { branch: branchResult.branchName });
+					}
+					const refreshed = existingStorage.getSessionById(existingSession.id) ?? existingSession;
+					runtime.state = buildExperimentState(refreshed, existingStorage.listLoggedRuns(refreshed.id));
+					runtime.goal = refreshed.goal ?? goalArg;
+					setMode(ctx, true, runtime.goal, "on");
+					dashboard.updateWidget(ctx, runtime);
+					if (!operationIsCurrent()) return;
+					await api.setActiveTools([...new Set([...api.getActiveTools(), ...EXPERIMENT_TOOL_NAMES])]);
+					if (!operationIsCurrent()) return;
+					api.sendUserMessage(
+						prompt.render(commandResumeTemplate, {
+							branch_status_line: branchStatusLine,
+							has_resume_context: resumeContext.length > 0,
+							resume_context: resumeContext,
+						}),
+					);
+					return;
+				}
+
+				if (!operationIsCurrent()) return;
+				setMode(ctx, true, goalArg, "on");
+				dashboard.updateWidget(ctx, runtime);
+				if (!operationIsCurrent()) return;
+				await api.setActiveTools([...new Set([...api.getActiveTools(), ...EXPERIMENT_TOOL_NAMES])]);
+				if (!operationIsCurrent()) return;
+				if (goalArg !== null) {
+					api.sendUserMessage(goalArg);
+				} else {
+					ctx.ui.notify("Autoresearch enabled—describe what to optimize in your next message.", "info");
+				}
+			} finally {
+				if (autoresearchCommandOperations.get(sessionKey) === operationToken) {
+					autoresearchCommandOperations.delete(sessionKey);
+				}
+				releaseAdmission();
 			}
-		},
+		}
 	});
 
 	api.registerCommand("contribute", {
@@ -1084,6 +1194,11 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 						ctx.ui.notify("Unable to read the contribution candidate HEAD.", "error");
 						return;
 					}
+					currentHead = currentHead.toLowerCase();
+					if (!GIT_SHA_PATTERN.test(currentHead)) {
+						ctx.ui.notify("The contribution candidate HEAD is not a canonical full commit SHA.", "error");
+						return;
+					}
 					try {
 						if (!(await git.isAncestor(ctx.cwd, contribution.baseProof.baseSha, currentHead))) {
 							throw new ContributionError(
@@ -1109,9 +1224,13 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 					}
 					const candidateRun =
 						candidateResult.runNumber === null ? null : storage.getRunById(candidateResult.runNumber);
-					if (!hasExecutableContributionTddProof(session, candidateRun, storage.listLoggedRuns(session.id))) {
+					const candidateTree = candidateRun?.parsedAsi?.[CONTRIBUTION_WORKTREE_TREE_ASI_KEY];
+					if (
+						typeof candidateTree !== "string" ||
+						!hasExecutableContributionTddProof(session, candidateRun, storage.listLoggedRuns(session.id))
+					) {
 						ctx.ui.notify(
-							"Contribution review requires executable TDD proof: an earlier unflagged failing run and the kept passing candidate must use the same fixed harness in the current segment.",
+							"Contribution review requires executable TDD proof: an earlier unflagged failing or timed-out run and the kept passing candidate must use the same fixed harness and invocation identity in the current segment.",
 							"error",
 						);
 						return;
@@ -1127,6 +1246,7 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 						segment: candidateResult.segment,
 						runNumber: candidateResult.runNumber,
 						commit: currentHead,
+						treeSha: candidateTree,
 						description: result,
 						scenario,
 						metric: candidateResult.metric,
@@ -1221,6 +1341,7 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 						settlement: Promise.withResolvers<void>(),
 					};
 					contributionPublicationOperations.set(reviewSessionKey, publicationOperation);
+					advanceLifecycleEpoch(reviewSessionKey);
 					const authorizePublication = (): void => {
 						throwIfAborted(publicationOperation.controller.signal);
 						if (contributionPublicationOperations.get(reviewSessionKey) !== publicationOperation) {
@@ -1238,7 +1359,7 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 							publication,
 						);
 						api.appendEntry(CONTRIBUTION_PUBLICATION_ENTRY, intent);
-						await (ctx.sessionManager as SessionManager).flush();
+						await ctx.sessionManager.flush({ durable: true });
 						authorizePublication();
 						ctx.ui.notify(
 							renderPublicationHandoff("Contribution publication plan (push outcome pending):", intent),
@@ -1329,6 +1450,11 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 				ctx.ui.notify("Usage: /contribute [status|off|review]", "error");
 				return;
 			}
+			const contributionStartSession = getSessionKey(ctx);
+			if (autoresearchCommandOperations.has(contributionStartSession)) {
+				ctx.ui.notify("Wait for the active autoresearch lifecycle operation before starting contribution mode.", "error");
+				return;
+			}
 			if (!ctx.hasUI) {
 				ctx.ui.notify("Contribution mode requires an interactive UI for explicit confirmations.", "error");
 				return;
@@ -1369,6 +1495,7 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 			contributionStartTransaction = startTransaction;
 			releaseStartAdmission = acquireMutationAdmissionHold(startSessionKey);
 			contributionStartTransactions.set(startSessionKey, startTransaction);
+			advanceLifecycleEpoch(startSessionKey);
 			try {
 				const currentRehydrate = rehydrateOperations.get(startSessionKey);
 				if (currentRehydrate) await currentRehydrate;
@@ -1459,7 +1586,7 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 				);
 				const finalConfirmed = await ctx.ui.confirm(
 					"Start exact upstream contribution session?",
-					`Goal: ${goal.title}\nOfficial main commit/base: ${goal.commitSha}\nGoal blob: ${goal.blobSha}\nGoal SHA-256: ${goal.sha256}\nModel: ${selectedModel.provider}/${selectedModel.id}\nConfirmed fork: ${selectedRemote.name} (${selectedRemote.url})\nVerified push-effective destination: ${selectedRemote.pushUrl}\nFresh local candidate branch: ${branchName}\n\nThis native OMP session continues indefinitely until /contribute off, an input/review gate, interruption, or session exit. It consumes model tokens, runs tests/commands under normal approval policy, and may create commits on the candidate branch. /contribute review requires another exact approval before an absent candidate branch is pushed to this fork; it never opens a pull request.\n\nOn confirmation only: recheck the official base and fork, switch model, create this exact branch from the frozen base commit, activate the existing autoresearch tools, then start the turn. Global approval policy is unchanged.`,
+					`Goal: ${goal.title}\nOfficial main commit/base: ${goal.commitSha}\nGoal blob: ${goal.blobSha}\nGoal SHA-256: ${goal.sha256}\nModel: ${selectedModel.provider}/${selectedModel.id}\nConfirmed fork: ${selectedRemote.name} (${selectedRemote.url})\nVerified push-effective destination: ${selectedRemote.pushUrl}\nFresh local candidate branch: ${branchName}\n\nThis native OMP session continues indefinitely until /contribute off, an input/review gate, interruption, or session exit. Its uncapped model token use may consume subscription quota and incur API charges. There is no estimate and no cap. It runs tests/commands under normal approval policy and may create commits on the candidate branch. /contribute review requires another exact approval before an absent candidate branch is pushed to this fork; it never opens a pull request.\n\nOn confirmation only: recheck the official base and fork, switch model, create this exact branch from the frozen base commit, activate the existing autoresearch tools, then start the turn. Global approval policy is unchanged.`,
 				);
 				if (!finalConfirmed) return;
 				await drainAutoresearchMutationOperations(startSessionKey);
@@ -1723,12 +1850,13 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 			});
 	});
 	api.on("agent_end", async (event, ctx) => {
-		const runtime = getRuntime(ctx);
+		let identity = captureLifecycleIdentity(ctx);
+		const runtime = identity.runtime;
+		const contributionRunning = runtime.contribution.status === "running";
+		if ((!runtime.autoresearchMode && !contributionRunning) || mutationAdmissionClosed(identity.sessionKey)) return;
 		runtime.runningExperiment = null;
 		dashboard.updateWidget(ctx, runtime);
 		dashboard.requestRender();
-		const contributionRunning = runtime.contribution.status === "running";
-		if (!runtime.autoresearchMode && !contributionRunning) return;
 		if (contributionRunning) {
 			// Approval dialogs cannot coexist with agent_end; queued messages and the
 			// explicit pause marker cover the observable input gates at this boundary.
@@ -1742,7 +1870,9 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 		}
 
 		const { session } = await loadActiveSession(ctx);
+		if (!lifecycleIdentityIsCurrent(ctx, identity)) return;
 		const storage = session ? await openAutoresearchStorageIfExists(ctx.cwd) : null;
+		if (!lifecycleIdentityIsCurrent(ctx, identity)) return;
 		const pendingRow = session && storage ? storage.getPendingRun(session.id) : null;
 		const pendingRun = pendingRunSummaryFromRow(pendingRow);
 		runtime.lastRunSummary = pendingRun;
@@ -1751,11 +1881,12 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 
 		if (runtime.contribution.status === "running") {
 			const currentBranch = await git.branch.current(ctx.cwd);
+			if (!lifecycleIdentityIsCurrent(ctx, identity)) return;
 			if (currentBranch !== runtime.contribution.branch) {
 				await stopContributionRuntime(ctx, runtime);
-				const experimentTools = new Set(EXPERIMENT_TOOL_NAMES);
-				await api.setActiveTools(api.getActiveTools().filter(name => !experimentTools.has(name)));
+				if (getSessionKey(ctx) !== identity.sessionKey || getRuntime(ctx) !== runtime) return;
 				dashboard.updateWidget(ctx, runtime);
+				dashboard.requestRender();
 				return;
 			}
 			if (runtime.contribution.currentSegment === null && runtime.state.sessionId !== null) {
@@ -1763,9 +1894,20 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 					...runtime.contribution,
 					currentSegment: runtime.state.currentSegment,
 				};
+				identity = captureLifecycleIdentity(ctx);
+			}
+			if (
+				!lifecycleIdentityIsCurrent(ctx, identity) ||
+				event.willContinue ||
+				ctx.hasPendingMessages() ||
+				contributionEndMustPause(event.messages)
+			) {
+				runtime.autoResumeArmed = false;
+				return;
 			}
 			runtime.autoResumeArmed = false;
 			runtime.lastAutoResumePendingRunNumber = pendingRun?.runNumber ?? null;
+			if (!lifecycleIdentityIsCurrent(ctx, identity)) return;
 			api.sendMessage(
 				{
 					customType: "autoresearch-resume",
@@ -1783,8 +1925,10 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 		const shouldResumePendingRun =
 			pendingRun !== null && runtime.lastAutoResumePendingRunNumber !== pendingRun.runNumber;
 		if (!shouldResumePendingRun && !runtime.autoResumeArmed) return;
+		if (!lifecycleIdentityIsCurrent(ctx, identity) || ctx.hasPendingMessages()) return;
 		runtime.autoResumeArmed = false;
 		runtime.lastAutoResumePendingRunNumber = pendingRun?.runNumber ?? null;
+		if (!lifecycleIdentityIsCurrent(ctx, identity)) return;
 		api.sendMessage(
 			{
 				customType: "autoresearch-resume",
@@ -1799,39 +1943,49 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 	});
 
 	api.on("before_agent_start", async (event, ctx) => {
-		const runtime = getRuntime(ctx);
-		if (!runtime.autoresearchMode) return;
+		let identity = captureLifecycleIdentity(ctx);
+		const runtime = identity.runtime;
+		if (!runtime.autoresearchMode || mutationAdmissionClosed(identity.sessionKey)) return;
 		// Re-check git branch on every agent start. If the user manually switched
 		// off the autoresearch/* branch between turns, we silently drop autoresearch
 		// from this turn — the widget hides, the experiment tools detach, and we do
 		// not inject the autoresearch system prompt.
 		const { session, currentBranch } = await loadActiveSession(ctx);
+		if (!lifecycleIdentityIsCurrent(ctx, identity)) return;
 		const onActiveBranch = session === null || session.branch === null || session.branch === currentBranch;
 		const onContributionBranch =
 			runtime.contribution.status !== "running" || runtime.contribution.branch === currentBranch;
 		if (!onActiveBranch || !onContributionBranch) {
 			if (runtime.contribution.status === "running") {
 				await stopContributionRuntime(ctx, runtime);
+				if (getSessionKey(ctx) !== identity.sessionKey || getRuntime(ctx) !== runtime) return;
 			} else {
+				advanceLifecycleEpoch(identity.sessionKey);
 				runtime.autoresearchMode = false;
 				runtime.state = createExperimentState();
 				runtime.lastRunSummary = null;
 				runtime.runningExperiment = null;
 			}
 			dashboard.updateWidget(ctx, runtime);
+			dashboard.requestRender();
+			const settledIdentity = captureLifecycleIdentity(ctx);
 			const experimentTools = new Set(EXPERIMENT_TOOL_NAMES);
+			if (!lifecycleIdentityIsCurrent(ctx, settledIdentity)) return;
 			await api.setActiveTools(api.getActiveTools().filter(name => !experimentTools.has(name)));
+			if (!lifecycleIdentityIsCurrent(ctx, settledIdentity)) return;
 			return;
 		}
 		const storage = await openAutoresearchStorageIfExists(ctx.cwd);
-		if (session && storage) {
-			runtime.state = buildExperimentState(session, storage.listLoggedRuns(session.id));
-		}
+		if (!lifecycleIdentityIsCurrent(ctx, identity)) return;
+		const nextState = session && storage ? buildExperimentState(session, storage.listLoggedRuns(session.id)) : runtime.state;
 		const pendingRow = session && storage ? storage.getPendingRun(session.id) : null;
 		const pendingRun = pendingRunSummaryFromRow(pendingRow);
+		if (!lifecycleIdentityIsCurrent(ctx, identity)) return;
+		runtime.state = nextState;
 		runtime.lastRunSummary = pendingRun;
 		runtime.lastRunDuration = pendingRun?.durationSeconds ?? runtime.lastRunDuration;
 		runtime.lastRunAsi = pendingRun?.parsedAsi ?? runtime.lastRunAsi;
+		identity = captureLifecycleIdentity(ctx);
 		const state = runtime.state;
 		// `event.systemPrompt` is typed `string[]`, but upstream code paths can leave
 		// it unset (issue #3665). Coerce defensively so the autoresearch block still
@@ -1868,7 +2022,6 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 				paths: r.scopeDeviations.join(", "),
 			}));
 		if (!session) {
-			const currentBranch = await tryReadBranch(ctx.cwd);
 			const onAutoresearchBranch = currentBranch?.startsWith("autoresearch/") ?? false;
 			const baselineWarning = onAutoresearchBranch
 				? null
@@ -1883,6 +2036,7 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 				has_baseline_warning: baselineWarning !== null,
 				baseline_warning: baselineWarning ?? "",
 			});
+			if (!lifecycleIdentityIsCurrent(ctx, identity)) return;
 			return {
 				systemPrompt: [
 					runtime.contribution.status === "running"
@@ -1926,6 +2080,7 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 					? formatNum(pendingRun.parsedPrimary, state.metricUnit)
 					: null,
 		});
+		if (!lifecycleIdentityIsCurrent(ctx, identity)) return;
 		return {
 			systemPrompt: [
 				runtime.contribution.status === "running"
@@ -1940,9 +2095,9 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 		runtime: AutoresearchRuntime,
 		opts: { keepTree: boolean; resetTreeForce: boolean },
 	): Promise<void> {
-		const storage = await openAutoresearchStorage(ctx.cwd);
-		const session = storage.getActiveSession();
 		const branchName = await tryReadBranch(ctx.cwd);
+		const storage = await openAutoresearchStorage(ctx.cwd);
+		const session = storage.getActiveSessionForBranch(branchName);
 		const onAutoresearchBranch = branchName?.startsWith("autoresearch/") ?? false;
 		const shouldResetTree = !opts.keepTree && (onAutoresearchBranch || opts.resetTreeForce);
 		if (shouldResetTree && session?.baselineCommit) {

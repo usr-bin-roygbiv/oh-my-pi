@@ -12,6 +12,10 @@ export interface SessionStorageStat {
 	mtime: Date;
 }
 
+export interface SessionFlushOptions {
+	durable?: boolean;
+}
+
 export interface SessionStorageWriter {
 	/**
 	 * Append one newline-terminated line. File and memory storage perform the
@@ -20,8 +24,8 @@ export interface SessionStorageWriter {
 	 * `line` MUST include the trailing newline.
 	 */
 	append(line: string): Promise<void>;
-	/** Resolve once all queued appends complete. No fsync. */
-	flush(): Promise<void>;
+	/** Resolve once all queued appends complete, optionally syncing durable backing storage. */
+	flush(options?: SessionFlushOptions): Promise<void>;
 	/** False once close() has begun/finished. */
 	isOpen(): boolean;
 	close(): Promise<void>;
@@ -130,8 +134,11 @@ class FileSessionStorageWriter implements SessionStorageWriter {
 		}
 	}
 
-	async flush(): Promise<void> {
+	async flush(options?: SessionFlushOptions): Promise<void> {
 		if (this.#error) throw this.#error;
+		if (!options?.durable) return;
+		if (typeof fs.fdatasyncSync === "function") fs.fdatasyncSync(this.#fd);
+		else fs.fsyncSync(this.#fd);
 	}
 
 	isOpen(): boolean {
@@ -470,7 +477,7 @@ class MemorySessionStorageWriter implements SessionStorageWriter {
 		}
 	}
 
-	async flush(): Promise<void> {
+	async flush(_options?: SessionFlushOptions): Promise<void> {
 		if (this.#error) throw this.#error;
 	}
 

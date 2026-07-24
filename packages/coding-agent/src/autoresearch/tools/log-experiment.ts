@@ -8,7 +8,12 @@ import type { Theme } from "../../modes/theme/theme";
 import { replaceTabs, truncateToWidth } from "../../tools/render-utils";
 import { throwIfAborted } from "../../tools/tool-errors";
 import * as git from "../../utils/git";
-import { CONTRIBUTION_HARNESS_SHA256_ASI_KEY, CONTRIBUTION_WORKTREE_TREE_ASI_KEY } from "../contribution";
+import {
+	CONTRIBUTION_HARNESS_SHA256_ASI_KEY,
+	CONTRIBUTION_INVOCATION_SHA256_ASI_KEY,
+	CONTRIBUTION_RESERVED_ASI_KEYS,
+	CONTRIBUTION_WORKTREE_TREE_ASI_KEY,
+} from "../contribution";
 import { computeRunModifiedPaths, parseWorkDirDirtyPaths } from "../git";
 import {
 	ensureNumericMetricMap,
@@ -54,6 +59,12 @@ const logExperimentSchema = type({
 		.array()
 		.describe("flag earlier runs as suspect"),
 });
+
+interface ContributionRunProof {
+	readonly harnessSha256: string;
+	readonly invocationSha256: string;
+	readonly worktreeTreeSha: string;
+}
 
 export function createLogExperimentTool(
 	options: AutoresearchToolFactoryOptions,
@@ -125,31 +136,28 @@ export function createLogExperimentTool(
 				let commitHash = explicitCommit && explicitCommit.length > 0 ? explicitCommit : headSha;
 
 				let gitNote: string | null = null;
+				let contributionProof: ContributionRunProof | null = null;
 				if (params.status === "keep") {
 					let expectedContributionTree: string | undefined;
+					let expectedContributionParent: string | undefined;
 					if (runtime.contribution.status === "running") {
-						const proof = pendingRun.parsedAsi?.[CONTRIBUTION_WORKTREE_TREE_ASI_KEY];
-						const harnessProof = pendingRun.parsedAsi?.[CONTRIBUTION_HARNESS_SHA256_ASI_KEY];
-						if (
-							typeof proof !== "string" ||
-							!/^[0-9a-f]{40}$/.test(proof) ||
-							typeof harnessProof !== "string" ||
-							!/^[0-9a-f]{64}$/.test(harnessProof)
-						) {
+						contributionProof = readContributionRunProof(pendingRun.parsedAsi);
+						if (contributionProof === null || headSha === null) {
 							return {
 								content: [
-									{ type: "text", text: "Error: the passing run has no valid contribution worktree proof." },
+									{ type: "text", text: "Error: the passing run has no valid contribution byte proof." },
 								],
 							};
 						}
 						const currentTree = await git.writeWorktreeTree(ctx.cwd, mutation.signal);
 						await mutation.authorizeMutation();
-						if (currentTree !== proof) {
+						if (currentTree !== contributionProof.worktreeTreeSha) {
 							return {
 								content: [{ type: "text", text: "Error: files changed after the harness execution." }],
 							};
 						}
-						expectedContributionTree = proof;
+						expectedContributionTree = contributionProof.worktreeTreeSha;
+						expectedContributionParent = headSha;
 					}
 					if (onAutoresearchBranch && allModified.length > 0) {
 						const commitResult = await commitKeptExperiment(
@@ -162,6 +170,7 @@ export function createLogExperimentTool(
 							session.primaryMetric,
 							mutation.signal,
 							expectedContributionTree,
+							expectedContributionParent,
 						);
 						if (commitResult.error) {
 							return {
@@ -169,9 +178,12 @@ export function createLogExperimentTool(
 							};
 						}
 						gitNote = commitResult.note ?? null;
-						const newSha = await tryReadHeadSha(ctx.cwd, mutation.signal);
-						await mutation.authorizeMutation();
-						if (newSha) commitHash = newSha;
+						if (commitResult.commitSha) commitHash = commitResult.commitSha;
+						else {
+							const newSha = await tryReadHeadSha(ctx.cwd, mutation.signal);
+							await mutation.authorizeMutation();
+							if (newSha) commitHash = newSha;
+						}
 					} else if (!onAutoresearchBranch) {
 						warnings.push(
 							"Auto-commit skipped: not on a dedicated autoresearch branch. Modified files remain in the worktree.",
@@ -220,13 +232,7 @@ export function createLogExperimentTool(
 				const mergedAsi = mergeAsi(pendingRun.parsedAsi, sanitizeAsi(params.asi));
 				const asi: ASIData | undefined =
 					runtime.contribution.status === "running"
-						? {
-								...(mergedAsi ?? {}),
-								[CONTRIBUTION_HARNESS_SHA256_ASI_KEY]:
-									pendingRun.parsedAsi?.[CONTRIBUTION_HARNESS_SHA256_ASI_KEY] ?? "",
-								[CONTRIBUTION_WORKTREE_TREE_ASI_KEY]:
-									pendingRun.parsedAsi?.[CONTRIBUTION_WORKTREE_TREE_ASI_KEY] ?? "",
-							}
+						? overrideContributionProofAsi(mergedAsi, pendingRun.parsedAsi)
 						: mergedAsi;
 
 				if (pendingRun.parsedPrimary !== null && metric !== pendingRun.parsedPrimary) {
@@ -354,6 +360,7 @@ export function createLogExperimentTool(
 interface KeepCommitResult {
 	error?: string;
 	note?: string;
+	commitSha?: string;
 }
 
 async function commitKeptExperiment(
@@ -366,6 +373,7 @@ async function commitKeptExperiment(
 	primaryMetric: string,
 	signal?: AbortSignal,
 	expectedTree?: string,
+	expectedParent?: string,
 ): Promise<KeepCommitResult> {
 	if (files.length === 0) return { note: "nothing to commit" };
 	try {
@@ -396,14 +404,36 @@ async function commitKeptExperiment(
 	}
 	const commitMessage = `${description}\n\nResult: ${JSON.stringify(payload)}`;
 	try {
-		const commitResult = await git.commit(cwd, commitMessage, {
-			files,
-			signal,
-			noVerify: expectedTree !== undefined,
-		});
+		const commitResult = await git.commit(
+			cwd,
+			commitMessage,
+			expectedTree === undefined ? { files, signal } : { signal },
+		);
 		throwIfAborted(signal);
+		let commitSha: string | undefined;
+		if (expectedTree !== undefined) {
+			const [headSha, statusOutput] = await Promise.all([
+				git.head.sha(cwd, signal),
+				git.status(cwd, { porcelainV1: true, untrackedFiles: "all", z: true, signal }),
+			]);
+			throwIfAborted(signal);
+			const committed = headSha === null ? null : await git.rawCommit(cwd, headSha, signal);
+			throwIfAborted(signal);
+			if (
+				headSha === null ||
+				committed === null ||
+				committed.treeSha !== expectedTree ||
+				expectedParent === undefined ||
+				committed.parentShas.length !== 1 ||
+				committed.parentShas[0] !== expectedParent ||
+				statusOutput.length > 0
+			) {
+				return { error: "commit hooks changed the exact tested tree, parent, or clean worktree" };
+			}
+			commitSha = headSha;
+		}
 		const summary = `${commitResult.stdout}${commitResult.stderr}`.split("\n").find(line => line.trim().length > 0);
-		return { note: summary?.trim() ?? "committed" };
+		return { commitSha, note: summary?.trim() ?? "committed" };
 	} catch (err) {
 		throwIfAborted(signal);
 		return { error: `git commit failed: ${err instanceof Error ? err.message : String(err)}` };
@@ -482,6 +512,29 @@ function computeScopeDeviations(modifiedPaths: string[], session: SessionRow): s
 		}
 	}
 	return deviations;
+}
+
+function readContributionRunProof(asi: ASIData | null): ContributionRunProof | null {
+	const harnessSha256 = asi?.[CONTRIBUTION_HARNESS_SHA256_ASI_KEY];
+	const invocationSha256 = asi?.[CONTRIBUTION_INVOCATION_SHA256_ASI_KEY];
+	const worktreeTreeSha = asi?.[CONTRIBUTION_WORKTREE_TREE_ASI_KEY];
+	if (
+		typeof harnessSha256 !== "string" ||
+		!/^[0-9a-f]{64}$/.test(harnessSha256) ||
+		typeof invocationSha256 !== "string" ||
+		!/^[0-9a-f]{64}$/.test(invocationSha256) ||
+		typeof worktreeTreeSha !== "string" ||
+		!/^[0-9a-f]{40,64}$/.test(worktreeTreeSha)
+	) {
+		return null;
+	}
+	return { harnessSha256, invocationSha256, worktreeTreeSha };
+}
+
+function overrideContributionProofAsi(merged: ASIData | undefined, computed: ASIData | null): ASIData {
+	const overridden: ASIData = { ...(merged ?? {}) };
+	for (const key of CONTRIBUTION_RESERVED_ASI_KEYS) overridden[key] = computed?.[key] ?? "";
+	return overridden;
 }
 
 function mergeMetrics(
