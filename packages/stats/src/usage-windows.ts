@@ -13,6 +13,7 @@
  * dashboard must keep working for API-key-only setups that never record usage.
  */
 import { Database } from "bun:sqlite";
+import { AuthBrokerClient, resolveAuthBrokerConfig } from "@oh-my-pi/pi-ai/auth-broker";
 import { getAgentDbPath, logger } from "@oh-my-pi/pi-utils";
 import type { ProviderWindowInsight, UsageWindowPoint, UsageWindowSeries } from "./shared-types";
 
@@ -96,6 +97,38 @@ export function readUsageSnapshots(sinceMs: number, dbPath = getAgentDbPath()): 
 	} finally {
 		db?.close();
 	}
+}
+
+/**
+ * Fetch usage snapshots from wherever they actually accumulate: the auth
+ * broker's durable history when a broker is configured (the broker performs
+ * every upstream usage fetch in that mode, so the local `usage_history` stays
+ * frozen), else the local agent DB. Broker errors fall back to the local read
+ * so the dashboard degrades to stale-but-present data instead of failing.
+ */
+export async function fetchUsageSnapshots(sinceMs: number): Promise<UsageSnapshotRow[]> {
+	try {
+		const brokerConfig = await resolveAuthBrokerConfig();
+		if (brokerConfig) {
+			const client = new AuthBrokerClient({ url: brokerConfig.url, token: brokerConfig.token });
+			const response = await client.fetchUsageHistory({ sinceMs });
+			return response.entries.map(entry => ({
+				recordedAt: entry.recordedAt,
+				provider: entry.provider,
+				accountKey: entry.accountKey,
+				email: entry.email ?? null,
+				accountId: entry.accountId ?? null,
+				limitId: entry.limitId,
+				label: entry.label,
+				windowLabel: entry.windowLabel ?? null,
+				usedFraction: entry.usedFraction ?? null,
+				status: entry.status ?? null,
+			}));
+		}
+	} catch (err) {
+		logger.debug("broker usage history unavailable, falling back to local", { error: String(err) });
+	}
+	return readUsageSnapshots(sinceMs);
 }
 
 /** True when a snapshot reports an exhausted window, by status or by fraction. */

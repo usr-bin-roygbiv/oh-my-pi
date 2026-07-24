@@ -46,7 +46,7 @@ import type {
 	RequestDetails,
 	ToolDashboardStats,
 } from "./types";
-import { computeUsageWindowStats, readUsageSnapshots } from "./usage-windows";
+import { computeUsageWindowStats, fetchUsageSnapshots } from "./usage-windows";
 
 /**
  * Apply a freshly parsed result to the database. Runs entirely on the
@@ -526,7 +526,8 @@ export async function getProviderDashboardStats(range?: string | null): Promise<
 	const { modelSeriesDays, modelSeriesBucketMs, cutoff } = getTimeRangeConfig(range);
 	const providers = getStatsByProvider(cutoff ?? undefined);
 	const tokensByProvider = new Map(providers.map(p => [p.provider, p.totalTokens]));
-	const { usageSeries, windowInsights } = computeUsageWindowStats(readUsageSnapshots(cutoff ?? 0), tokensByProvider);
+	const snapshots = await fetchUsageSnapshots(cutoff ?? 0);
+	const { usageSeries, windowInsights } = computeUsageWindowStats(snapshots, tokensByProvider);
 	return {
 		providers,
 		hourly: getProviderHourlyBurn(cutoff ?? undefined),
