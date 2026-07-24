@@ -555,27 +555,129 @@ export class AutoresearchStorage {
 const storageCache = new Map<string, AutoresearchStorage>();
 
 const AUTORESEARCH_READONLY_PROBE_MAX_BYTES = 256 * 1024 * 1024;
+const AUTORESEARCH_READONLY_PROBE_MAX_BYTES_BIGINT = BigInt(AUTORESEARCH_READONLY_PROBE_MAX_BYTES);
+const AUTORESEARCH_READONLY_PROBE_COPY_BUFFER_BYTES = 64 * 1024;
 
-function readProbeFileSize(filePath: string, label: string, optional = false): number {
-	let stat: fs.Stats;
+type ProbeFileSnapshot = {
+	dev: bigint;
+	ino: bigint;
+	size: bigint;
+	mtimeNs: bigint;
+	ctimeNs: bigint;
+};
+
+type ProbeStateSnapshot = {
+	database: ProbeFileSnapshot;
+	wal: ProbeFileSnapshot | null;
+};
+
+function throwProbeLimitExceeded(): never {
+	throw new Error("Existing autoresearch state exceeds the 256 MiB read-only probe limit.");
+}
+
+function throwProbeSourceChanged(): never {
+	throw new Error("Existing autoresearch state changed during the read-only probe.");
+}
+
+function probeFileSnapshotFromStat(stat: fs.BigIntStats, label: string): ProbeFileSnapshot {
+	if (!stat.isFile()) throw new Error(`Existing autoresearch ${label} is not a regular file.`);
+	if (stat.size > AUTORESEARCH_READONLY_PROBE_MAX_BYTES_BIGINT) throwProbeLimitExceeded();
+	return {
+		dev: stat.dev,
+		ino: stat.ino,
+		size: stat.size,
+		mtimeNs: stat.mtimeNs,
+		ctimeNs: stat.ctimeNs,
+	};
+}
+
+function readProbeFileSnapshot(filePath: string, label: string, optional = false): ProbeFileSnapshot | null {
+	let stat: fs.BigIntStats;
 	try {
-		stat = fs.lstatSync(filePath);
+		stat = fs.lstatSync(filePath, { bigint: true });
 	} catch (error) {
-		if (optional && isEnoent(error)) return 0;
+		if (optional && isEnoent(error)) return null;
 		throw error;
 	}
-	if (!stat.isFile()) {
-		throw new Error(`Existing autoresearch ${label} is not a regular file.`);
+	return probeFileSnapshotFromStat(stat, label);
+}
+
+function readProbeStateSnapshot(dbPath: string): ProbeStateSnapshot {
+	const database = readProbeFileSnapshot(dbPath, "database");
+	if (!database) throw new Error("Existing autoresearch database is missing.");
+	const wal = readProbeFileSnapshot(`${dbPath}-wal`, "write-ahead log", true);
+	if (wal && wal.size > AUTORESEARCH_READONLY_PROBE_MAX_BYTES_BIGINT - database.size) {
+		throwProbeLimitExceeded();
 	}
-	if (stat.size > AUTORESEARCH_READONLY_PROBE_MAX_BYTES) {
-		throw new Error("Existing autoresearch state exceeds the 256 MiB read-only probe limit.");
+	return { database, wal };
+}
+
+function probeFileSnapshotsEqual(left: ProbeFileSnapshot, right: ProbeFileSnapshot): boolean {
+	return (
+		left.dev === right.dev &&
+		left.ino === right.ino &&
+		left.size === right.size &&
+		left.mtimeNs === right.mtimeNs &&
+		left.ctimeNs === right.ctimeNs
+	);
+}
+
+function assertProbeStateUnchanged(expected: ProbeStateSnapshot, actual: ProbeStateSnapshot): void {
+	if (
+		!probeFileSnapshotsEqual(expected.database, actual.database) ||
+		(expected.wal === null) !== (actual.wal === null) ||
+		(expected.wal !== null && actual.wal !== null && !probeFileSnapshotsEqual(expected.wal, actual.wal))
+	) {
+		throwProbeSourceChanged();
 	}
-	return stat.size;
+}
+
+function copyProbeFileBounded(
+	sourcePath: string,
+	destinationPath: string,
+	label: string,
+	expected: ProbeFileSnapshot,
+): void {
+	const sourceFlags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0);
+	const source = fs.openSync(sourcePath, sourceFlags);
+	let destination: number | null = null;
+	try {
+		const opened = probeFileSnapshotFromStat(fs.fstatSync(source, { bigint: true }), label);
+		if (!probeFileSnapshotsEqual(expected, opened)) throwProbeSourceChanged();
+		destination = fs.openSync(destinationPath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL, 0o600);
+		const buffer = Buffer.allocUnsafe(AUTORESEARCH_READONLY_PROBE_COPY_BUFFER_BYTES);
+		let copied = 0n;
+		while (true) {
+			const bytesRead = fs.readSync(source, buffer, 0, buffer.length, null);
+			if (bytesRead === 0) break;
+			const nextCopied = copied + BigInt(bytesRead);
+			if (nextCopied > AUTORESEARCH_READONLY_PROBE_MAX_BYTES_BIGINT) throwProbeLimitExceeded();
+			if (nextCopied > expected.size) {
+				probeFileSnapshotFromStat(fs.fstatSync(source, { bigint: true }), label);
+				throwProbeSourceChanged();
+			}
+			let written = 0;
+			while (written < bytesRead) {
+				written += fs.writeSync(destination, buffer, written, bytesRead - written);
+			}
+			copied = nextCopied;
+		}
+		if (copied !== expected.size) throwProbeSourceChanged();
+		const copiedSource = probeFileSnapshotFromStat(fs.fstatSync(source, { bigint: true }), label);
+		const currentPath = readProbeFileSnapshot(sourcePath, label);
+		if (!currentPath || !probeFileSnapshotsEqual(expected, copiedSource) || !probeFileSnapshotsEqual(expected, currentPath)) {
+			throwProbeSourceChanged();
+		}
+	} finally {
+		if (destination !== null) fs.closeSync(destination);
+		fs.closeSync(source);
+	}
 }
 
 function assertSqliteFileHeader(filePath: string): void {
 	const header = Buffer.allocUnsafe(SQLITE_FILE_HEADER.length);
-	const descriptor = fs.openSync(filePath, "r");
+	const sourceFlags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0);
+	const descriptor = fs.openSync(filePath, sourceFlags);
 	try {
 		const bytesRead = fs.readSync(descriptor, header, 0, header.length, 0);
 		if (bytesRead !== header.length || !header.equals(SQLITE_FILE_HEADER)) {
@@ -595,18 +697,17 @@ export async function hasActiveAutoresearchSession(cwd: string): Promise<boolean
 	let probeDir: string | null = null;
 	let database: Database | null = null;
 	try {
-		const walPath = `${dbPath}-wal`;
-		const databaseBytes = readProbeFileSize(dbPath, "database");
-		const walBytes = readProbeFileSize(walPath, "write-ahead log", true);
-		if (walBytes > AUTORESEARCH_READONLY_PROBE_MAX_BYTES - databaseBytes) {
-			throw new Error("Existing autoresearch state exceeds the 256 MiB read-only probe limit.");
-		}
-		assertSqliteFileHeader(dbPath);
+		const initialState = readProbeStateSnapshot(dbPath);
 
 		probeDir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-autoresearch-probe-"));
 		const probePath = path.join(probeDir, "state.db");
-		fs.copyFileSync(dbPath, probePath);
-		if (walBytes > 0) fs.copyFileSync(walPath, `${probePath}-wal`);
+		copyProbeFileBounded(dbPath, probePath, "database", initialState.database);
+		assertSqliteFileHeader(probePath);
+		assertProbeStateUnchanged(initialState, readProbeStateSnapshot(dbPath));
+		if (initialState.wal) {
+			copyProbeFileBounded(`${dbPath}-wal`, `${probePath}-wal`, "write-ahead log", initialState.wal);
+		}
+		assertProbeStateUnchanged(initialState, readProbeStateSnapshot(dbPath));
 		database = new Database(probePath, { readonly: true, create: false });
 		return (
 			database

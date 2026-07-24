@@ -1439,6 +1439,9 @@ export async function writeTree(cwd: string, options: Pick<CommandOptions, "env"
 
 const WORKTREE_TREE_RECORD_LIMIT_BYTES = 1024 * 1024;
 const WORKTREE_TREE_INDEX_BATCH_BYTES = 1024 * 1024;
+const WORKTREE_TREE_FILE_LIMIT_BYTES = 32 * 1024 * 1024;
+const WORKTREE_TREE_TOTAL_LIMIT_BYTES = 256 * 1024 * 1024;
+const WORKTREE_TREE_COPY_BUFFER_BYTES = 64 * 1024;
 
 async function runGitToFile(
 	cwd: string,
@@ -1588,25 +1591,65 @@ function parseObjectId(output: string, kind: "blob" | "submodule" | "tree"): str
 async function hashWorktreeFile(
 	repositoryRoot: string,
 	absolutePath: string | Buffer,
+	materializedPath: string,
 	env: Record<string, string>,
+	reserveMaterializedBytes: (bytes: number) => void,
+	availableMaterializedBytes: () => number,
 	signal?: AbortSignal,
 ): Promise<{ mode: "100644" | "100755"; objectId: string }> {
 	const noFollow = fs.constants.O_NOFOLLOW ?? 0;
-	const file = await fs.promises.open(absolutePath, fs.constants.O_RDONLY | noFollow);
+	const source = await fs.promises.open(absolutePath, fs.constants.O_RDONLY | noFollow);
+	let mode: "100644" | "100755";
 	try {
-		const fileStat = await file.stat();
+		const fileStat = await source.stat();
 		if (!fileStat.isFile()) throw new Error("Worktree entry changed while it was being snapshotted.");
+		if (fileStat.size > WORKTREE_TREE_FILE_LIMIT_BYTES) {
+			throw new Error("Worktree proof file exceeds the 32 MiB materialization limit.");
+		}
+		if (fileStat.size > availableMaterializedBytes()) {
+			throw new Error("Worktree proof exceeds the 256 MiB aggregate materialization limit.");
+		}
+		mode = (fileStat.mode & 0o100) === 0 ? "100644" : "100755";
+		const materialized = await fs.promises.open(materializedPath, "w", 0o600);
+		try {
+			const buffer = Buffer.allocUnsafe(WORKTREE_TREE_COPY_BUFFER_BYTES);
+			let fileBytes = 0;
+			while (true) {
+				throwIfAborted(signal);
+				const { bytesRead } = await source.read(buffer, 0, buffer.length, null);
+				if (bytesRead === 0) break;
+				fileBytes += bytesRead;
+				if (fileBytes > WORKTREE_TREE_FILE_LIMIT_BYTES) {
+					throw new Error("Worktree proof file exceeds the 32 MiB materialization limit.");
+				}
+				reserveMaterializedBytes(bytesRead);
+				let written = 0;
+				while (written < bytesRead) {
+					const result = await materialized.write(buffer, written, bytesRead - written, null);
+					if (result.bytesWritten === 0) throw new Error("Failed to materialize worktree proof bytes.");
+					written += result.bytesWritten;
+				}
+			}
+		} finally {
+			await materialized.close();
+		}
+	} finally {
+		await source.close();
+	}
+
+	const materialized = await fs.promises.open(materializedPath, "r");
+	try {
 		const objectId = parseObjectId(
 			await runText(repositoryRoot, ["hash-object", "-w", "--no-filters", "--stdin"], {
 				env,
 				signal,
-				stdin: file.fd,
+				stdin: materialized.fd,
 			}),
 			"blob",
 		);
-		return { mode: (fileStat.mode & 0o100) === 0 ? "100644" : "100755", objectId };
+		return { mode, objectId };
 	} finally {
-		await file.close();
+		await materialized.close();
 	}
 }
 
@@ -1625,6 +1668,7 @@ export async function writeWorktreeTree(cwd: string, signal?: AbortSignal): Prom
 	const temporaryObjectDirectory = path.join(temporaryRoot, "objects");
 	const stagedListing = path.join(temporaryRoot, "staged");
 	const candidateListing = path.join(temporaryRoot, "candidates");
+	const materializedPath = path.join(temporaryRoot, "materialized");
 	const env = {
 		GIT_INDEX_FILE: path.join(temporaryRoot, "index"),
 		GIT_OBJECT_DIRECTORY: temporaryObjectDirectory,
@@ -1686,6 +1730,14 @@ export async function writeWorktreeTree(cwd: string, signal?: AbortSignal): Prom
 		const replacedParents = new Set<string>();
 		let indexBatch: Buffer[] = [];
 		let indexBatchBytes = 0;
+		let materializedBytes = 0;
+		const reserveMaterializedBytes = (bytes: number): void => {
+			if (bytes > WORKTREE_TREE_TOTAL_LIMIT_BYTES - materializedBytes) {
+				throw new Error("Worktree proof exceeds the 256 MiB aggregate materialization limit.");
+			}
+			materializedBytes += bytes;
+		};
+		const availableMaterializedBytes = (): number => WORKTREE_TREE_TOTAL_LIMIT_BYTES - materializedBytes;
 		const flushIndexBatch = async (): Promise<void> => {
 			if (indexBatchBytes === 0) return;
 			await runEffect(repository.repoRoot, ["update-index", "--add", "-z", "--index-info"], {
@@ -1735,6 +1787,10 @@ export async function writeWorktreeTree(cwd: string, signal?: AbortSignal): Prom
 				}
 				if (entry.stat.isSymbolicLink()) {
 					const contents = await fs.promises.readlink(entry.absolutePath, { encoding: "buffer" });
+					if (contents.byteLength > WORKTREE_TREE_FILE_LIMIT_BYTES) {
+						throw new Error("Worktree proof file exceeds the 32 MiB materialization limit.");
+					}
+					reserveMaterializedBytes(contents.byteLength);
 					const objectId = parseObjectId(
 						await runText(repository.repoRoot, ["hash-object", "-w", "--no-filters", "--stdin"], {
 							env,
@@ -1749,7 +1805,15 @@ export async function writeWorktreeTree(cwd: string, signal?: AbortSignal): Prom
 				if (!entry.stat.isFile()) {
 					throw new Error(`Cannot snapshot unsupported filesystem entry: ${entry.relativePath.toString("hex")}`);
 				}
-				const hashed = await hashWorktreeFile(repository.repoRoot, entry.absolutePath, env, signal);
+				const hashed = await hashWorktreeFile(
+					repository.repoRoot,
+					entry.absolutePath,
+					materializedPath,
+					env,
+					reserveMaterializedBytes,
+					availableMaterializedBytes,
+					signal,
+				);
 				const mode =
 					!useFilesystemSymlinks && trackedEntry?.mode === "120000"
 						? "120000"
