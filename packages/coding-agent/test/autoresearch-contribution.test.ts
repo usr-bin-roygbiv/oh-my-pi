@@ -485,6 +485,49 @@ describe("read-only contribution storage preflight", () => {
 		expect(snapshotStorageArtifacts(dbDir.path())).toEqual(before);
 	});
 
+	for (const oversizedArtifact of ["database", "write-ahead log"] as const) {
+		it(`rejects an oversized ${oversizedArtifact} before copying any state`, async () => {
+			await openHistoricalSession(cwd.path());
+			closeAllAutoresearchStorages();
+			const dbName = fs.readdirSync(dbDir.path()).find(name => name.endsWith(".db"));
+			if (!dbName) throw new Error("Expected autoresearch database fixture");
+			const dbPath = `${dbDir.path()}/${dbName}`;
+			const oversizedPath = oversizedArtifact === "database" ? dbPath : `${dbPath}-wal`;
+			if (oversizedArtifact === "write-ahead log") fs.closeSync(fs.openSync(oversizedPath, "w"));
+			fs.truncateSync(oversizedPath, 512 * 1024 * 1024 + 1);
+			const probeTemps = (): string[] =>
+				fs
+					.readdirSync(os.tmpdir())
+					.filter(name => name.startsWith("omp-autoresearch-probe-"))
+					.sort();
+			const tempsBefore = probeTemps();
+			const mkdtempSpy = vi.spyOn(fs, "mkdtempSync");
+			const copyAttempts: string[] = [];
+			const realCopyFileSync = fs.copyFileSync;
+			vi.spyOn(fs, "copyFileSync").mockImplementation((source, destination) => {
+				copyAttempts.push(String(source));
+				if (fs.statSync(source).size > 512 * 1024 * 1024) {
+					throw new Error("Test intercepted an unbounded state copy");
+				}
+				realCopyFileSync(source, destination);
+			});
+
+			const result = await hasActiveAutoresearchSession(cwd.path()).then(
+				value => ({ value }),
+				(error: unknown) => ({ error }),
+			);
+
+			expect(result).toEqual({ error: expect.any(Error) });
+			if (!("error" in result) || !(result.error instanceof Error)) throw new Error("Expected bounded probe error");
+			expect(result.error.message).toContain("read-only probe limit");
+			expect(copyAttempts).toEqual([]);
+			expect(
+				mkdtempSpy.mock.calls.filter(([prefix]) => String(prefix).includes("omp-autoresearch-probe-")),
+			).toEqual([]);
+			expect(probeTemps()).toEqual(tempsBefore);
+		});
+	}
+
 	it("blocks malformed existing storage conservatively without repairing or replacing it", async () => {
 		await openHistoricalSession(cwd.path());
 		closeAllAutoresearchStorages();
@@ -4749,6 +4792,55 @@ describe("process-local contribution lifecycle", () => {
 			message: expect.stringContaining("candidate_not_descendant"),
 		});
 	});
+	it("aborts and drains review preparation before off can close its session", async () => {
+		const harness = createIntegrationHarness(cwd.path(), { confirmAnswers: [true, true, true] });
+		await startContribution(harness);
+		await prepareKeptContribution(harness, cwd.path());
+		const reviewReadEntered = Promise.withResolvers<void>();
+		const releaseReviewRead = Promise.withResolvers<void>();
+		let reviewSignal: AbortSignal | undefined;
+		vi.spyOn(git.branch, "current").mockImplementation(async (_workDir, signal) => {
+			reviewSignal = signal;
+			reviewReadEntered.resolve();
+			await releaseReviewRead.promise;
+			if (signal?.aborted) throw signal.reason ?? new DOMException("Review preparation invalidated", "AbortError");
+			return harness.currentBranch();
+		});
+
+		let reviewSettled = false;
+		const reviewPromise = commandRequired(harness, "contribute")
+			.handler("review", harness.ctx)
+			.finally(() => {
+				reviewSettled = true;
+			});
+		await reviewReadEntered.promise;
+		let offSettled = false;
+		const offPromise = commandRequired(harness, "contribute")
+			.handler("off", harness.ctx)
+			.finally(() => {
+				offSettled = true;
+			});
+		for (let turn = 0; turn < 4; turn++) await Promise.resolve();
+		const reviewSettledBeforeRelease = reviewSettled;
+		const offSettledBeforeRelease = offSettled;
+		const reviewSignalDefinedBeforeRelease = reviewSignal !== undefined;
+		const reviewSignalAbortedBeforeRelease = reviewSignal?.aborted;
+
+		releaseReviewRead.resolve();
+		const [reviewResult, offResult] = await Promise.allSettled([reviewPromise, offPromise]);
+
+		expect(reviewSettledBeforeRelease).toBe(false);
+		expect(offSettledBeforeRelease).toBe(false);
+		expect(reviewSignalDefinedBeforeRelease).toBe(true);
+		expect(reviewSignalAbortedBeforeRelease).toBe(true);
+		expect(reviewResult.status).toBe("fulfilled");
+		expect(offResult.status).toBe("fulfilled");
+		expect(harness.pushes).toEqual([]);
+		expect(harness.activeTools).toEqual(["read", "bash"]);
+		await commandRequired(harness, "contribute").handler("status", harness.ctx);
+		expect(harness.notifications.at(-1)?.message).toBe("Contribution mode is off.");
+	});
+
 	for (const race of [
 		{ point: "fork verification", invalidation: "off" },
 		{ point: "pre-push ancestry", invalidation: "session switch" },
@@ -5221,6 +5313,87 @@ describe("process-local contribution lifecycle", () => {
 			}).toEqual(settledState);
 		});
 	}
+
+	it("aborts and drains an admitted ordinary mutation before restarting autoresearch", async () => {
+		await initializeRealContributionRepository(cwd.path());
+		const repositoryHead = (await $`git -C ${cwd.path()} rev-parse HEAD`.quiet()).text().trim();
+		const harness = createIntegrationHarness(cwd.path());
+		const branch = "autoresearch/ordinary-restart";
+		harness.setCurrentBranch(branch);
+		harness.setHeadSha(repositoryHead);
+		await commandRequired(harness, "autoresearch").handler("initial ordinary goal", harness.ctx);
+		const init = harness.tools.get("init_experiment");
+		const updateNotes = harness.tools.get("update_notes");
+		if (!init || !updateNotes) throw new Error("Expected ordinary autoresearch tools");
+		await init.execute(
+			"ordinary-restart-session",
+			{ name: "ordinary restart", primary_metric: "runtime_ms", metric_unit: "ms" },
+			undefined,
+			undefined,
+			harness.ctx as ExtensionContext,
+		);
+		const storage = await openAutoresearchStorage(cwd.path());
+		const session = storage.getActiveSessionForBranch(branch);
+		if (!session) throw new Error("Expected initialized ordinary session");
+		const notesBefore = session.notes;
+		const mutationEntered = Promise.withResolvers<void>();
+		const releaseMutation = Promise.withResolvers<void>();
+		let mutationSignal: AbortSignal | undefined;
+		vi.spyOn(git.branch, "current").mockImplementation(async (_workDir, signal) => {
+			if (signal) {
+				mutationSignal = signal;
+				mutationEntered.resolve();
+				await releaseMutation.promise;
+				if (signal.aborted) throw signal.reason ?? new DOMException("Ordinary restart invalidated", "AbortError");
+			}
+			return harness.currentBranch();
+		});
+
+		let mutationSettled = false;
+		const mutationPromise = updateNotes
+			.execute(
+				"ordinary-notes-during-restart",
+				{ body: "stale notes must not publish across restart" },
+				undefined,
+				undefined,
+				harness.ctx as ExtensionContext,
+			)
+			.finally(() => {
+				mutationSettled = true;
+			});
+		await mutationEntered.promise;
+		let commandSettled = false;
+		const commandPromise = commandRequired(harness, "autoresearch")
+			.handler("replacement ordinary goal", harness.ctx)
+			.finally(() => {
+				commandSettled = true;
+			});
+		for (let turn = 0; turn < 4; turn++) await Promise.resolve();
+		const mutationSettledBeforeRelease = mutationSettled;
+		const commandSettledBeforeRelease = commandSettled;
+		const mutationSignalDefinedBeforeRelease = mutationSignal !== undefined;
+		const mutationSignalAbortedBeforeRelease = mutationSignal?.aborted;
+
+		releaseMutation.resolve();
+		const [mutationResult, commandResult] = await Promise.allSettled([mutationPromise, commandPromise]);
+
+		expect(mutationSettledBeforeRelease).toBe(false);
+		expect(commandSettledBeforeRelease).toBe(false);
+		expect(mutationSignalDefinedBeforeRelease).toBe(true);
+		expect(mutationSignalAbortedBeforeRelease).toBe(true);
+		expect(mutationResult).toMatchObject({ status: "rejected", reason: { name: "ToolAbortError" } });
+		expect(commandResult.status).toBe("fulfilled");
+		expect(storage.getSessionById(session.id)).toMatchObject({
+			goal: "replacement ordinary goal",
+			notes: notesBefore,
+			closedAt: null,
+		});
+		expect(storage.getActiveSessionForBranch(branch)?.id).toBe(session.id);
+		expect(harness.appendEntries.at(-1)).toEqual({
+			customType: "autoresearch-control",
+			data: { mode: "on", goal: "replacement ordinary goal" },
+		});
+	});
 
 	it("binds an ordinary session to branch A and restores it only after returning from branch B", async () => {
 		const harness = createIntegrationHarness(cwd.path());

@@ -287,6 +287,74 @@ describe("AgentSession.branchFromBtw", () => {
 		expect(emitted[2]?.transitionId).toBe(emitted[0]?.transitionId);
 	});
 
+	it("serializes a queued move back to the original directory", async () => {
+		const activeSession = await createSession();
+		const originalCwd = activeSession.sessionManager.getCwd();
+		const targetCwd = path.join(tempDir, "queued-move-target");
+		fs.mkdirSync(targetCwd);
+		const firstMoveEntered = Promise.withResolvers<void>();
+		const releaseFirstMove = Promise.withResolvers<void>();
+		const realMoveTo = activeSession.sessionManager.moveTo.bind(activeSession.sessionManager);
+		let moveCallCount = 0;
+		vi.spyOn(activeSession.sessionManager, "moveTo").mockImplementation(async (newCwd, targetSessionDir) => {
+			moveCallCount++;
+			if (moveCallCount === 1) {
+				firstMoveEntered.resolve();
+				await releaseFirstMove.promise;
+			}
+			await realMoveTo(newCwd, targetSessionDir);
+		});
+
+		const moveAway = activeSession.moveSession(targetCwd);
+		await firstMoveEntered.promise;
+		let moveBackSettled = false;
+		const moveBack = activeSession.moveSession(originalCwd).finally(() => {
+			moveBackSettled = true;
+		});
+		for (let turn = 0; turn < 4; turn++) await Promise.resolve();
+		const moveBackSettledBeforeRelease = moveBackSettled;
+
+		releaseFirstMove.resolve();
+		const results = await Promise.allSettled([moveAway, moveBack]);
+
+		expect(moveBackSettledBeforeRelease).toBe(false);
+		expect(results).toEqual([
+			{ status: "fulfilled", value: true },
+			{ status: "fulfilled", value: true },
+		]);
+		expect(moveCallCount).toBe(2);
+		expect(activeSession.sessionManager.getCwd()).toBe(originalCwd);
+	});
+
+	it("coalesces a queued duplicate move after the first reaches its target", async () => {
+		const emitted: Array<Record<string, unknown>> = [];
+		const extensionRunner = {
+			hasHandlers: vi.fn(() => true),
+			emit: vi.fn(async (event: Record<string, unknown>) => {
+				emitted.push(event);
+				return undefined;
+			}),
+		} as unknown as ExtensionRunner;
+		const activeSession = await createSession({ extensionRunner });
+		const targetCwd = path.join(tempDir, "duplicate-move-target");
+		fs.mkdirSync(targetCwd);
+
+		const results = await Promise.allSettled([
+			activeSession.moveSession(targetCwd),
+			activeSession.moveSession(targetCwd),
+		]);
+
+		expect(results).toEqual([
+			{ status: "fulfilled", value: true },
+			{ status: "fulfilled", value: true },
+		]);
+		expect(activeSession.sessionManager.getCwd()).toBe(targetCwd);
+		expect(emitted.filter(event => event.type === "session_before_move")).toHaveLength(1);
+		expect(emitted.filter(event => event.type === "session_move")).toHaveLength(1);
+		expect(emitted.filter(event => event.type === "session_transition_end")).toHaveLength(2);
+		expect(emitted.filter(event => event.type === "session_transition_end" && event.committed === true)).toHaveLength(1);
+	});
+
 	it("syncs promoted /btw messages into live context even when hooks skip conversation restore", async () => {
 		const extensionRunner = {
 			hasHandlers: vi.fn((eventType: string) => eventType === "session_before_branch"),
