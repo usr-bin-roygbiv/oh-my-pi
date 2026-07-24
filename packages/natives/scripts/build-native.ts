@@ -372,6 +372,16 @@ if (crossTarget) {
 		const existing = process.env[envKey] ?? "";
 		process.env[envKey] = existing ? `${existing} -UNDEBUG` : "-UNDEBUG";
 	}
+	// MSVC cross builds compile C deps with clang-cl, which — unlike real MSVC —
+	// enforces per-function target features: opus' silk/x86 SSE4.1 units fail to
+	// build without the feature enabled globally. The win32 x64 addon floor is
+	// x86-64-v2 (SSE4.2 inclusive), so enabling it for all C deps is safe.
+	if (crossTarget.endsWith("-msvc") && targetArch === "x64") {
+		const envKey = `CFLAGS_${bareTriple.replace(/-/g, "_")}`;
+		const existing = process.env[envKey] ?? "";
+		const sseFlags = "-msse4.1 -msse4.2";
+		process.env[envKey] = existing ? `${existing} ${sseFlags}` : sseFlags;
+	}
 	// napi 3.7.0 resolves the built artifact from the FULL `--target` directory,
 	// but cargo-zigbuild writes under the bare triple; bridge the two so napi's
 	// postBuild copyArtifact succeeds for glibc-pinned targets.
