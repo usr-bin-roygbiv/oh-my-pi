@@ -3,7 +3,7 @@
 ## [Unreleased]
 ### Added
 
-- Added opt-in `/contribute` spare-machine research with official-main goal provenance, fresh uncapped sessions, executable red/green gates, lifecycle-safe mutation draining, durable publication recovery, push-effective fork verification, rewrite-isolated exact-SHA publication, and a human-gated pull-request handoff.
+- Added opt-in `/contribute` spare-machine research with official-main goal provenance, fresh uncapped sessions, executable red/green gates, lifecycle-safe mutation draining, software-crash publication recovery via a pre-push synced intent, push-effective fork verification, rewrite-isolated exact-SHA publication, and a human-gated pull-request handoff.
 
 ## [17.1.2] - 2026-07-24
 
