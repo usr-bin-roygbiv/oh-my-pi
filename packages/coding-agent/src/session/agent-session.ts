@@ -330,6 +330,7 @@ const PLAN_MODE_REMINDER_MAX = 3;
 interface SessionTransitionState {
 	transitionId: string;
 	committed: boolean;
+	emitEnd: boolean;
 }
 
 interface TreeNavigationResult {
@@ -6104,15 +6105,18 @@ export class AgentSession {
 	async moveSession(newCwd: string, targetSessionDir?: string): Promise<boolean> {
 		const resolvedCwd = path.resolve(newCwd);
 		const resolvedTargetDir = targetSessionDir ? path.resolve(targetSessionDir) : undefined;
-		if (
-			resolvedCwd === path.resolve(this.sessionManager.getCwd()) &&
-			(!resolvedTargetDir || resolvedTargetDir === path.resolve(this.sessionManager.getSessionDir()))
-		) {
-			return true;
-		}
+		return this.#runSessionTransition("move", async transition => {
+			if (
+				resolvedCwd === path.resolve(this.sessionManager.getCwd()) &&
+				(!resolvedTargetDir || resolvedTargetDir === path.resolve(this.sessionManager.getSessionDir()))
+			) {
+				transition.emitEnd = false;
+				return true;
+			}
 
-		this.#assertVibeSessionTransitionAllowed("move the session");
-		return this.#runSessionTransition("move", transition => this.#moveSession(newCwd, targetSessionDir, transition));
+			this.#assertVibeSessionTransitionAllowed("move the session");
+			return this.#moveSession(resolvedCwd, resolvedTargetDir, transition);
+		});
 	}
 
 	async #moveSession(
@@ -6963,6 +6967,7 @@ export class AgentSession {
 		const transition: SessionTransitionState = {
 			transitionId: crypto.randomUUID(),
 			committed: false,
+			emitEnd: true,
 		};
 		try {
 			return await operation(transition);
@@ -6976,6 +6981,7 @@ export class AgentSession {
 	}
 
 	async #finishSessionTransition(kind: SessionTransitionKind, transition: SessionTransitionState): Promise<void> {
+		if (!transition.emitEnd) return;
 		if (this.#extensionRunner?.hasHandlers("session_transition_end")) {
 			await this.#extensionRunner.emit({
 				type: "session_transition_end",

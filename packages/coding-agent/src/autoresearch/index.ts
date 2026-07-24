@@ -47,6 +47,7 @@ import {
 	reconstructControlState,
 } from "./state";
 import {
+	type AutoresearchStorage,
 	hasActiveAutoresearchSession,
 	openAutoresearchStorage,
 	openAutoresearchStorageIfExists,
@@ -1114,6 +1115,8 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 					return;
 				}
 
+				await drainAutoresearchMutationOperations(sessionKey);
+				if (!operationIsCurrent()) return;
 				const goalArg = trimmed.length > 0 ? trimmed : null;
 				const branchResult = await ensureAutoresearchBranch(api, ctx.cwd, goalArg ?? runtime.goal);
 				if (!operationIsCurrent()) return;
@@ -1262,15 +1265,72 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 					return;
 				}
 				const reviewSessionKey = getSessionKey(ctx);
+				if (contributionPublicationOperations.has(reviewSessionKey)) {
+					ctx.ui.notify("A contribution review or publication is already active for this session.", "error");
+					return;
+				}
+				const contribution = runtime.contribution;
+				const reviewAuthorization = contribution.authorization;
+				const reviewBranch = contribution.branch;
+				const reviewSessionId = contribution.sessionId;
+				const publicationOperation: ContributionPublicationOperation = {
+					controller: new AbortController(),
+					phase: "pre-push",
+					settlement: Promise.withResolvers<void>(),
+				};
+				contributionPublicationOperations.set(reviewSessionKey, publicationOperation);
+				advanceLifecycleEpoch(reviewSessionKey);
+				let publicationSettled = false;
+				const settlePublicationOperation = (): void => {
+					if (publicationSettled) return;
+					publicationSettled = true;
+					if (contributionPublicationOperations.get(reviewSessionKey) === publicationOperation) {
+						contributionPublicationOperations.delete(reviewSessionKey);
+					}
+					publicationOperation.settlement.resolve();
+				};
+				const assertContributionIdentity = (): void => {
+					const currentRuntime = getRuntime(ctx);
+					const current = currentRuntime.contribution;
+					if (
+						getSessionKey(ctx) !== reviewSessionKey ||
+						currentRuntime !== runtime ||
+						current.status !== "running" ||
+						current.authorization !== reviewAuthorization ||
+						current.branch !== reviewBranch ||
+						current.sessionId !== reviewSessionId
+					) {
+						throw new Error("Contribution publication authorization changed.");
+					}
+				};
+				const authorizePublication = (): void => {
+					throwIfAborted(publicationOperation.controller.signal);
+					if (contributionPublicationOperations.get(reviewSessionKey) !== publicationOperation) {
+						throw new Error("Contribution publication authorization changed.");
+					}
+					assertContributionIdentity();
+				};
 				const releaseReviewAdmission = acquireMutationAdmissionHold(reviewSessionKey);
 				try {
 					await drainAutoresearchMutationOperations(reviewSessionKey);
+					try {
+						authorizePublication();
+					} catch (error) {
+						ctx.ui.notify(`Contribution review failed: ${describeContributionError(error)}`, "error");
+						return;
+					}
 					if (runtime.contribution.status !== "running") {
 						ctx.ui.notify("Contribution review authorization changed while active mutations settled.", "error");
 						return;
 					}
-					const contribution = runtime.contribution;
-					const storage = await openAutoresearchStorageIfExists(ctx.cwd);
+					let storage: AutoresearchStorage | null;
+					try {
+						storage = await openAutoresearchStorageIfExists(ctx.cwd);
+						authorizePublication();
+					} catch (error) {
+						ctx.ui.notify(`Contribution review failed: ${describeContributionError(error)}`, "error");
+						return;
+					}
 					if (!storage || contribution.sessionId === null) {
 						ctx.ui.notify("Contribution review requires an initialized experiment session.", "error");
 						return;
@@ -1293,10 +1353,16 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 					let statusOutput: string;
 					try {
 						[currentBranch, currentHead, statusOutput] = await Promise.all([
-							git.branch.current(ctx.cwd),
-							git.head.sha(ctx.cwd),
-							git.status(ctx.cwd, { porcelainV1: true, untrackedFiles: "all", z: true }),
+							git.branch.current(ctx.cwd, publicationOperation.controller.signal),
+							git.head.sha(ctx.cwd, publicationOperation.controller.signal),
+							git.status(ctx.cwd, {
+								porcelainV1: true,
+								untrackedFiles: "all",
+								z: true,
+								signal: publicationOperation.controller.signal,
+							}),
 						]);
+						authorizePublication();
 					} catch (error) {
 						ctx.ui.notify(`Contribution review failed: ${describeContributionError(error)}`, "error");
 						return;
@@ -1319,12 +1385,20 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 						return;
 					}
 					try {
-						if (!(await git.isAncestor(ctx.cwd, contribution.baseProof.baseSha, currentHead))) {
+						if (
+							!(await git.isAncestor(
+								ctx.cwd,
+								contribution.baseProof.baseSha,
+								currentHead,
+								publicationOperation.controller.signal,
+							))
+						) {
 							throw new ContributionError(
 								"candidate_not_descendant",
 								"The contribution candidate does not descend from the frozen official base.",
 							);
 						}
+						authorizePublication();
 					} catch (error) {
 						ctx.ui.notify(`Contribution review failed: ${describeContributionError(error)}`, "error");
 						return;
@@ -1375,8 +1449,8 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 					let reviewPushRemoteUrl: string;
 					try {
 						const [reviewRemoteUrl, pushRemoteUrl] = await Promise.all([
-							git.remote.url(ctx.cwd, contribution.remoteName),
-							git.remote.pushUrl(ctx.cwd, contribution.remoteName),
+							git.remote.url(ctx.cwd, contribution.remoteName, publicationOperation.controller.signal),
+							git.remote.pushUrl(ctx.cwd, contribution.remoteName, publicationOperation.controller.signal),
 						]);
 						if (reviewRemoteUrl !== contribution.remoteUrl || pushRemoteUrl === undefined) {
 							throw new ContributionError(
@@ -1392,7 +1466,10 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 								"The push-effective destination differs from the confirmed fork.",
 							);
 						}
-						await verifyContributionFork(ctx.cwd, pushRemote);
+						await verifyContributionFork(ctx.cwd, pushRemote, {
+							signal: publicationOperation.controller.signal,
+						});
+						authorizePublication();
 						reviewPushRemoteUrl = pushRemoteUrl;
 					} catch (error) {
 						ctx.ui.notify(`Contribution review failed: ${describeContributionError(error)}`, "error");
@@ -1406,30 +1483,14 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 						contribution.branch,
 						contribution.baseProof,
 					);
-					const reviewAuthorization = contribution.authorization;
-					const reviewBranch = contribution.branch;
-					const reviewSessionId = contribution.sessionId;
-					const assertContributionIdentity = (): void => {
-						const currentRuntime = getRuntime(ctx);
-						const current = currentRuntime.contribution;
-						if (
-							getSessionKey(ctx) !== reviewSessionKey ||
-							currentRuntime !== runtime ||
-							current.status !== "running" ||
-							current.authorization !== reviewAuthorization ||
-							current.branch !== reviewBranch ||
-							current.sessionId !== reviewSessionId
-						) {
-							throw new Error("Contribution publication authorization changed.");
-						}
-					};
 					const approved = await ctx.ui.confirm(
 						"Push exact contribution candidate for review?",
 						`${approvedDraft.body}\n\nThis approval pushes only the verified candidate ${currentHead} with \`${currentHead}:refs/heads/${contribution.branch}\` through the confirmed fork remote ${contribution.remoteName}. Its verified push-effective destination is ${reviewPushRemoteUrl}, and the candidate branch must be absent. A command-scoped explicit pushurl prevents Git URL rewrite rules from changing that destination. This does not create or approve a pull request. The SHA-bound human sentence remains empty and must be written by the human reviewer.`,
+						{ signal: publicationOperation.controller.signal },
 					);
 					if (!approved) return;
 					try {
-						assertContributionIdentity();
+						authorizePublication();
 					} catch (error) {
 						ctx.ui.notify(`Contribution review failed: ${describeContributionError(error)}`, "error");
 						return;
@@ -1450,24 +1511,6 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 						ctx.ui.notify("Contribution review proof changed after approval; publication cancelled.", "error");
 						return;
 					}
-					if (contributionPublicationOperations.has(reviewSessionKey)) {
-						ctx.ui.notify("A contribution publication is already active for this session.", "error");
-						return;
-					}
-					const publicationOperation: ContributionPublicationOperation = {
-						controller: new AbortController(),
-						phase: "pre-push",
-						settlement: Promise.withResolvers<void>(),
-					};
-					contributionPublicationOperations.set(reviewSessionKey, publicationOperation);
-					advanceLifecycleEpoch(reviewSessionKey);
-					const authorizePublication = (): void => {
-						throwIfAborted(publicationOperation.controller.signal);
-						if (contributionPublicationOperations.get(reviewSessionKey) !== publicationOperation) {
-							throw new Error("Contribution publication authorization changed.");
-						}
-						assertContributionIdentity();
-					};
 					const authorizePush = async (publication: PublishedContributionCandidate): Promise<void> => {
 						authorizePublication();
 						const intent = createPublicationEntryData(
@@ -1560,13 +1603,11 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 							"info",
 						);
 					} finally {
-						if (contributionPublicationOperations.get(reviewSessionKey) === publicationOperation) {
-							contributionPublicationOperations.delete(reviewSessionKey);
-						}
-						publicationOperation.settlement.resolve();
+						settlePublicationOperation();
 					}
 					return;
 				} finally {
+					settlePublicationOperation();
 					releaseReviewAdmission();
 				}
 			}

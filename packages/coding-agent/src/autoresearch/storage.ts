@@ -3,7 +3,7 @@ import { Buffer } from "node:buffer";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { getAutoresearchDbPath, getAutoresearchProjectDir, logger } from "@oh-my-pi/pi-utils";
+import { getAutoresearchDbPath, getAutoresearchProjectDir, isEnoent, logger } from "@oh-my-pi/pi-utils";
 import * as git from "../utils/git";
 import type { ASIData, ExperimentStatus, MetricDirection, NumericMetricMap } from "./types";
 
@@ -554,29 +554,59 @@ export class AutoresearchStorage {
 
 const storageCache = new Map<string, AutoresearchStorage>();
 
+const AUTORESEARCH_READONLY_PROBE_MAX_BYTES = 256 * 1024 * 1024;
+
+function readProbeFileSize(filePath: string, label: string, optional = false): number {
+	let stat: fs.Stats;
+	try {
+		stat = fs.lstatSync(filePath);
+	} catch (error) {
+		if (optional && isEnoent(error)) return 0;
+		throw error;
+	}
+	if (!stat.isFile()) {
+		throw new Error(`Existing autoresearch ${label} is not a regular file.`);
+	}
+	if (stat.size > AUTORESEARCH_READONLY_PROBE_MAX_BYTES) {
+		throw new Error("Existing autoresearch state exceeds the 256 MiB read-only probe limit.");
+	}
+	return stat.size;
+}
+
+function assertSqliteFileHeader(filePath: string): void {
+	const header = Buffer.allocUnsafe(SQLITE_FILE_HEADER.length);
+	const descriptor = fs.openSync(filePath, "r");
+	try {
+		const bytesRead = fs.readSync(descriptor, header, 0, header.length, 0);
+		if (bytesRead !== header.length || !header.equals(SQLITE_FILE_HEADER)) {
+			throw new Error("Existing autoresearch state is not a SQLite database.");
+		}
+	} finally {
+		fs.closeSync(descriptor);
+	}
+}
+
 export async function hasActiveAutoresearchSession(cwd: string): Promise<boolean> {
 	const { dbPath } = await resolveAutoresearchPaths(cwd);
 	const cached = storageCache.get(dbPath);
 	if (cached) return cached.getActiveSession() !== null;
 	if (!(await Bun.file(dbPath).exists())) return false;
 
-	const probeDir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-autoresearch-probe-"));
-	const probePath = path.join(probeDir, "state.db");
+	let probeDir: string | null = null;
 	let database: Database | null = null;
 	try {
-		fs.copyFileSync(dbPath, probePath);
-		const header = Buffer.allocUnsafe(SQLITE_FILE_HEADER.length);
-		const descriptor = fs.openSync(probePath, "r");
-		try {
-			const bytesRead = fs.readSync(descriptor, header, 0, header.length, 0);
-			if (bytesRead !== header.length || !header.equals(SQLITE_FILE_HEADER)) {
-				throw new Error("Existing autoresearch state is not a SQLite database.");
-			}
-		} finally {
-			fs.closeSync(descriptor);
-		}
 		const walPath = `${dbPath}-wal`;
-		if (fs.existsSync(walPath)) fs.copyFileSync(walPath, `${probePath}-wal`);
+		const databaseBytes = readProbeFileSize(dbPath, "database");
+		const walBytes = readProbeFileSize(walPath, "write-ahead log", true);
+		if (walBytes > AUTORESEARCH_READONLY_PROBE_MAX_BYTES - databaseBytes) {
+			throw new Error("Existing autoresearch state exceeds the 256 MiB read-only probe limit.");
+		}
+		assertSqliteFileHeader(dbPath);
+
+		probeDir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-autoresearch-probe-"));
+		const probePath = path.join(probeDir, "state.db");
+		fs.copyFileSync(dbPath, probePath);
+		if (walBytes > 0) fs.copyFileSync(walPath, `${probePath}-wal`);
 		database = new Database(probePath, { readonly: true, create: false });
 		return (
 			database
@@ -592,7 +622,7 @@ export async function hasActiveAutoresearchSession(cwd: string): Promise<boolean
 		try {
 			database?.close();
 		} finally {
-			fs.rmSync(probeDir, { recursive: true, force: true });
+			if (probeDir !== null) fs.rmSync(probeDir, { recursive: true, force: true });
 		}
 	}
 }

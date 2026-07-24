@@ -2087,13 +2087,6 @@ export async function isAncestor(
 	descendant: string,
 	signal?: AbortSignal,
 ): Promise<boolean> {
-	const repository = await resolveRepository(cwd);
-	if (!repository) throw new Error("Not a Git repository.");
-	try {
-		await Bun.file(path.join(repository.commonDir, "info", "grafts")).text();
-	} catch (error) {
-		if (!isEnoent(error)) throw error;
-	}
 	const target = ancestor.toLowerCase();
 	const queue = [descendant];
 	const visited = new Set<string>();
