@@ -32,7 +32,6 @@ import {
 	findBestKeptMetric,
 } from "../state";
 import { openAutoresearchStorageIfExists, type SessionRow } from "../storage";
-import { CONTRIBUTION_HEAD_SHA_ASI_KEY } from "../types";
 import type {
 	ASIData,
 	AutoresearchToolFactoryOptions,
@@ -41,6 +40,7 @@ import type {
 	LogDetails,
 	NumericMetricMap,
 } from "../types";
+import { CONTRIBUTION_HEAD_SHA_ASI_KEY } from "../types";
 import { beginAutoresearchMutation } from "./mutation-authorization";
 
 const EXPERIMENT_TOOL_NAMES = ["init_experiment", "run_experiment", "log_experiment", "update_notes"];

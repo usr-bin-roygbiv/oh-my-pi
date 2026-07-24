@@ -89,7 +89,6 @@ describe("CommandController /move", () => {
 		}
 	});
 
-
 	it("aborts /move when pending settings flush fails, leaving cwd untouched", async () => {
 		const sourceDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-move-source-"));
 		const targetDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-move-target-"));

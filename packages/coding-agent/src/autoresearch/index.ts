@@ -57,7 +57,6 @@ import { createInitExperimentTool } from "./tools/init-experiment";
 import { createLogExperimentTool } from "./tools/log-experiment";
 import { createRunExperimentTool } from "./tools/run-experiment";
 import { createUpdateNotesTool } from "./tools/update-notes";
-import { CONTRIBUTION_HEAD_SHA_ASI_KEY } from "./types";
 import type {
 	AutoresearchMutationAuthorization,
 	AutoresearchRuntime,
@@ -66,6 +65,7 @@ import type {
 	ExperimentResult,
 	PendingRunSummary,
 } from "./types";
+import { CONTRIBUTION_HEAD_SHA_ASI_KEY } from "./types";
 
 const EXPERIMENT_TOOL_NAMES = ["init_experiment", "run_experiment", "log_experiment", "update_notes"];
 
@@ -431,7 +431,7 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 		const startTransaction = contributionStartTransactions.get(sessionKey);
 		if (startTransaction) {
 			startTransaction.token = null;
-			settlements.push(startTransaction.settlement.promise);
+			if (startTransaction.phase === "activating") settlements.push(startTransaction.settlement.promise);
 		}
 		const publication = contributionPublicationOperations.get(sessionKey);
 		if (publication) {

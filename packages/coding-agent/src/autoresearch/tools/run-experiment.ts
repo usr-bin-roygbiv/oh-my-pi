@@ -29,8 +29,8 @@ import {
 } from "../helpers";
 import { buildExperimentState } from "../state";
 import { openAutoresearchStorageIfExists } from "../storage";
-import { CONTRIBUTION_HEAD_SHA_ASI_KEY } from "../types";
 import type { AutoresearchToolFactoryOptions, RunDetails, RunExperimentProgressDetails } from "../types";
+import { CONTRIBUTION_HEAD_SHA_ASI_KEY } from "../types";
 import { DEFAULT_HARNESS_COMMAND, HARNESS_FILENAME } from "./init-experiment";
 import { beginAutoresearchMutation } from "./mutation-authorization";
 

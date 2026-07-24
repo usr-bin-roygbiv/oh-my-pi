@@ -1198,11 +1198,10 @@ export class CommandController {
 		if (!isDirectory) return;
 
 		if (await this.#moveInteractiveCwd(resolvedPath)) return;
-		const restoreResult = await this.ctx.session.executeBash(
-			`cd -- ${quoteShellArg(sourceCwd)}`,
-			undefined,
-			{ excludeFromContext: true, useUserShell: true },
-		);
+		const restoreResult = await this.ctx.session.executeBash(`cd -- ${quoteShellArg(sourceCwd)}`, undefined, {
+			excludeFromContext: true,
+			useUserShell: true,
+		});
 		if (
 			restoreResult.cancelled ||
 			restoreResult.exitCode !== 0 ||

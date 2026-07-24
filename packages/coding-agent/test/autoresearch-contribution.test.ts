@@ -2481,6 +2481,7 @@ async function preparePendingContribution(harness: IntegrationHarness, cwd: stri
 			[CONTRIBUTION_HARNESS_SHA256_ASI_KEY]: HARNESS_SHA256,
 			[CONTRIBUTION_WORKTREE_TREE_ASI_KEY]: CANDIDATE_TREE_SHA,
 			[CONTRIBUTION_INVOCATION_SHA256_ASI_KEY]: INVOCATION_SHA256,
+			[CONTRIBUTION_HEAD_SHA_ASI_KEY]: COMMIT_SHA,
 		},
 	});
 	return { run, session, storage };
@@ -2709,10 +2710,10 @@ describe("process-local contribution lifecycle", () => {
 		let branchReadCount = 0;
 		vi.spyOn(git.branch, "current").mockImplementation(async () => {
 			branchReadCount++;
-			if (branchReadCount === 1) {
+			if (branchReadCount === 2) {
 				firstBranchEntered.resolve();
 				await releaseFirstBranch.promise;
-			} else if (branchReadCount === 2) {
+			} else if (branchReadCount === 3) {
 				secondBranchEntered.resolve();
 				await releaseSecondBranch.promise;
 			}
@@ -4602,7 +4603,6 @@ describe("process-local contribution lifecycle", () => {
 			harness.ctx as ExtensionContext,
 		);
 		await run.execute("spoofed-green", { timeout_seconds: 2 }, undefined, undefined, harness.ctx as ExtensionContext);
-		harness.setHeadSha(CURRENT_HEAD);
 		await log.execute(
 			"log-spoofed-green",
 			{
