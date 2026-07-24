@@ -259,14 +259,17 @@ creates, approves, or merges a pull request.
 
 Immediately before transport, OMP records and displays the immutable candidate,
 destination ref, review URLs, and exact draft as a durable “push outcome pending”
-intent. Once that immutable push begins, lifecycle commands drain it rather than
-canceling an ambiguously completed transport. A successful push always retains the
-review URLs and draft handoff before the transition completes. If the process exits
-before recording success, resume or select that exact original transcript (for
-example with `omp --resume`) and run `/contribute status`; it checks the exact fork
-ref and reports recovered success, a different SHA, or an unknown outcome without
-retrying the push. A fresh plain `omp` session reports contribution mode off. The
-process-local authorization and continuation loop never resume.
+intent. It waits for transcript-writer acknowledgement and an explicit file-data
+sync request before transport. This improves recovery after a software or process
+crash; it is not a guarantee against sudden power loss or storage, filesystem, or
+hardware failure. Once that immutable push begins, lifecycle commands drain it
+rather than canceling an ambiguously completed transport. A successful push always
+retains the review URLs and draft handoff before the transition completes. If the
+process exits before recording success, resume or select that exact original
+transcript (for example with `omp --resume`) and run `/contribute status`; it checks
+the exact fork ref and reports recovered success, a different SHA, or an unknown
+outcome without retrying the push. A fresh plain `omp` session reports contribution
+mode off. The process-local authorization and continuation loop never resume.
 
 After the push, OMP stops the research loop and prints:
 
