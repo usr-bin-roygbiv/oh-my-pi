@@ -1181,7 +1181,10 @@ describe("contribution fork validation and publication", () => {
 			const filterMarker = `${source.path()}/.git/snapshot-filter-ran`;
 			const filterScript = `${source.path()}/.git/snapshot-filter.sh`;
 			await Bun.write(`${source.path()}/.gitattributes`, "tracked.txt filter=snapshot-filter\n");
-			await Bun.write(filterScript, `#!/bin/sh\nprintf invoked > ${JSON.stringify(filterMarker)}\nprintf transformed\n`);
+			await Bun.write(
+				filterScript,
+				`#!/bin/sh\nprintf invoked > ${JSON.stringify(filterMarker)}\nprintf transformed\n`,
+			);
 			fs.chmodSync(filterScript, 0o755);
 			await $`git -C ${expected.path()} init -b main`.quiet();
 			await Bun.write(`${expected.path()}/tracked.txt`, "unstaged worktree bytes\n");
@@ -3605,17 +3608,11 @@ describe("process-local contribution lifecycle", () => {
 			}>(harness, "session_move");
 			const movedCtx = { ...harness.ctx, cwd: destination.path() } as ExtensionContext;
 
-			await moveHandler(
-				{ type: "session_move", previousCwd: cwd.path(), cwd: destination.path() },
-				movedCtx,
-			);
+			await moveHandler({ type: "session_move", previousCwd: cwd.path(), cwd: destination.path() }, movedCtx);
 			const prompt = await handlerRequired<BeforeAgentStartEvent, { systemPrompt?: string[] }>(
 				harness,
 				"before_agent_start",
-			)(
-				{ type: "before_agent_start", prompt: "after move", systemPrompt: ["base prompt"] },
-				movedCtx,
-			);
+			)({ type: "before_agent_start", prompt: "after move", systemPrompt: ["base prompt"] }, movedCtx);
 
 			expect(prompt).toBeUndefined();
 			expect(harness.activeTools).toEqual(["read", "bash"]);
@@ -5625,8 +5622,7 @@ describe("process-local contribution lifecycle", () => {
 			throw new Error("Expected all autoresearch mutation tools");
 		}
 		for (const tool of [init, runTool, logTool, updateNotesTool]) {
-			const concurrency =
-				typeof tool.concurrency === "function" ? tool.concurrency({} as never) : tool.concurrency;
+			const concurrency = typeof tool.concurrency === "function" ? tool.concurrency({} as never) : tool.concurrency;
 			expect(concurrency).toBe("exclusive");
 		}
 		expect(init.concurrency?.({ new_segment: true })).toBe("exclusive");

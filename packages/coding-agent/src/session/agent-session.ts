@@ -6112,9 +6112,7 @@ export class AgentSession {
 		}
 
 		this.#assertVibeSessionTransitionAllowed("move the session");
-		return this.#runSessionTransition("move", transition =>
-			this.#moveSession(newCwd, targetSessionDir, transition),
-		);
+		return this.#runSessionTransition("move", transition => this.#moveSession(newCwd, targetSessionDir, transition));
 	}
 
 	async #moveSession(

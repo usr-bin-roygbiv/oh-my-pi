@@ -1569,7 +1569,11 @@ async function inspectWorktreePath(
 		}
 		if (index === relativePath.length || entryStat.isDirectory()) continue;
 		replacedParents.add(prefixKey);
-		return { absolutePath: absoluteGitPath(repositoryRoot, prefix), relativePath: Buffer.from(prefix), stat: entryStat };
+		return {
+			absolutePath: absoluteGitPath(repositoryRoot, prefix),
+			relativePath: Buffer.from(prefix),
+			stat: entryStat,
+		};
 	}
 	const absolutePath = absoluteGitPath(repositoryRoot, relativePath);
 	return { absolutePath, relativePath, stat: await fs.promises.lstat(absolutePath) };
@@ -1664,15 +1668,19 @@ export async function writeWorktreeTree(cwd: string, signal?: AbortSignal): Prom
 				: undefined;
 		};
 		const trustFileMode =
-			(await tryText(repository.repoRoot, ["config", "--type=bool", "--get", "core.fileMode"], {
-				readOnly: true,
-				signal,
-			}))?.trim() !== "false";
+			(
+				await tryText(repository.repoRoot, ["config", "--type=bool", "--get", "core.fileMode"], {
+					readOnly: true,
+					signal,
+				})
+			)?.trim() !== "false";
 		const useFilesystemSymlinks =
-			(await tryText(repository.repoRoot, ["config", "--type=bool", "--get", "core.symlinks"], {
-				readOnly: true,
-				signal,
-			}))?.trim() !== "false";
+			(
+				await tryText(repository.repoRoot, ["config", "--type=bool", "--get", "core.symlinks"], {
+					readOnly: true,
+					signal,
+				})
+			)?.trim() !== "false";
 
 		await runEffect(repository.repoRoot, ["read-tree", "--empty"], { env, signal });
 		const replacedParents = new Set<string>();
@@ -1704,46 +1712,50 @@ export async function writeWorktreeTree(cwd: string, signal?: AbortSignal): Prom
 				const entry = await inspectWorktreePath(repository.repoRoot, relativePath, replacedParents);
 				if (!entry) continue;
 				const trackedEntry = entry.relativePath.equals(relativePath) ? candidateTrackedEntry : undefined;
-			if (entry.stat.isDirectory()) {
-				if (trackedEntry?.mode !== "160000") continue;
-				const submodulePath = path.join(repository.repoRoot, decodeGitPath(entry.relativePath));
-				const submoduleRepository = await resolveRepository(submodulePath);
-				const objectId =
-					submoduleRepository && path.resolve(submoduleRepository.repoRoot) === path.resolve(submodulePath)
-						? parseObjectId(
-								await runText(submodulePath, ["--no-replace-objects", "rev-parse", "--verify", "HEAD^{commit}"], {
-									readOnly: true,
-									signal,
-								}),
-								"submodule",
-							)
-						: trackedEntry.objectId;
-				await appendIndexEntry("160000", objectId, entry.relativePath);
-				continue;
-			}
-			if (entry.stat.isSymbolicLink()) {
-				const contents = await fs.promises.readlink(entry.absolutePath, { encoding: "buffer" });
-				const objectId = parseObjectId(
-					await runText(repository.repoRoot, ["hash-object", "-w", "--no-filters", "--stdin"], {
-						env,
-						signal,
-						stdin: contents,
-					}),
-					"blob",
-				);
-				await appendIndexEntry("120000", objectId, entry.relativePath);
-				continue;
-			}
-			if (!entry.stat.isFile()) {
-				throw new Error(`Cannot snapshot unsupported filesystem entry: ${entry.relativePath.toString("hex")}`);
-			}
-			const hashed = await hashWorktreeFile(repository.repoRoot, entry.absolutePath, env, signal);
-			const mode =
-				!useFilesystemSymlinks && trackedEntry?.mode === "120000"
-					? "120000"
-					: !trustFileMode && (trackedEntry?.mode === "100644" || trackedEntry?.mode === "100755")
-						? trackedEntry.mode
-						: hashed.mode;
+				if (entry.stat.isDirectory()) {
+					if (trackedEntry?.mode !== "160000") continue;
+					const submodulePath = path.join(repository.repoRoot, decodeGitPath(entry.relativePath));
+					const submoduleRepository = await resolveRepository(submodulePath);
+					const objectId =
+						submoduleRepository && path.resolve(submoduleRepository.repoRoot) === path.resolve(submodulePath)
+							? parseObjectId(
+									await runText(
+										submodulePath,
+										["--no-replace-objects", "rev-parse", "--verify", "HEAD^{commit}"],
+										{
+											readOnly: true,
+											signal,
+										},
+									),
+									"submodule",
+								)
+							: trackedEntry.objectId;
+					await appendIndexEntry("160000", objectId, entry.relativePath);
+					continue;
+				}
+				if (entry.stat.isSymbolicLink()) {
+					const contents = await fs.promises.readlink(entry.absolutePath, { encoding: "buffer" });
+					const objectId = parseObjectId(
+						await runText(repository.repoRoot, ["hash-object", "-w", "--no-filters", "--stdin"], {
+							env,
+							signal,
+							stdin: contents,
+						}),
+						"blob",
+					);
+					await appendIndexEntry("120000", objectId, entry.relativePath);
+					continue;
+				}
+				if (!entry.stat.isFile()) {
+					throw new Error(`Cannot snapshot unsupported filesystem entry: ${entry.relativePath.toString("hex")}`);
+				}
+				const hashed = await hashWorktreeFile(repository.repoRoot, entry.absolutePath, env, signal);
+				const mode =
+					!useFilesystemSymlinks && trackedEntry?.mode === "120000"
+						? "120000"
+						: !trustFileMode && (trackedEntry?.mode === "100644" || trackedEntry?.mode === "100755")
+							? trackedEntry.mode
+							: hashed.mode;
 				await appendIndexEntry(mode, hashed.objectId, entry.relativePath);
 			}
 		} finally {
