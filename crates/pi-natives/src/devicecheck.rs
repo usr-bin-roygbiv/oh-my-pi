@@ -340,7 +340,7 @@ mod platform {
 mod platform {
 	use super::DeviceCheckTokenResult;
 
-	pub fn generate_token() -> DeviceCheckTokenResult {
+	pub const fn generate_token() -> DeviceCheckTokenResult {
 		DeviceCheckTokenResult {
 			supported:    false,
 			token_base64: None,
