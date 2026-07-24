@@ -14,6 +14,7 @@ import { Markdown, Text } from "@oh-my-pi/pi-tui";
 import { formatNumber } from "@oh-my-pi/pi-utils";
 import { settings } from "../config/settings";
 import type { EvalCellResult, EvalLanguage, EvalStatusEvent, EvalToolDetails } from "../eval/types";
+import { formatEvalCodeForDisplay } from "./eval-format";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { formatContextUsage } from "../modes/components/status-line/context-thresholds";
 import { truncateToVisualLines } from "../modes/components/visual-truncate";
@@ -89,10 +90,11 @@ function getRenderCells(args: EvalRenderArgs | undefined): EvalRenderCell[] {
 	const out: EvalRenderCell[] = [];
 	for (const cell of raw) {
 		if (!cell || typeof cell !== "object") continue;
+		const language = normalizeRenderLanguage(typeof cell.language === "string" ? cell.language : undefined);
 		const code = typeof cell.code === "string" ? cell.code : "";
 		out.push({
-			language: normalizeRenderLanguage(typeof cell.language === "string" ? cell.language : undefined),
-			code,
+			language,
+			code: formatEvalCodeForDisplay(code, language),
 			title: typeof cell.title === "string" ? cell.title : undefined,
 		});
 	}
@@ -587,6 +589,10 @@ export const evalToolRenderer = {
 
 		const cellResults = details?.cells;
 		if (cellResults && cellResults.length > 0) {
+			const displayCells = cellResults.map(cell => {
+				const language = cell.language ?? details?.language ?? "python";
+				return { cell, code: formatEvalCodeForDisplay(cell.code, language), language };
+			});
 			let cached: { key: string; width: number; result: string[] } | undefined;
 
 			return markFramedBlockComponent({
@@ -602,8 +608,8 @@ export const evalToolRenderer = {
 					}
 
 					const lines: string[] = [];
-					for (let i = 0; i < cellResults.length; i++) {
-						const cell = cellResults[i];
+					for (let i = 0; i < displayCells.length; i++) {
+						const { cell, code, language } = displayCells[i];
 						const allEvents = cell.statusEvents ?? [];
 						const agentEvents = allEvents.filter(e => e.op === "agent");
 						const otherEvents = agentEvents.length > 0 ? allEvents.filter(e => e.op !== "agent") : allEvents;
@@ -623,8 +629,8 @@ export const evalToolRenderer = {
 						}
 						const cellLines = renderCodeCell(
 							{
-								code: cell.code,
-								language: languageForHighlighter(cell.language ?? details?.language),
+								code,
+								language: languageForHighlighter(language),
 								showLanguage: true,
 								index: i,
 								total: cellResults.length,
