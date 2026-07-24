@@ -58,6 +58,7 @@ import type {
 	SessionStartEvent,
 	ToolDefinition,
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
+import { ExtensionUiController } from "@oh-my-pi/pi-coding-agent/modes/controllers/extension-ui-controller";
 import * as git from "@oh-my-pi/pi-coding-agent/utils/git";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { $ } from "bun";
@@ -2522,6 +2523,54 @@ async function initializeRealContributionRepository(cwd: string): Promise<void> 
 	await $`git -C ${cwd} add autoresearch.sh source.ts`.quiet();
 	await $`git -C ${cwd} commit -m baseline`.quiet();
 }
+
+describe("interactive contribution review confirmation", () => {
+	it("propagates cancellation through the initialized TUI confirmation selector", async () => {
+		let uiContext: ExtensionContext["ui"] | undefined;
+		const controller = new ExtensionUiController({
+			editor: {
+				setText: vi.fn(),
+				handleInput: vi.fn(),
+				getText: vi.fn(() => ""),
+			},
+			ui: { requestRender: vi.fn() },
+			session: {
+				extensionRunner: undefined,
+				setUsageFallbackConfirmer: vi.fn(),
+			},
+			setToolUIContext(context: ExtensionContext["ui"]): void {
+				uiContext = context;
+			},
+			addAutocompleteProvider: vi.fn(),
+		} as never);
+		const selectorEntered = Promise.withResolvers<void>();
+		const releaseSelector = Promise.withResolvers<void>();
+		let selectorSignal: AbortSignal | undefined;
+		vi.spyOn(controller, "showHookSelector").mockImplementation(async (_title, _options, dialogOptions) => {
+			selectorSignal = dialogOptions?.signal;
+			selectorEntered.resolve();
+			await releaseSelector.promise;
+			return dialogOptions?.signal?.aborted ? undefined : "Yes";
+		});
+		await controller.initHooksAndCustomTools();
+		if (!uiContext) throw new Error("Expected initialized extension UI context");
+		const abortController = new AbortController();
+		const confirmation = uiContext.confirm("Review", "Push candidate?", {
+			signal: abortController.signal,
+		});
+		await selectorEntered.promise;
+
+		abortController.abort(new DOMException("Review invalidated", "AbortError"));
+		const selectorSignalBeforeRelease = selectorSignal;
+		const selectorAbortedBeforeRelease = selectorSignal?.aborted;
+		releaseSelector.resolve();
+		const confirmed = await confirmation;
+
+		expect(selectorSignalBeforeRelease).toBe(abortController.signal);
+		expect(selectorAbortedBeforeRelease).toBe(true);
+		expect(confirmed).toBe(false);
+	});
+});
 
 describe("process-local contribution lifecycle", () => {
 	let cwd: TempDir;
