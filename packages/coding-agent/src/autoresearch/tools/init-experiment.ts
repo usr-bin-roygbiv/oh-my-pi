@@ -98,6 +98,7 @@ export function createInitExperimentTool(
 						: null;
 				const branch =
 					(await awaitAbortable(operationSignal, () => git.branch.current(ctx.cwd, operationSignal))) ?? null;
+				await authorizeMutation();
 				const onAutoresearchBranch = branch?.startsWith("autoresearch/") ?? false;
 
 				const existing = storage?.getActiveSessionForBranch(branch) ?? null;

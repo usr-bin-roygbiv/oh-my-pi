@@ -156,6 +156,11 @@ export interface ContributionReviewState {
 
 export type ContributionState = { status: "off" } | ContributionRunningState | ContributionReviewState;
 
+export interface AutoresearchSessionOwner {
+	readonly sessionId: number;
+	readonly branch: string | null;
+}
+
 export interface AutoresearchRuntime {
 	autoresearchMode: boolean;
 	autoResumeArmed: boolean;
@@ -169,6 +174,7 @@ export interface AutoresearchRuntime {
 	runningExperiment: RunningExperiment | null;
 	state: ExperimentState;
 	goal: string | null;
+	ordinarySessionOwner: AutoresearchSessionOwner | null;
 	contribution: ContributionState;
 }
 

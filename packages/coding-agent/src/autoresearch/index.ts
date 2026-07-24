@@ -60,6 +60,7 @@ import { createUpdateNotesTool } from "./tools/update-notes";
 import type {
 	AutoresearchMutationAuthorization,
 	AutoresearchRuntime,
+	AutoresearchSessionOwner,
 	ContributionRunningState,
 	ExperimentResult,
 	PendingRunSummary,
@@ -101,6 +102,7 @@ interface AsyncLifecycleIdentity {
 	readonly contribution: AutoresearchRuntime["contribution"];
 	readonly state: AutoresearchRuntime["state"];
 	readonly autoresearchMode: boolean;
+	readonly ordinarySessionOwner: AutoresearchRuntime["ordinarySessionOwner"];
 }
 
 interface TransitionAdmissionHold {
@@ -458,6 +460,7 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 			contribution: runtime.contribution,
 			state: runtime.state,
 			autoresearchMode: runtime.autoresearchMode,
+			ordinarySessionOwner: runtime.ordinarySessionOwner,
 		};
 	};
 	const lifecycleIdentityIsCurrent = (ctx: ExtensionContext, identity: AsyncLifecycleIdentity): boolean =>
@@ -466,6 +469,7 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 		(lifecycleEpochs.get(identity.sessionKey) ?? 0) === identity.epoch &&
 		identity.runtime.contribution === identity.contribution &&
 		identity.runtime.state === identity.state &&
+		identity.runtime.ordinarySessionOwner === identity.ordinarySessionOwner &&
 		identity.runtime.autoresearchMode === identity.autoresearchMode &&
 		!mutationAdmissionClosed(identity.sessionKey);
 	const showPersistedPublicationStatus = async (ctx: ExtensionContext): Promise<boolean> => {
@@ -553,14 +557,37 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 		}
 	};
 
+	const sessionOwnerForRuntime = (runtime: AutoresearchRuntime): AutoresearchSessionOwner | null => {
+		if (runtime.contribution.status === "running" && runtime.contribution.sessionId !== null) {
+			return { sessionId: runtime.contribution.sessionId, branch: runtime.contribution.branch };
+		}
+		return runtime.contribution.status === "off" ? runtime.ordinarySessionOwner : null;
+	};
+
 	const loadActiveSession = async (
 		ctx: ExtensionContext,
-	): Promise<{ session: SessionRow | null; currentBranch: string | null }> => {
+		owner: AutoresearchSessionOwner | null,
+	): Promise<{ session: SessionRow | null; currentBranch: string | null; onActiveBranch: boolean }> => {
 		const currentBranch = await tryReadBranch(ctx.cwd);
 		const storage = await openAutoresearchStorageIfExists(ctx.cwd);
-		if (!storage) return { session: null, currentBranch };
+		if (!storage) return { session: null, currentBranch, onActiveBranch: owner === null };
+		if (owner) {
+			const ownedSession = storage.getSessionById(owner.sessionId);
+			const activeOwnedSession =
+				ownedSession?.closedAt === null && ownedSession.branch === owner.branch ? ownedSession : null;
+			const onActiveBranch = activeOwnedSession !== null && activeOwnedSession.branch === currentBranch;
+			return {
+				session: onActiveBranch ? activeOwnedSession : null,
+				currentBranch,
+				onActiveBranch,
+			};
+		}
 		const session = storage.getActiveSessionForBranch(currentBranch);
-		return { session, currentBranch };
+		return {
+			session,
+			currentBranch,
+			onActiveBranch: session !== null || storage.getActiveSession() === null,
+		};
 	};
 
 	const rehydrate = (ctx: ExtensionContext): Promise<void> => {
@@ -585,15 +612,14 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 			// This is the common case: every project gets a session_start event but most
 			// never touch autoresearch, so we must not create a SQLite file just to look.
 			const everActivated = control.lastMode !== null || contributionRunning;
-			const { session, currentBranch } = everActivated
-				? await loadActiveSession(ctx)
-				: { session: null, currentBranch: null };
+			const expectedOwner = sessionOwnerForRuntime(runtime);
+			const { session, currentBranch, onActiveBranch } = everActivated
+				? await loadActiveSession(ctx, expectedOwner)
+				: { session: null, currentBranch: null, onActiveBranch: true };
 
-			// Mode is effective only when the recorded session matches the current git
-			// branch. When the user switches off the autoresearch branch the widget hides
-			// and the experiment tools detach, but the session entries are preserved so
-			// switching back resumes seamlessly.
-			const onActiveBranch = session === null || session.branch === null || session.branch === currentBranch;
+			// Mode is effective only when the exact retained session owner matches the
+			// current branch. Legacy runtimes without an owner fall back to a session on
+			// the current branch, never to the globally newest active session.
 			const onContributionBranch =
 				!contributionRunning ||
 				runtime.contribution.status !== "running" ||
@@ -603,6 +629,9 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 				: control.autoresearchMode && onActiveBranch;
 
 			if (session && onActiveBranch) {
+				if (!contributionRunning) {
+					runtime.ordinarySessionOwner = { sessionId: session.id, branch: session.branch };
+				}
 				const storage = await openAutoresearchStorageIfExists(ctx.cwd);
 				if (storage) {
 					const loggedRuns = storage.listLoggedRuns(session.id);
@@ -787,8 +816,13 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 		}
 		const capturedRuntime = getRuntime(ctx);
 		const captured = capturedRuntime.contribution;
+		const capturedOrdinarySessionOwner = capturedRuntime.ordinarySessionOwner;
+		const capturedSessionOwner = sessionOwnerForRuntime(capturedRuntime);
 		if (captured.status === "review") {
 			throw new Error("Contribution review state does not authorize autoresearch mutation.");
+		}
+		if (captured.status === "off" && !capturedRuntime.autoresearchMode) {
+			throw new ToolAbortError("Autoresearch mode is not active on the current branch.");
 		}
 		const operation: AutoresearchMutationOperation = {
 			controller: new AbortController(),
@@ -811,6 +845,9 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 				if (current.status !== "off") {
 					throw new Error("Contribution startup overtook autoresearch mutation before mutation.");
 				}
+				if (currentRuntime.ordinarySessionOwner !== capturedOrdinarySessionOwner) {
+					throw new Error("Autoresearch session ownership changed before mutation.");
+				}
 				return;
 			}
 			if (
@@ -827,14 +864,21 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 			async authorizeMutation(currentCtx, signal): Promise<void> {
 				throwIfAborted(signal);
 				assertProcessIdentity(currentCtx);
-				if (captured.status === "running") {
+				if (capturedSessionOwner) {
+					const storage = await openAutoresearchStorageIfExists(currentCtx.cwd);
+					const currentBranch = await git.branch.current(currentCtx.cwd, signal);
+					const session = storage?.getActiveSessionForBranch(capturedSessionOwner.branch) ?? null;
+					if (currentBranch !== capturedSessionOwner.branch || session?.id !== capturedSessionOwner.sessionId) {
+						if (captured.status === "running") {
+							throw new Error("Contribution branch or experiment session changed before mutation.");
+						}
+						throw new ToolAbortError("Autoresearch session branch or ownership changed before mutation.");
+					}
+				} else if (captured.status === "running") {
 					const storage = await openAutoresearchStorageIfExists(currentCtx.cwd);
 					const currentBranch = await git.branch.current(currentCtx.cwd, signal);
 					const session = storage?.getActiveSessionForBranch(captured.branch) ?? null;
-					if (
-						currentBranch !== captured.branch ||
-						(captured.sessionId === null ? session !== null : session?.id !== captured.sessionId)
-					) {
+					if (currentBranch !== captured.branch || session !== null) {
 						throw new Error("Contribution branch or experiment session changed before mutation.");
 					}
 				}
@@ -865,12 +909,18 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 			forceUncapped: ctx => getRuntime(ctx).contribution.status === "running",
 			onSessionUpdated(ctx, state): void {
 				const runtime = getRuntime(ctx);
-				if (runtime.contribution.status !== "running" || state.branch !== runtime.contribution.branch) return;
-				runtime.contribution = {
-					...runtime.contribution,
-					sessionId: state.sessionId,
-					currentSegment: state.currentSegment,
-				};
+				if (runtime.contribution.status === "running") {
+					if (state.branch !== runtime.contribution.branch) return;
+					runtime.contribution = {
+						...runtime.contribution,
+						sessionId: state.sessionId,
+						currentSegment: state.currentSegment,
+					};
+					return;
+				}
+				if (state.sessionId !== null) {
+					runtime.ordinarySessionOwner = { sessionId: state.sessionId, branch: state.branch };
+				}
 			},
 			async prepareNewSegment(ctx, signal) {
 				const runtime = getRuntime(ctx);
@@ -975,6 +1025,8 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 				autoresearchCommandOperations.get(sessionKey) === operationToken;
 			try {
 				if (trimmed === "" && runtime.autoresearchMode) {
+					await drainAutoresearchMutationOperations(sessionKey);
+					if (!operationIsCurrent()) return;
 					setMode(ctx, false, runtime.goal, "off");
 					dashboard.updateWidget(ctx, runtime);
 					const experimentTools = new Set(EXPERIMENT_TOOL_NAMES);
@@ -986,6 +1038,8 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 				}
 
 				if (trimmed === "off") {
+					await drainAutoresearchMutationOperations(sessionKey);
+					if (!operationIsCurrent()) return;
 					setMode(ctx, false, runtime.goal, "off");
 					dashboard.updateWidget(ctx, runtime);
 					const experimentTools = new Set(EXPERIMENT_TOOL_NAMES);
@@ -997,6 +1051,8 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 				}
 
 				if (trimmed === "clear" || trimmed.startsWith("clear ")) {
+					await drainAutoresearchMutationOperations(sessionKey);
+					if (!operationIsCurrent()) return;
 					const flagPart = trimmed === "clear" ? "" : trimmed.slice("clear ".length).trim();
 					const keepTree = flagPart.includes("--keep-tree");
 					const resetTreeForce = flagPart.includes("--reset-tree");
@@ -1037,6 +1093,7 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 					}
 					const refreshed = existingStorage.getSessionById(existingSession.id) ?? existingSession;
 					runtime.state = buildExperimentState(refreshed, existingStorage.listLoggedRuns(refreshed.id));
+					runtime.ordinarySessionOwner = { sessionId: refreshed.id, branch: refreshed.branch };
 					runtime.goal = refreshed.goal ?? goalArg;
 					setMode(ctx, true, runtime.goal, "on");
 					dashboard.updateWidget(ctx, runtime);
@@ -1054,6 +1111,7 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 				}
 
 				if (!operationIsCurrent()) return;
+				runtime.ordinarySessionOwner = null;
 				setMode(ctx, true, goalArg, "on");
 				dashboard.updateWidget(ctx, runtime);
 				if (!operationIsCurrent()) return;
@@ -1869,8 +1927,12 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 			return;
 		}
 
-		const { session } = await loadActiveSession(ctx);
+		const { session, onActiveBranch } = await loadActiveSession(ctx, sessionOwnerForRuntime(runtime));
 		if (!lifecycleIdentityIsCurrent(ctx, identity)) return;
+		if (!contributionRunning && !onActiveBranch) {
+			runtime.autoResumeArmed = false;
+			return;
+		}
 		const storage = session ? await openAutoresearchStorageIfExists(ctx.cwd) : null;
 		if (!lifecycleIdentityIsCurrent(ctx, identity)) return;
 		const pendingRow = session && storage ? storage.getPendingRun(session.id) : null;
@@ -1950,9 +2012,16 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 		// off the autoresearch/* branch between turns, we silently drop autoresearch
 		// from this turn — the widget hides, the experiment tools detach, and we do
 		// not inject the autoresearch system prompt.
-		const { session, currentBranch } = await loadActiveSession(ctx);
+		const expectedOwner = sessionOwnerForRuntime(runtime);
+		const { session, currentBranch, onActiveBranch } = await loadActiveSession(ctx, expectedOwner);
 		if (!lifecycleIdentityIsCurrent(ctx, identity)) return;
-		const onActiveBranch = session === null || session.branch === null || session.branch === currentBranch;
+		if (session && runtime.contribution.status === "off") {
+			const owner = runtime.ordinarySessionOwner;
+			if (owner?.sessionId !== session.id || owner.branch !== session.branch) {
+				runtime.ordinarySessionOwner = { sessionId: session.id, branch: session.branch };
+				identity = captureLifecycleIdentity(ctx);
+			}
+		}
 		const onContributionBranch =
 			runtime.contribution.status !== "running" || runtime.contribution.branch === currentBranch;
 		if (!onActiveBranch || !onContributionBranch) {
@@ -2119,6 +2188,9 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 
 		if (session) {
 			storage.closeSession(session.id);
+			if (runtime.ordinarySessionOwner?.sessionId === session.id) {
+				runtime.ordinarySessionOwner = null;
+			}
 		}
 		runtime.state = createExperimentState();
 		runtime.goal = null;

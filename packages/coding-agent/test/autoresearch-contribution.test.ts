@@ -3952,10 +3952,22 @@ describe("process-local contribution lifecycle", () => {
 				activationEntered.resolve();
 			},
 		});
+		harness.setCurrentBranch("autoresearch/ordinary");
+		harness.setSessionBranch([
+			{
+				type: "custom",
+				customType: "autoresearch-control",
+				id: "ordinary-init-race-control",
+				parentId: null,
+				timestamp: new Date(0).toISOString(),
+				data: { mode: "on", goal: "ordinary init activation race" },
+			},
+		]);
+		const sessionStart = handlerRequired<SessionStartEvent>(harness, "session_start");
+		await sessionStart({ type: "session_start" } as SessionStartEvent, harness.ctx as ExtensionContext);
 		await Bun.write(`${cwd.path()}/autoresearch.sh`, "#!/usr/bin/env bash\necho METRIC runtime_ms=1\n");
 		const init = harness.tools.get("init_experiment");
 		if (!init) throw new Error("Expected init_experiment tool");
-		harness.setCurrentBranch("autoresearch/ordinary");
 		harness.setStatusText(" M autoresearch.sh\0");
 		const statusEntered = Promise.withResolvers<AbortSignal | undefined>();
 		const statusAbortObserved = Promise.withResolvers<void>();
