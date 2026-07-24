@@ -659,8 +659,8 @@ export interface AnthropicFallbackContent {
 }
 
 /**
- * Verbatim Anthropic server-tool block retained for same-provider history
- * replay. Other providers discard it in `transformMessages`.
+ * Verbatim Anthropic web-search call/result retained for same-provider
+ * history replay. Other providers discard it in `transformMessages`.
  */
 export interface AnthropicServerToolContent {
 	type: "anthropicServerTool";
@@ -668,7 +668,7 @@ export interface AnthropicServerToolContent {
 		| {
 				type: "server_tool_use";
 				id: string;
-				name: string;
+				name: "web_search";
 				input?: Record<string, unknown> | null;
 				[key: string]: unknown;
 		  }

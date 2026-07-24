@@ -74,6 +74,9 @@ export type ServerToolUseBlockParam = {
 	[key: string]: unknown;
 };
 
+/** Web-search server-tool call whose matching result is replayable by omp. */
+export type WebSearchServerToolUseBlockParam = ServerToolUseBlockParam & { name: "web_search" };
+
 /** Native web-search result replayed inside an assistant turn. */
 export type WebSearchToolResultBlockParam = {
 	type: "web_search_tool_result";
@@ -81,6 +84,14 @@ export type WebSearchToolResultBlockParam = {
 	content: unknown;
 	[key: string]: unknown;
 };
+
+/** True for the complete native web-search history variants omp can replay. */
+export function isAnthropicWebSearchHistoryBlock(block: {
+	type: string;
+	name?: unknown;
+}): block is WebSearchServerToolUseBlockParam | WebSearchToolResultBlockParam {
+	return block.type === "web_search_tool_result" || (block.type === "server_tool_use" && block.name === "web_search");
+}
 
 export type ThinkingBlockParam = {
 	type: "thinking";

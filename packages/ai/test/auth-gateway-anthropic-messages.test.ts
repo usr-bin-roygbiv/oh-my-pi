@@ -1,6 +1,9 @@
 import { describe, expect, it } from "bun:test";
 import { encodeResponse, encodeStream, parseRequest } from "@oh-my-pi/pi-ai/providers/anthropic-messages-server";
-import type { ServerToolUseBlockParam, WebSearchToolResultBlockParam } from "@oh-my-pi/pi-ai/providers/anthropic-wire";
+import type {
+	WebSearchServerToolUseBlockParam,
+	WebSearchToolResultBlockParam,
+} from "@oh-my-pi/pi-ai/providers/anthropic-wire";
 import type { AssistantMessage, AssistantMessageEvent, ToolResultMessage } from "@oh-my-pi/pi-ai/types";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
@@ -297,8 +300,8 @@ describe("anthropic-messages parseRequest", () => {
 		expect(unknown.context.messages).toHaveLength(1);
 	});
 
-	it("preserves inbound assistant server_tool_use/web_search_tool_result blocks verbatim", () => {
-		const serverToolUse: ServerToolUseBlockParam = {
+	it("preserves inbound assistant web-search call/result blocks verbatim", () => {
+		const serverToolUse: WebSearchServerToolUseBlockParam = {
 			type: "server_tool_use",
 			id: "srvtoolu_1",
 			name: "web_search",
@@ -339,6 +342,42 @@ describe("anthropic-messages parseRequest", () => {
 			{ type: "anthropicServerTool", block: searchResult },
 			{ type: "text", text: "forecast ready" },
 		]);
+	});
+
+	it("does not retain a partial code-execution server-tool history", () => {
+		const parsed = parseRequest({
+			model: "claude-opus-4-7",
+			max_tokens: 8,
+			messages: [
+				{ role: "user", content: "run code" },
+				{
+					role: "assistant",
+					content: [
+						{
+							type: "server_tool_use",
+							id: "srvtoolu_code",
+							name: "bash_code_execution",
+							input: { command: "printf ok" },
+						},
+						{
+							type: "bash_code_execution_tool_result",
+							tool_use_id: "srvtoolu_code",
+							content: {
+								type: "bash_code_execution_result",
+								stdout: "ok",
+								stderr: "",
+								return_code: 0,
+								content: [],
+							},
+						},
+					],
+				},
+			],
+		});
+		const assistant = parsed.context.messages.find(message => message.role === "assistant");
+		expect(assistant?.content).toHaveLength(2);
+		expect(assistant?.content.every(block => block.type === "text")).toBe(true);
+		expect(assistant?.content.some(block => block.type === "anthropicServerTool")).toBe(false);
 	});
 });
 

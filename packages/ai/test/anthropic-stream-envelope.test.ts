@@ -672,6 +672,79 @@ describe("anthropic stream envelope handling", () => {
 		]);
 	});
 
+	it("does not persist a code-execution call without its unsupported result block", async () => {
+		vi.spyOn(AnthropicMessages.prototype, "create").mockImplementation(
+			() =>
+				createMockRequest([
+					{
+						type: "message_start",
+						message: {
+							id: "msg_code_execution",
+							usage: {
+								input_tokens: 12,
+								output_tokens: 0,
+								cache_read_input_tokens: 0,
+								cache_creation_input_tokens: 0,
+							},
+						},
+					},
+					{
+						type: "content_block_start",
+						index: 0,
+						content_block: {
+							type: "server_tool_use",
+							id: "srvtoolu_code",
+							name: "bash_code_execution",
+						},
+					},
+					{
+						type: "content_block_delta",
+						index: 0,
+						delta: { type: "input_json_delta", partial_json: '{"command":"printf ok"}' },
+					},
+					{ type: "content_block_stop", index: 0 },
+					{
+						type: "content_block_start",
+						index: 1,
+						content_block: {
+							type: "bash_code_execution_tool_result",
+							tool_use_id: "srvtoolu_code",
+							content: {
+								type: "bash_code_execution_result",
+								stdout: "ok",
+								stderr: "",
+								return_code: 0,
+								content: [],
+							},
+						},
+					},
+					{ type: "content_block_stop", index: 1 },
+					{ type: "content_block_start", index: 2, content_block: { type: "text", text: "" } },
+					{ type: "content_block_delta", index: 2, delta: { type: "text_delta", text: "done" } },
+					{ type: "content_block_stop", index: 2 },
+					{
+						type: "message_delta",
+						delta: { stop_reason: "end_turn" },
+						usage: {
+							input_tokens: 12,
+							output_tokens: 8,
+							cache_read_input_tokens: 0,
+							cache_creation_input_tokens: 0,
+						},
+					},
+					{ type: "message_stop" },
+				]) as never,
+		);
+
+		const stream = streamAnthropic(model, context, { apiKey: "sk-ant-test" });
+		for await (const _ of stream) {
+			// drain stream
+		}
+		const result = await stream.result();
+
+		expect(JSON.parse(JSON.stringify(result.content))).toEqual([{ type: "text", text: "done" }]);
+	});
+
 	it("passes Umans gateway web search headers to custom clients", async () => {
 		type CapturedPayload = { tools?: Array<{ name?: string }> };
 		let capturedParams: CapturedPayload | undefined;

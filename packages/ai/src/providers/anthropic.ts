@@ -72,16 +72,17 @@ import {
 	calculateAnthropicRetryDelayMs,
 	retryDelayFromHeaders,
 } from "./anthropic-client";
-import type {
-	ToolInputSchema as AnthropicToolInputSchema,
-	Tool as AnthropicWireTool,
-	Usage as AnthropicWireUsage,
-	ContentBlockParam,
-	FallbackParam,
-	MessageCreateParamsStreaming,
-	MessageParam,
-	RawMessageStreamEvent,
-	TextBlockParam,
+import {
+	type ToolInputSchema as AnthropicToolInputSchema,
+	type Tool as AnthropicWireTool,
+	type Usage as AnthropicWireUsage,
+	type ContentBlockParam,
+	type FallbackParam,
+	isAnthropicWebSearchHistoryBlock,
+	type MessageCreateParamsStreaming,
+	type MessageParam,
+	type RawMessageStreamEvent,
+	type TextBlockParam,
 } from "./anthropic-wire";
 import {
 	buildCopilotDynamicHeaders,
@@ -2303,8 +2304,7 @@ const streamAnthropicOnce = (
 									kind: "redactedThinking",
 								});
 							} else if (
-								(event.content_block.type === "server_tool_use" ||
-									event.content_block.type === "web_search_tool_result") &&
+								isAnthropicWebSearchHistoryBlock(event.content_block) &&
 								umansGatewayWebSearchHeader === undefined
 							) {
 								streamedReplayUnsafeContent = true;

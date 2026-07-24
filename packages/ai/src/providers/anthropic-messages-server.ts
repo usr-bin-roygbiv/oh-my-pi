@@ -27,6 +27,7 @@ import {
 	type AnthropicUserContentBlock,
 	anthropicMessagesRequestSchema,
 } from "./anthropic-messages-server-schema";
+import { isAnthropicWebSearchHistoryBlock } from "./anthropic-wire";
 
 /**
  * Anthropic Messages API (https://docs.anthropic.com/en/api/messages) ↔ pi-ai
@@ -215,12 +216,19 @@ function walkAssistantContent(
 				break;
 			case "server_tool_use":
 			case "web_search_tool_result":
-				// Native Anthropic server-tool call/result. Anthropic requires
-				// these replayed verbatim (encrypted_content/signatures included),
-				// so retain the block as-is instead of flattening to text — a
-				// gateway client sending the response back as history must be able
-				// to reconstruct the exact assistant turn.
-				out.push({ type: "anthropicServerTool", block: { ...block } });
+				if (isAnthropicWebSearchHistoryBlock(block)) {
+					// Native web-search call/result. Anthropic requires these
+					// replayed verbatim (encrypted_content included), so retain
+					// the block instead of flattening it to text.
+					out.push({ type: "anthropicServerTool", block: { ...block } });
+				} else {
+					// Other server tools use distinct result block types that omp
+					// cannot yet replay atomically. Flatten both sides rather than
+					// persisting a lone server_tool_use without its matching result.
+					const unknown = block as { type: string };
+					warnUnknownBlockType("assistant", unknown.type);
+					out.push({ type: "text", text: describeUnknownBlock(unknown) });
+				}
 				break;
 			default: {
 				// Unknown assistant variant (mcp_tool_use, code_execution_*, …).
