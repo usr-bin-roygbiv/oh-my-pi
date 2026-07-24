@@ -82,7 +82,8 @@ interface ContributionRemoteChoice {
 
 interface ContributionStartTransaction {
 	token: symbol | null;
-	phase: "confirming" | "activating";
+	phase: "waiting-rehydrate" | "confirming" | "activating";
+	rehydrateGeneration: number | null;
 	readonly settlement: PromiseWithResolvers<void>;
 }
 
@@ -418,6 +419,7 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 	const mutationAdmissionHolds = new Map<string, number>();
 	const transitionAdmissionHolds = new Map<string, TransitionAdmissionHold>();
 	const rehydrateOperations = new Map<string, Promise<void>>();
+	const rehydrateGenerations = new Map<string, number>();
 	const lifecycleEpochs = new Map<string, number>();
 
 	const acquireMutationAdmissionHold = (sessionKey: string): (() => void) => {
@@ -434,10 +436,19 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 
 	const mutationAdmissionClosed = (sessionKey: string): boolean => (mutationAdmissionHolds.get(sessionKey) ?? 0) > 0;
 
-	const invalidateContributionOperations = (sessionKey: string): Promise<void> | undefined => {
+	const invalidateContributionOperations = (
+		sessionKey: string,
+		rehydrateGeneration?: number,
+	): Promise<void> | undefined => {
 		const settlements: Promise<void>[] = [];
 		const startTransaction = contributionStartTransactions.get(sessionKey);
-		if (startTransaction) {
+		const preserveWaitingStart =
+			startTransaction !== undefined &&
+			startTransaction.phase === "waiting-rehydrate" &&
+			startTransaction.rehydrateGeneration !== null &&
+			rehydrateGeneration !== undefined &&
+			rehydrateGeneration <= startTransaction.rehydrateGeneration;
+		if (startTransaction && !preserveWaitingStart) {
 			startTransaction.token = null;
 			if (startTransaction.phase === "activating") settlements.push(startTransaction.settlement.promise);
 		}
@@ -627,13 +638,15 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 
 	const rehydrate = (ctx: ExtensionContext): Promise<void> => {
 		const sessionKey = getSessionKey(ctx);
+		const rehydrateGeneration = (rehydrateGenerations.get(sessionKey) ?? 0) + 1;
+		rehydrateGenerations.set(sessionKey, rehydrateGeneration);
 		const previous = rehydrateOperations.get(sessionKey) ?? Promise.resolve();
 		const releaseAdmission = acquireMutationAdmissionHold(sessionKey);
 		let operation: Promise<void>;
 		operation = (async (): Promise<void> => {
 			await previous.catch(() => undefined);
 			await drainAutoresearchMutationOperations(sessionKey);
-			const activationSettlement = invalidateContributionOperations(sessionKey);
+			const activationSettlement = invalidateContributionOperations(sessionKey, rehydrateGeneration);
 			if (activationSettlement) await activationSettlement;
 
 			const runtime = getRuntime(ctx);
@@ -1631,7 +1644,17 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 				return;
 			}
 			const contributionStartSession = getSessionKey(ctx);
-			if (autoresearchCommandOperations.has(contributionStartSession)) {
+			let contributionTransitionActive = false;
+			for (const hold of transitionAdmissionHolds.values()) {
+				if (hold.sessionKey !== contributionStartSession) continue;
+				contributionTransitionActive = true;
+				break;
+			}
+			if (
+				autoresearchCommandOperations.has(contributionStartSession) ||
+				contributionStartTransactions.has(contributionStartSession) ||
+				contributionTransitionActive
+			) {
 				ctx.ui.notify(
 					"Wait for the active autoresearch lifecycle operation before starting contribution mode.",
 					"error",
@@ -1649,29 +1672,17 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 				);
 				return;
 			}
-			const initialStartSessionKey = getSessionKey(ctx);
-			const initialRehydrate = rehydrateOperations.get(initialStartSessionKey);
-			if (initialRehydrate) await initialRehydrate;
-			if (getSessionKey(ctx) !== initialStartSessionKey) {
-				ctx.ui.notify("Contribution mode session changed while startup state was loading.", "error");
-				return;
-			}
-			if (runtime.contribution.status === "running") {
-				ctx.ui.notify("Stop the running contribution flow before starting another.", "error");
-				return;
-			}
-			const preflightConfirmed = await ctx.ui.confirm(
-				"Inspect official contribution prerequisites?",
-				"Run bounded read-only discovery of official goal provenance, authenticated models, the clean base, active autoresearch state, and GitHub fork remotes? No model, branch, tools, or durable contribution state will change.",
-			);
-			if (!preflightConfirmed) return;
 			let contributionStartSessionKey: string | null = null;
 			let contributionStartTransaction: ContributionStartTransaction | null = null;
 			let releaseStartAdmission: (() => void) | null = null;
 			const startSessionKey = getSessionKey(ctx);
+			const initialRehydrate = rehydrateOperations.get(startSessionKey) ?? null;
+			const initialRehydrateGeneration =
+				initialRehydrate === null ? null : (rehydrateGenerations.get(startSessionKey) ?? null);
 			const startTransaction: ContributionStartTransaction = {
 				token: Symbol("contribution-start-authorization"),
-				phase: "confirming",
+				phase: initialRehydrate === null ? "confirming" : "waiting-rehydrate",
+				rehydrateGeneration: initialRehydrateGeneration,
 				settlement: Promise.withResolvers<void>(),
 			};
 			contributionStartSessionKey = startSessionKey;
@@ -1680,6 +1691,24 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 			contributionStartTransactions.set(startSessionKey, startTransaction);
 			advanceLifecycleEpoch(startSessionKey);
 			try {
+				if (initialRehydrate) await initialRehydrate;
+				if (getSessionKey(ctx) !== startSessionKey) {
+					ctx.ui.notify("Contribution mode session changed while startup state was loading.", "error");
+					return;
+				}
+				assertContributionStartIdentity(ctx, runtime, startSessionKey, startTransaction);
+				startTransaction.rehydrateGeneration = null;
+				startTransaction.phase = "confirming";
+				if (runtime.contribution.status === "running") {
+					ctx.ui.notify("Stop the running contribution flow before starting another.", "error");
+					return;
+				}
+				const preflightConfirmed = await ctx.ui.confirm(
+					"Inspect official contribution prerequisites?",
+					"Run bounded read-only discovery of official goal provenance, authenticated models, the clean base, active autoresearch state, and GitHub fork remotes? No model, branch, tools, or durable contribution state will change.",
+				);
+				if (!preflightConfirmed) return;
+				assertContributionStartIdentity(ctx, runtime, startSessionKey, startTransaction);
 				const currentRehydrate = rehydrateOperations.get(startSessionKey);
 				if (currentRehydrate) await currentRehydrate;
 				assertContributionStartIdentity(ctx, runtime, startSessionKey, startTransaction);

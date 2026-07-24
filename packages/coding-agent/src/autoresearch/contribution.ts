@@ -1099,7 +1099,12 @@ function validateRemoteObject(remote: GitHubRemote): void {
 }
 
 function validateRemoteName(remoteName: string): void {
-	if (remoteName.length === 0 || /[\x00-\x20\x7f]/.test(remoteName) || remoteName.startsWith("-")) {
+	if (
+		remoteName.length === 0 ||
+		remoteName.length > 100 ||
+		/[\x00-\x20\x7f]/.test(remoteName) ||
+		remoteName.startsWith("-")
+	) {
 		throw new ContributionError("remote_invalid", "The contribution remote name is invalid.");
 	}
 }

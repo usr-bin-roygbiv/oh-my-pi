@@ -3326,6 +3326,71 @@ describe("process-local contribution lifecycle", () => {
 		]);
 	});
 
+	it("waits behind every admitted rehydrate without losing startup authorization", async () => {
+		const harness = createIntegrationHarness(cwd.path(), { confirmAnswers: [true, true] });
+		harness.setSessionBranch([
+			{
+				type: "custom",
+				customType: "autoresearch-control",
+				id: "queued-startup-rehydrate",
+				parentId: null,
+				timestamp: new Date(0).toISOString(),
+				data: { mode: "off" },
+			},
+		]);
+		const firstBranchEntered = Promise.withResolvers<void>();
+		const secondBranchEntered = Promise.withResolvers<void>();
+		const releaseFirstBranch = Promise.withResolvers<void>();
+		const releaseSecondBranch = Promise.withResolvers<void>();
+		let branchReadCount = 0;
+		vi.spyOn(git.branch, "current").mockImplementation(async () => {
+			branchReadCount++;
+			if (branchReadCount === 2) {
+				firstBranchEntered.resolve();
+				await releaseFirstBranch.promise;
+			} else if (branchReadCount === 3) {
+				secondBranchEntered.resolve();
+				await releaseSecondBranch.promise;
+			}
+			return harness.currentBranch();
+		});
+		const sessionStart = handlerRequired<SessionStartEvent>(harness, "session_start");
+		const firstRehydrate = Promise.resolve(
+			sessionStart({ type: "session_start" } as SessionStartEvent, harness.ctx as ExtensionContext),
+		);
+		await firstBranchEntered.promise;
+		const secondRehydrate = Promise.resolve(
+			sessionStart({ type: "session_start" } as SessionStartEvent, harness.ctx as ExtensionContext),
+		);
+		const startPromise = startContribution(harness);
+		for (let turn = 0; turn < 4; turn++) await Promise.resolve();
+		const confirmationsWhileFirstBlocked = harness.confirmCalls.length;
+
+		releaseFirstBranch.resolve();
+		const [firstResult] = await Promise.allSettled([firstRehydrate]);
+		await secondBranchEntered.promise;
+		const confirmationsWhileSecondBlocked = harness.confirmCalls.length;
+		releaseSecondBranch.resolve();
+		const [secondResult, startResult] = await Promise.allSettled([secondRehydrate, startPromise]);
+		await commandRequired(harness, "contribute").handler("status", harness.ctx);
+
+		expect(confirmationsWhileFirstBlocked).toBe(0);
+		expect(confirmationsWhileSecondBlocked).toBe(0);
+		expect(firstResult.status).toBe("fulfilled");
+		expect(secondResult.status).toBe("fulfilled");
+		expect(startResult.status).toBe("fulfilled");
+		expect(harness.confirmCalls).toHaveLength(2);
+		expect(harness.notifications.at(-1)?.message).toStartWith("Contribution running on ");
+		expect(harness.activeTools).toEqual([
+			"read",
+			"bash",
+			"init_experiment",
+			"run_experiment",
+			"log_experiment",
+			"update_notes",
+		]);
+	});
+
 	it("does not wedge ordinary autoresearch when a tree transition never commits", async () => {
 		const harness = createIntegrationHarness(cwd.path());
 		await commandRequired(harness, "autoresearch").handler("ordinary goal", harness.ctx);
