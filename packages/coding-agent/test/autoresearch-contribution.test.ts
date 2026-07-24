@@ -449,6 +449,9 @@ async function openUncachedActiveSession(cwd: string): Promise<autoresearchStora
 	const dbPath = storage.dbPath;
 	const projectDir = storage.projectDir;
 	closeAllAutoresearchStorages();
+	const baselineCheckpointer = new Database(dbPath);
+	baselineCheckpointer.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+	baselineCheckpointer.close();
 	const uncached = new autoresearchStorage.AutoresearchStorage(dbPath, projectDir);
 	uncached.openSession({
 		name: "concurrent active session",
