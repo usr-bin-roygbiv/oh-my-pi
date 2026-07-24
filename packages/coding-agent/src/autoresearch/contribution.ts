@@ -587,7 +587,7 @@ export async function publishContributionCandidate(
 	if (!options.worktreeClean) {
 		throw new ContributionError("worktree_dirty", "Contribution review requires a clean worktree.");
 	}
-	validateRemoteName(options.remoteName);
+	validateContributionRemoteName(options.remoteName);
 	const approvedRemote = validateContributionForkRemote(options.confirmedRemoteUrl);
 	const approvedPushRemote = validateContributionForkRemote(options.confirmedPushRemoteUrl);
 	if (approvedPushRemote.slug !== approvedRemote.slug) {
@@ -1098,7 +1098,7 @@ function validateRemoteObject(remote: GitHubRemote): void {
 	validateContributionForkRemote(remote.canonicalUrl);
 }
 
-function validateRemoteName(remoteName: string): void {
+export function validateContributionRemoteName(remoteName: string): void {
 	if (
 		remoteName.length === 0 ||
 		remoteName.length > 100 ||

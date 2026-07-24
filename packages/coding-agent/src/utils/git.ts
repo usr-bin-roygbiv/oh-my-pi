@@ -91,6 +91,24 @@ export interface RawCommit {
 	readonly parentShas: readonly string[];
 }
 
+export interface WorktreeTreeAttestation {
+	readonly relativePath: string;
+	readonly blobSha: string;
+	readonly sha256: string;
+	readonly byteLength: number;
+	readonly mode: "100644" | "100755";
+}
+
+export interface AttestedWorktreeTree {
+	readonly treeSha: string;
+	readonly attestation: WorktreeTreeAttestation;
+}
+
+interface WorktreeTreeMaterialization {
+	readonly treeSha: string;
+	readonly attestation: WorktreeTreeAttestation | null;
+}
+
 export interface CommitOptions {
 	readonly allowEmpty?: boolean;
 	readonly author?: CommitAuthor;
@@ -1355,6 +1373,45 @@ export async function commit(cwd: string, message: string, options: CommitOption
 	return runChecked(cwd, args, { signal: options.signal, stdin: message });
 }
 
+async function findExecutablePrePushHook(cwd: string, signal?: AbortSignal): Promise<string | null> {
+	const repository = await resolveRepository(cwd);
+	if (!repository) return null;
+	const configuredHooksRecord = await tryText(
+		repository.repoRoot,
+		["config", "-z", "--path", "--get", "core.hooksPath"],
+		{
+			readOnly: true,
+			signal,
+		},
+	);
+	let configuredHooksDirectory: string | undefined;
+	if (configuredHooksRecord !== undefined) {
+		if (!configuredHooksRecord.endsWith("\0") || configuredHooksRecord.indexOf("\0") !== configuredHooksRecord.length - 1) {
+			throw new ToolError("Git returned an invalid hooks path configuration.");
+		}
+		configuredHooksDirectory = configuredHooksRecord.slice(0, -1);
+		if (configuredHooksDirectory.length === 0) return null;
+	}
+	const hooksDirectory = configuredHooksDirectory
+		? path.resolve(repository.repoRoot, configuredHooksDirectory)
+		: path.join(repository.commonDir, "hooks");
+	const hookPath = path.join(hooksDirectory, "pre-push");
+	try {
+		await fs.promises.access(hookPath, fs.constants.X_OK);
+		return hookPath;
+	} catch (error) {
+		if (
+			isEnoent(error) ||
+			isEnotdir(error) ||
+			hasFsCode(error, "EACCES") ||
+			hasFsCode(error, "EPERM")
+		) {
+			return null;
+		}
+		throw error;
+	}
+}
+
 /** Push the current branch (branch-scoped: never follows tags). */
 export async function push(cwd: string, options: PushOptions = {}): Promise<void> {
 	// `--no-follow-tags` overrides a user's `push.followTags = true`, which
@@ -1364,44 +1421,69 @@ export async function push(cwd: string, options: PushOptions = {}): Promise<void
 	// itself already updated. Tool pushes push exactly the named refspec.
 	const configArgs: string[] = [];
 	let remote = options.remote;
-	if (options.verifiedRemoteUrl !== undefined) {
-		// The explicit pushurl disables url.*.pushInsteadOf for this command.
-		// Route it through a random, exact-match alias: that match is longer
-		// than any configured ordinary insteadOf prefix, and its single
-		// expansion is the already-verified URL. A unique command-scoped
-		// remote prevents local config from adding another destination.
-		const verifiedRemote = `omp-verified-push-${crypto.randomUUID()}`;
-		const transportAlias = `omp-verified-push://${crypto.randomUUID()}`;
-		configArgs.push(
-			"-c",
-			`remote.${verifiedRemote}.url=${options.verifiedRemoteUrl}`,
-			"-c",
-			`remote.${verifiedRemote}.pushurl=${transportAlias}`,
-			"-c",
-			`url.${options.verifiedRemoteUrl}.insteadOf=${transportAlias}`,
-		);
-		const resolvedPushUrl = trimScalar(
-			await runText(cwd, [...configArgs, "ls-remote", "--get-url", transportAlias], {
-				readOnly: true,
-				signal: options.signal,
-			}),
-		);
-		if (resolvedPushUrl !== options.verifiedRemoteUrl) {
-			throw new ToolError("Git configuration rewrote the verified push destination.");
+	let hookDirectory: string | null = null;
+	let hookEnv: Record<string, string | undefined> | undefined;
+	try {
+		if (options.verifiedRemoteUrl !== undefined) {
+			// The explicit pushurl disables url.*.pushInsteadOf for this command.
+			// Route it through a random, exact-match alias: that match is longer
+			// than any configured ordinary insteadOf prefix, and its single
+			// expansion is the already-verified URL. A unique command-scoped
+			// remote prevents local config from adding another destination.
+			const verifiedRemote = `omp-verified-push-${crypto.randomUUID()}`;
+			const transportAlias = `omp-verified-push://${crypto.randomUUID()}`;
+			configArgs.push(
+				"-c",
+				`remote.${verifiedRemote}.url=${options.verifiedRemoteUrl}`,
+				"-c",
+				`remote.${verifiedRemote}.pushurl=${transportAlias}`,
+				"-c",
+				`url.${options.verifiedRemoteUrl}.insteadOf=${transportAlias}`,
+			);
+			const resolvedPushUrl = trimScalar(
+				await runText(cwd, [...configArgs, "ls-remote", "--get-url", transportAlias], {
+					readOnly: true,
+					signal: options.signal,
+				}),
+			);
+			if (resolvedPushUrl !== options.verifiedRemoteUrl) {
+				throw new ToolError("Git configuration rewrote the verified push destination.");
+			}
+			if (!options.noVerify && options.remote !== undefined) {
+				const originalHook = await findExecutablePrePushHook(cwd, options.signal);
+				hookDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), "omp-verified-push-hooks-"));
+				const hookPath = path.join(hookDirectory, "pre-push");
+				await Bun.write(
+					hookPath,
+					'#!/bin/sh\nhook="$OMP_ORIGINAL_PRE_PUSH_HOOK"\nremote="$OMP_ORIGINAL_REMOTE_NAME"\nurl="$OMP_VERIFIED_REMOTE_URL"\noriginal_git_config_parameters="$OMP_ORIGINAL_GIT_CONFIG_PARAMETERS"\noriginal_git_config_parameters_present="$OMP_ORIGINAL_GIT_CONFIG_PARAMETERS_PRESENT"\nunset OMP_ORIGINAL_PRE_PUSH_HOOK OMP_ORIGINAL_REMOTE_NAME OMP_VERIFIED_REMOTE_URL OMP_ORIGINAL_GIT_CONFIG_PARAMETERS OMP_ORIGINAL_GIT_CONFIG_PARAMETERS_PRESENT\nif [ "$original_git_config_parameters_present" = "1" ]; then\n\texport GIT_CONFIG_PARAMETERS="$original_git_config_parameters"\nelse\n\tunset GIT_CONFIG_PARAMETERS\nfi\nif [ -n "$hook" ]; then\n\texec "$hook" "$remote" "$url"\nfi\nexit 0\n',
+				);
+				await fs.promises.chmod(hookPath, 0o700);
+				configArgs.push("-c", `core.hooksPath=${hookDirectory}`);
+				hookEnv = {
+					OMP_ORIGINAL_PRE_PUSH_HOOK: originalHook ?? "",
+					OMP_ORIGINAL_REMOTE_NAME: options.remote,
+					OMP_VERIFIED_REMOTE_URL: options.verifiedRemoteUrl,
+					OMP_ORIGINAL_GIT_CONFIG_PARAMETERS: process.env.GIT_CONFIG_PARAMETERS ?? "",
+					OMP_ORIGINAL_GIT_CONFIG_PARAMETERS_PRESENT:
+						process.env.GIT_CONFIG_PARAMETERS === undefined ? "0" : "1",
+				};
+			}
+			remote = verifiedRemote;
 		}
-		remote = verifiedRemote;
+		const args = [...configArgs, "push", "--no-follow-tags"];
+		if (options.noVerify) args.push("--no-verify");
+		if (options.recurseSubmodules !== undefined) args.push(`--recurse-submodules=${options.recurseSubmodules}`);
+		if (typeof options.forceWithLease === "string") {
+			args.push(`--force-with-lease=${options.forceWithLease}`);
+		} else if (options.forceWithLease) {
+			args.push("--force-with-lease");
+		}
+		if (remote) args.push(remote);
+		if (options.refspec) args.push(options.refspec);
+		await runEffect(cwd, args, { env: hookEnv, signal: options.signal });
+	} finally {
+		if (hookDirectory) await fs.promises.rm(hookDirectory, { force: true, recursive: true });
 	}
-	const args = [...configArgs, "push", "--no-follow-tags"];
-	if (options.noVerify) args.push("--no-verify");
-	if (options.recurseSubmodules !== undefined) args.push(`--recurse-submodules=${options.recurseSubmodules}`);
-	if (typeof options.forceWithLease === "string") {
-		args.push(`--force-with-lease=${options.forceWithLease}`);
-	} else if (options.forceWithLease) {
-		args.push("--force-with-lease");
-	}
-	if (remote) args.push(remote);
-	if (options.refspec) args.push(options.refspec);
-	await runEffect(cwd, args, { signal: options.signal });
 }
 
 /** Checkout a ref. */
@@ -1644,16 +1726,27 @@ async function hashWorktreeFile(
 	env: Record<string, string>,
 	reserveMaterializedBytes: (bytes: number) => void,
 	availableMaterializedBytes: () => number,
+	attestationMaxBytes: number | null,
 	signal?: AbortSignal,
-): Promise<{ mode: "100644" | "100755"; objectId: string }> {
+): Promise<{
+	mode: "100644" | "100755";
+	objectId: string;
+	byteLength: number;
+	sha256: string | null;
+}> {
 	const noFollow = fs.constants.O_NOFOLLOW ?? 0;
 	const source = await fs.promises.open(absolutePath, fs.constants.O_RDONLY | noFollow);
 	let mode: "100644" | "100755";
+	let fileBytes = 0;
+	const hasher = attestationMaxBytes === null ? null : new Bun.CryptoHasher("sha256");
 	try {
 		const fileStat = await source.stat();
 		if (!fileStat.isFile()) throw new Error("Worktree entry changed while it was being snapshotted.");
 		if (fileStat.size > WORKTREE_TREE_FILE_LIMIT_BYTES) {
 			throw new Error("Worktree proof file exceeds the 32 MiB materialization limit.");
+		}
+		if (attestationMaxBytes !== null && fileStat.size > attestationMaxBytes) {
+			throw new Error("Attested worktree file exceeds its byte limit.");
 		}
 		if (fileStat.size > availableMaterializedBytes()) {
 			throw new Error("Worktree proof exceeds the 256 MiB aggregate materialization limit.");
@@ -1662,7 +1755,6 @@ async function hashWorktreeFile(
 		const materialized = await fs.promises.open(materializedPath, "w", 0o600);
 		try {
 			const buffer = Buffer.allocUnsafe(WORKTREE_TREE_COPY_BUFFER_BYTES);
-			let fileBytes = 0;
 			while (true) {
 				throwIfAborted(signal);
 				const { bytesRead } = await source.read(buffer, 0, buffer.length, null);
@@ -1671,7 +1763,11 @@ async function hashWorktreeFile(
 				if (fileBytes > WORKTREE_TREE_FILE_LIMIT_BYTES) {
 					throw new Error("Worktree proof file exceeds the 32 MiB materialization limit.");
 				}
+				if (attestationMaxBytes !== null && fileBytes > attestationMaxBytes) {
+					throw new Error("Attested worktree file exceeds its byte limit.");
+				}
 				reserveMaterializedBytes(bytesRead);
+				hasher?.update(buffer.subarray(0, bytesRead));
 				let written = 0;
 				while (written < bytesRead) {
 					const result = await materialized.write(buffer, written, bytesRead - written, null);
@@ -1696,14 +1792,19 @@ async function hashWorktreeFile(
 			}),
 			"blob",
 		);
-		return { mode, objectId };
+		return { mode, objectId, byteLength: fileBytes, sha256: hasher?.digest("hex") ?? null };
 	} finally {
 		await materialized.close();
 	}
 }
 
 /** Materialize current tracked and non-ignored untracked bytes without touching real Git state or filters. */
-export async function writeWorktreeTree(cwd: string, signal?: AbortSignal): Promise<string> {
+async function materializeWorktreeTree(
+	cwd: string,
+	attestationPath: Buffer | null,
+	attestationMaxBytes: number | null,
+	signal?: AbortSignal,
+): Promise<WorktreeTreeMaterialization> {
 	let cwdStat: fs.Stats;
 	try {
 		cwdStat = await fs.promises.stat(cwd);
@@ -1723,6 +1824,7 @@ export async function writeWorktreeTree(cwd: string, signal?: AbortSignal): Prom
 		GIT_OBJECT_DIRECTORY: temporaryObjectDirectory,
 		GIT_ALTERNATE_OBJECT_DIRECTORIES: path.join(repository.commonDir, "objects"),
 	};
+	let attestation: WorktreeTreeAttestation | null = null;
 	try {
 		await fs.promises.mkdir(temporaryObjectDirectory);
 		let listingBytes = 0;
@@ -1833,11 +1935,16 @@ export async function writeWorktreeTree(cwd: string, signal?: AbortSignal): Prom
 		try {
 			for await (const relativePath of readNulRecords(candidateListing)) {
 				throwIfAborted(signal);
+				const isAttestedPath = attestationPath?.equals(relativePath) ?? false;
 				const candidateTrackedEntry = await findTrackedEntry(relativePath);
 				const entry = await inspectWorktreePath(repository.repoRoot, relativePath, replacedParents);
 				if (!entry) continue;
+				if (isAttestedPath && !entry.relativePath.equals(relativePath)) {
+					throw new Error("Attested worktree path is not a regular file.");
+				}
 				const trackedEntry = entry.relativePath.equals(relativePath) ? candidateTrackedEntry : undefined;
 				if (entry.stat.isDirectory()) {
+					if (isAttestedPath) throw new Error("Attested worktree path is not a regular file.");
 					if (trackedEntry?.mode !== "160000") continue;
 					const submodulePath = path.join(repository.repoRoot, decodeGitPath(entry.relativePath));
 					const submoduleRepository = await resolveRepository(submodulePath);
@@ -1859,6 +1966,7 @@ export async function writeWorktreeTree(cwd: string, signal?: AbortSignal): Prom
 					continue;
 				}
 				if (entry.stat.isSymbolicLink()) {
+					if (isAttestedPath) throw new Error("Attested worktree path is not a regular file.");
 					const contents = await fs.promises.readlink(entry.absolutePath, { encoding: "buffer" });
 					if (contents.byteLength > WORKTREE_TREE_FILE_LIMIT_BYTES) {
 						throw new Error("Worktree proof file exceeds the 32 MiB materialization limit.");
@@ -1885,6 +1993,7 @@ export async function writeWorktreeTree(cwd: string, signal?: AbortSignal): Prom
 					env,
 					reserveMaterializedBytes,
 					availableMaterializedBytes,
+					isAttestedPath ? attestationMaxBytes : null,
 					signal,
 				);
 				const mode =
@@ -1893,16 +2002,60 @@ export async function writeWorktreeTree(cwd: string, signal?: AbortSignal): Prom
 						: !trustFileMode && (trackedEntry?.mode === "100644" || trackedEntry?.mode === "100755")
 							? trackedEntry.mode
 							: hashed.mode;
+				if (isAttestedPath) {
+					if ((mode !== "100644" && mode !== "100755") || hashed.sha256 === null) {
+						throw new Error("Attested worktree path is not a regular file.");
+					}
+					attestation = {
+						relativePath: decodeGitPath(relativePath),
+						blobSha: hashed.objectId,
+						sha256: hashed.sha256,
+						byteLength: hashed.byteLength,
+						mode,
+					};
+				}
 				await appendIndexEntry(mode, hashed.objectId, entry.relativePath);
 			}
 		} finally {
 			await stagedRecords.return?.(undefined);
 		}
 		await flushIndexBatch();
-		return parseObjectId(await runText(repository.repoRoot, ["write-tree"], { env, signal }), "tree");
+		const treeSha = parseObjectId(await runText(repository.repoRoot, ["write-tree"], { env, signal }), "tree");
+		if (attestationPath !== null && attestation === null) {
+			throw new Error("Required attested worktree file is missing from the materialized tree.");
+		}
+		return { treeSha, attestation };
 	} finally {
 		await fs.promises.rm(temporaryRoot, { force: true, recursive: true });
 	}
+}
+
+/** Materialize current tracked and non-ignored untracked bytes without touching real Git state or filters. */
+export async function writeWorktreeTree(cwd: string, signal?: AbortSignal): Promise<string> {
+	return (await materializeWorktreeTree(cwd, null, null, signal)).treeSha;
+}
+
+/** Materialize a worktree tree while hashing one required regular blob from the exact copied bytes. */
+export async function writeWorktreeTreeWithAttestation(
+	cwd: string,
+	relativePath: string,
+	maxBytes: number,
+	signal?: AbortSignal,
+): Promise<AttestedWorktreeTree> {
+	if (
+		!Number.isInteger(maxBytes) ||
+		maxBytes < 0 ||
+		maxBytes > WORKTREE_TREE_FILE_LIMIT_BYTES ||
+		relativePath.includes("\0") ||
+		relativePath.includes("\\")
+	) {
+		throw new Error("Invalid worktree attestation request.");
+	}
+	const encodedPath = Buffer.from(relativePath);
+	validateGitRelativePath(encodedPath);
+	const materialized = await materializeWorktreeTree(cwd, encodedPath, maxBytes, signal);
+	if (materialized.attestation === null) throw new Error("Worktree attestation was not produced.");
+	return { treeSha: materialized.treeSha, attestation: materialized.attestation };
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -2217,13 +2370,18 @@ export const revList = {
 	},
 };
 
+export const RAW_ANCESTRY_MAX_COMMITS = 256;
+
 /** Return whether `ancestor` is reachable through raw commit parents from `descendant`. */
 export async function isAncestor(
 	cwd: string,
 	ancestor: string,
 	descendant: string,
 	signal?: AbortSignal,
+	maxCommits: number = RAW_ANCESTRY_MAX_COMMITS,
 ): Promise<boolean> {
+	const requestedLimit = Number.isFinite(maxCommits) ? Math.trunc(maxCommits) : RAW_ANCESTRY_MAX_COMMITS;
+	const traversalLimit = Math.min(RAW_ANCESTRY_MAX_COMMITS, Math.max(1, requestedLimit));
 	const target = ancestor.toLowerCase();
 	const queue = [descendant];
 	const visited = new Set<string>();
@@ -2232,6 +2390,9 @@ export async function isAncestor(
 		const commitSha = queue[index]!;
 		const normalizedSha = commitSha.toLowerCase();
 		if (visited.has(normalizedSha)) continue;
+		if (visited.size >= traversalLimit) {
+			throw new Error(`Raw Git ancestry proof exceeds the ${traversalLimit}-commit traversal limit.`);
+		}
 		visited.add(normalizedSha);
 		const commit = await rawCommit(cwd, commitSha, signal);
 		if (!commit) throw new Error(`Unable to read raw Git commit ${commitSha}.`);

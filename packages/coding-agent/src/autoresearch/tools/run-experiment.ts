@@ -335,38 +335,23 @@ async function captureContributionExecutionProof(
 ): Promise<ContributionExecutionProof> {
 	const headSha = await git.head.sha(cwd, signal);
 	if (headSha === null) throw new Error("Contribution execution requires an immutable HEAD commit.");
-	const harnessSha256 = await hashBoundedFile(
-		path.join(cwd, HARNESS_FILENAME),
+	const worktreePrefix = await git.show.prefix(cwd, signal);
+	const worktreeProof = await git.writeWorktreeTreeWithAttestation(
+		cwd,
+		`${worktreePrefix}${HARNESS_FILENAME}`,
 		CONTRIBUTION_HARNESS_MAX_BYTES,
 		signal,
 	);
-	const worktreeTreeSha = await git.writeWorktreeTree(cwd, signal);
 	const invocation = JSON.stringify({ command, effectiveTimeoutMs });
 	const invocationSha256 = new Bun.CryptoHasher("sha256").update(invocation).digest("hex");
-	return { harnessSha256, invocationSha256, worktreeTreeSha, headSha };
+	return {
+		harnessSha256: worktreeProof.attestation.sha256,
+		invocationSha256,
+		worktreeTreeSha: worktreeProof.treeSha,
+		headSha,
+	};
 }
 
-async function hashBoundedFile(filePath: string, maxBytes: number, signal?: AbortSignal): Promise<string> {
-	const hasher = new Bun.CryptoHasher("sha256");
-	const reader = Bun.file(filePath).stream().getReader();
-	let totalBytes = 0;
-	try {
-		while (true) {
-			throwIfAborted(signal);
-			const chunk = await reader.read();
-			if (chunk.done) break;
-			totalBytes += chunk.value.byteLength;
-			if (totalBytes > maxBytes) {
-				await reader.cancel();
-				throw new Error(`Contribution harness exceeds the ${formatBytes(maxBytes)} byte limit.`);
-			}
-			hasher.update(chunk.value);
-		}
-	} finally {
-		reader.releaseLock();
-	}
-	return hasher.digest("hex");
-}
 
 function sameContributionExecutionProof(
 	before: ContributionExecutionProof,

@@ -6963,20 +6963,20 @@ export class AgentSession {
 		const admission = Promise.withResolvers<void>();
 		this.#sessionTransitionAdmission = previousAdmission.then(() => admission.promise);
 		await previousAdmission;
-
-		const transition: SessionTransitionState = {
-			transitionId: crypto.randomUUID(),
-			committed: false,
-			emitEnd: true,
-		};
 		try {
-			return await operation(transition);
-		} finally {
+			if (this.#isDisposed) throw new Error("Cannot start a session transition after disposal.");
+			const transition: SessionTransitionState = {
+				transitionId: crypto.randomUUID(),
+				committed: false,
+				emitEnd: true,
+			};
 			try {
-				await this.#finishSessionTransition(kind, transition);
+				return await operation(transition);
 			} finally {
-				admission.resolve();
+				await this.#finishSessionTransition(kind, transition);
 			}
+		} finally {
+			admission.resolve();
 		}
 	}
 

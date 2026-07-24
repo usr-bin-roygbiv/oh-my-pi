@@ -25,6 +25,7 @@ import {
 	type PublishedContributionCandidate,
 	publishContributionCandidate,
 	validateContributionForkRemote,
+	validateContributionRemoteName,
 	verifyContributionBase,
 	verifyContributionFork,
 } from "./contribution";
@@ -336,6 +337,12 @@ const contributionPublicationGit: ContributionPublicationGit = {
 async function discoverContributionRemotes(cwd: string): Promise<ContributionRemoteChoice[]> {
 	const choices: ContributionRemoteChoice[] = [];
 	for (const name of await git.remote.list(cwd)) {
+		try {
+			validateContributionRemoteName(name);
+		} catch (error) {
+			if (error instanceof ContributionError) continue;
+			throw error;
+		}
 		const [url, pushUrl] = await Promise.all([git.remote.url(cwd, name), git.remote.pushUrl(cwd, name)]);
 		if (!url || !pushUrl) continue;
 		try {

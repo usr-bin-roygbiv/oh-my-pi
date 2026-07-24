@@ -1323,6 +1323,120 @@ describe("contribution fork validation and publication", () => {
 		}
 	});
 
+	it("preserves a configured hook path and its original Git config view", async () => {
+		const source = TempDir.createSync("@pi-contribution-configured-hook-source-");
+		const remote = TempDir.createSync("@pi-contribution-configured-hook-target-");
+		try {
+			await $`git init --bare ${remote.path()}`.quiet();
+			await $`git -C ${source.path()} init -b main`.quiet();
+			await $`git -C ${source.path()} config user.name OMP`.quiet();
+			await $`git -C ${source.path()} config user.email omp@example.invalid`.quiet();
+			await Bun.write(`${source.path()}/candidate.txt`, "candidate\n");
+			await $`git -C ${source.path()} add candidate.txt`.quiet();
+			await $`git -C ${source.path()} commit -m candidate`.quiet();
+			const candidateSha = (await $`git -C ${source.path()} rev-parse HEAD`.quiet()).text().trim();
+			const remoteUrl = `file://${remote.path()}`;
+			await $`git -C ${source.path()} remote add origin ${remoteUrl}`.quiet();
+			const hooksDirectoryName = " hooks ";
+			const hooksDirectory = `${source.path()}/${hooksDirectoryName}`;
+			await fs.promises.mkdir(hooksDirectory);
+			await $`git -C ${source.path()} config core.hooksPath ${hooksDirectoryName}`.quiet();
+			const hookMarker = `${source.path()}/configured-pre-push-args`;
+			const configMarker = `${source.path()}/configured-pre-push-config`;
+			const hookPath = `${hooksDirectory}/pre-push`;
+			await Bun.write(
+				hookPath,
+				`#!/bin/sh\nprintf '%s\\n%s\\n' "$1" "$2" > ${JSON.stringify(hookMarker)}\ngit config --get core.hooksPath > ${JSON.stringify(configMarker)}\n`,
+			);
+			fs.chmodSync(hookPath, 0o755);
+
+			await git.push(source.path(), {
+				remote: "origin",
+				verifiedRemoteUrl: remoteUrl,
+				refspec: `${candidateSha}:refs/heads/${CONTRIBUTION_BRANCH}`,
+				forceWithLease: `refs/heads/${CONTRIBUTION_BRANCH}:`,
+			});
+
+			expect((await Bun.file(hookMarker).text()).trim().split("\n")).toEqual(["origin", remoteUrl]);
+			expect(await Bun.file(configMarker).text()).toBe(`${hooksDirectoryName}\n`);
+		} finally {
+			source.removeSync();
+			remote.removeSync();
+		}
+	});
+
+	it("fails the verified push when Git discovers a non-executable hook target", async () => {
+		const source = TempDir.createSync("@pi-contribution-invalid-hook-source-");
+		const remote = TempDir.createSync("@pi-contribution-invalid-hook-target-");
+		try {
+			await $`git init --bare ${remote.path()}`.quiet();
+			await $`git -C ${source.path()} init -b main`.quiet();
+			await $`git -C ${source.path()} config user.name OMP`.quiet();
+			await $`git -C ${source.path()} config user.email omp@example.invalid`.quiet();
+			await Bun.write(`${source.path()}/candidate.txt`, "candidate\n");
+			await $`git -C ${source.path()} add candidate.txt`.quiet();
+			await $`git -C ${source.path()} commit -m candidate`.quiet();
+			const candidateSha = (await $`git -C ${source.path()} rev-parse HEAD`.quiet()).text().trim();
+			const remoteUrl = `file://${remote.path()}`;
+			await $`git -C ${source.path()} remote add origin ${remoteUrl}`.quiet();
+			await fs.promises.mkdir(`${source.path()}/.git/hooks/pre-push`);
+
+			await expect(
+				git.push(source.path(), {
+					remote: "origin",
+					verifiedRemoteUrl: remoteUrl,
+					refspec: `${candidateSha}:refs/heads/${CONTRIBUTION_BRANCH}`,
+					forceWithLease: `refs/heads/${CONTRIBUTION_BRANCH}:`,
+				}),
+			).rejects.toThrow();
+			const remoteRef =
+				await $`git --git-dir ${remote.path()} show-ref --verify --quiet refs/heads/${CONTRIBUTION_BRANCH}`
+					.quiet()
+					.nothrow();
+			expect(remoteRef.exitCode).not.toBe(0);
+		} finally {
+			source.removeSync();
+			remote.removeSync();
+		}
+	});
+
+	it("respects an explicitly empty hooks path during verified push", async () => {
+		const source = TempDir.createSync("@pi-contribution-disabled-hook-source-");
+		const remote = TempDir.createSync("@pi-contribution-disabled-hook-target-");
+		try {
+			await $`git init --bare ${remote.path()}`.quiet();
+			await $`git -C ${source.path()} init -b main`.quiet();
+			await $`git -C ${source.path()} config user.name OMP`.quiet();
+			await $`git -C ${source.path()} config user.email omp@example.invalid`.quiet();
+			await Bun.write(`${source.path()}/candidate.txt`, "candidate\n");
+			await $`git -C ${source.path()} add candidate.txt`.quiet();
+			await $`git -C ${source.path()} commit -m candidate`.quiet();
+			const candidateSha = (await $`git -C ${source.path()} rev-parse HEAD`.quiet()).text().trim();
+			const remoteUrl = `file://${remote.path()}`;
+			await $`git -C ${source.path()} remote add origin ${remoteUrl}`.quiet();
+			const hookMarker = `${source.path()}/disabled-pre-push-ran`;
+			const hookPath = `${source.path()}/.git/hooks/pre-push`;
+			await Bun.write(hookPath, `#!/bin/sh\nprintf hook > ${JSON.stringify(hookMarker)}\n`);
+			fs.chmodSync(hookPath, 0o755);
+			await $`git -C ${source.path()} config core.hooksPath ${""}`.quiet();
+
+			await git.push(source.path(), {
+				remote: "origin",
+				verifiedRemoteUrl: remoteUrl,
+				refspec: `${candidateSha}:refs/heads/${CONTRIBUTION_BRANCH}`,
+				forceWithLease: `refs/heads/${CONTRIBUTION_BRANCH}:`,
+			});
+
+			expect(await Bun.file(hookMarker).exists()).toBe(false);
+			expect(
+				(await $`git --git-dir ${remote.path()} rev-parse refs/heads/${CONTRIBUTION_BRANCH}`.quiet()).text().trim(),
+			).toBe(candidateSha);
+		} finally {
+			source.removeSync();
+			remote.removeSync();
+		}
+	});
+
 	it("leaves the candidate ref absent when the normal pre-push hook rejects", async () => {
 		const source = TempDir.createSync("@pi-contribution-rejected-push-source-");
 		const remote = TempDir.createSync("@pi-contribution-rejected-push-remote-");
@@ -2536,12 +2650,28 @@ function createIntegrationHarness(cwd: string, options: IntegrationHarnessOption
 	const forkRemoteName = options.forkRemoteName ?? "origin";
 
 	const realWriteWorktreeTree = git.writeWorktreeTree;
+	const realWriteWorktreeTreeWithAttestation = git.writeWorktreeTreeWithAttestation;
 	const realWriteTree = git.writeTree;
 	const realRawCommit = git.rawCommit;
 	const realCommit = git.commit;
 	const realHeadSha = git.head.sha;
 	vi.spyOn(git, "writeWorktreeTree").mockImplementation(async (workDir, signal) =>
 		fs.existsSync(`${workDir}/.git`) ? realWriteWorktreeTree(workDir, signal) : CANDIDATE_TREE_SHA,
+	);
+	vi.spyOn(git, "writeWorktreeTreeWithAttestation").mockImplementation(
+		async (workDir, relativePath, maxBytes, signal) =>
+			fs.existsSync(`${workDir}/.git`)
+				? realWriteWorktreeTreeWithAttestation(workDir, relativePath, maxBytes, signal)
+				: {
+						treeSha: CANDIDATE_TREE_SHA,
+						attestation: {
+							relativePath,
+							blobSha: "e".repeat(40),
+							sha256: HARNESS_SHA256,
+							byteLength: 0,
+							mode: "100755",
+						},
+					},
 	);
 	vi.spyOn(git, "writeTree").mockImplementation(async (workDir, writeOptions) =>
 		fs.existsSync(`${workDir}/.git`) ? realWriteTree(workDir, writeOptions) : CANDIDATE_TREE_SHA,

@@ -61,7 +61,7 @@ export class HookRunner {
 
 	constructor(
 		private readonly hooks: LoadedHook[],
-		private readonly cwd: string,
+		_cwd: string,
 		private readonly sessionManager: SessionManager,
 		private readonly modelRegistry: ModelRegistry,
 	) {
@@ -226,7 +226,7 @@ export class HookRunner {
 		return {
 			ui: this.#uiContext,
 			hasUI: this.#hasUI,
-			cwd: this.cwd,
+			cwd: this.sessionManager.getCwd(),
 			sessionManager: this.sessionManager,
 			modelRegistry: this.modelRegistry,
 			model: this.#getModel(),
