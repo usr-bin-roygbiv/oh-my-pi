@@ -61,7 +61,7 @@ import type {
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import { ExtensionUiController } from "@oh-my-pi/pi-coding-agent/modes/controllers/extension-ui-controller";
 import * as git from "@oh-my-pi/pi-coding-agent/utils/git";
-import { TempDir } from "@oh-my-pi/pi-utils";
+import { $which, TempDir } from "@oh-my-pi/pi-utils";
 import { $ } from "bun";
 
 afterEach(() => {
@@ -113,6 +113,61 @@ function snapshotWorktreeTreeTemps(): string[] {
 		.filter(entry => entry.name.startsWith("omp-worktree-tree-"))
 		.map(entry => `${entry.name}:${entry.isDirectory() ? "directory" : "file"}`)
 		.sort();
+}
+
+async function installOversizedGitListingWrapper(
+	repositoryRoot: string,
+	mode: "bytes" | "records",
+): Promise<() => void> {
+	const realGit = $which("git");
+	if (!realGit) throw new Error("Expected git binary for worktree listing fixture");
+	const wrapperDirectory = `${repositoryRoot}/.omp-git-wrapper`;
+	const wrapperPath = `${wrapperDirectory}/git`;
+	fs.mkdirSync(wrapperDirectory, { recursive: true });
+	await Bun.write(
+		wrapperPath,
+		`#!/usr/bin/env bun
+import { Buffer } from "node:buffer";
+const args = process.argv.slice(2);
+const writeChunk = async chunk => {
+	if (process.stdout.write(chunk)) return;
+	const drained = Promise.withResolvers();
+	process.stdout.once("drain", drained.resolve);
+	await drained.promise;
+};
+if (args.includes("ls-files") && args.includes("--others")) {
+	const byteMode = ${JSON.stringify(mode)} === "bytes";
+	const record = byteMode
+		? "base.txt/" + ["a", "b", "c", "d"].map(character => character.repeat(165)).join("/") + "\\0"
+		: "base.txt/missing\\0";
+	const batchRecords = 256;
+	const batch = Buffer.from(record.repeat(batchRecords));
+	let remaining = byteMode ? 99_999 : 100_001;
+	while (remaining > 0) {
+		const count = Math.min(remaining, batchRecords);
+		await writeChunk(count === batchRecords ? batch : batch.subarray(0, count * Buffer.byteLength(record)));
+		remaining -= count;
+	}
+	if (byteMode) await Bun.write(${JSON.stringify(`${repositoryRoot}/.omp-listing-complete`)}, "complete");
+	process.exit(0);
+}
+const child = Bun.spawnSync([${JSON.stringify(realGit)}, ...args], {
+	cwd: process.cwd(),
+	env: process.env,
+	stdin: "inherit",
+	stdout: "inherit",
+	stderr: "inherit",
+});
+process.exit(child.exitCode);
+`,
+	);
+	fs.chmodSync(wrapperPath, 0o755);
+	const originalPath = process.env.PATH;
+	process.env.PATH = originalPath ? `${wrapperDirectory}:${originalPath}` : wrapperDirectory;
+	return () => {
+		if (originalPath === undefined) delete process.env.PATH;
+		else process.env.PATH = originalPath;
+	};
 }
 
 function growFileAfterSnapshotStat(targetPath: string, grownBytes: number): () => boolean {
@@ -581,21 +636,27 @@ describe("read-only contribution storage preflight", () => {
 	it("cannot lose an active WAL row when a checkpoint races the read-only probe", async () => {
 		const writer = await openUncachedActiveSession(cwd.path());
 		const dbPath = writer.dbPath;
-		const realCopyFileSync = fs.copyFileSync;
-		let databaseCopies = 0;
+		const realOpenSync = fs.openSync as unknown as (...args: unknown[]) => number;
+		const realReadSync = fs.readSync as unknown as (...args: unknown[]) => number;
+		let sourceDatabaseDescriptor: number | null = null;
 		let checkpointedAfterDatabaseCopy = false;
 		const checkpointer: { current: Database | null } = { current: null };
-		vi.spyOn(fs, "copyFileSync").mockImplementation((source, destination) => {
-			realCopyFileSync(source, destination);
-			if (String(source) !== dbPath || checkpointedAfterDatabaseCopy) return;
-			databaseCopies++;
+		vi.spyOn(fs, "openSync").mockImplementation(((...args: unknown[]) => {
+			const descriptor = realOpenSync(...args);
+			if (String(args[0]) === dbPath && sourceDatabaseDescriptor === null) sourceDatabaseDescriptor = descriptor;
+			return descriptor;
+		}) as typeof fs.openSync);
+		vi.spyOn(fs, "readSync").mockImplementation(((...args: unknown[]) => {
+			const bytesRead = realReadSync(...args);
+			if (args[0] !== sourceDatabaseDescriptor || bytesRead !== 0 || checkpointedAfterDatabaseCopy) return bytesRead;
 			checkpointer.current = new Database(dbPath);
 			checkpointer.current.exec("PRAGMA wal_checkpoint(TRUNCATE)");
 			checkpointer.current.exec(
 				"INSERT INTO runs (session_id, segment, command, started_at, pre_run_dirty_paths_json, log_path) VALUES (1, 0, 'probe', 0, '[]', '')",
 			);
 			checkpointedAfterDatabaseCopy = true;
-		});
+			return bytesRead;
+		}) as typeof fs.readSync);
 
 		let probeResult: { value: boolean } | { error: unknown } | undefined;
 		let sourceStayedActive = false;
@@ -618,15 +679,14 @@ describe("read-only contribution storage preflight", () => {
 			writer.close();
 		}
 
-		expect(databaseCopies === 0 || checkpointedAfterDatabaseCopy).toBe(true);
+		expect(sourceDatabaseDescriptor).not.toBeNull();
+		expect(checkpointedAfterDatabaseCopy).toBe(true);
 		expect(sourceStayedActive).toBe(true);
-		if (!probeResult) throw new Error("Expected read-only probe outcome");
-		if ("error" in probeResult) {
-			expect(probeResult.error).toBeInstanceOf(Error);
-			expect((probeResult.error as Error).message).toContain("changed during the read-only probe");
-		} else {
-			expect(probeResult.value).toBe(true);
+		expect(probeResult).toEqual({ error: expect.any(Error) });
+		if (!probeResult || !("error" in probeResult) || !(probeResult.error instanceof Error)) {
+			throw new Error("Expected checkpoint race rejection");
 		}
+		expect(probeResult.error.message).toContain("changed during the read-only probe");
 	});
 
 	it("rejects source growth after the initial size check without attempting an unbounded copy", async () => {
@@ -1330,6 +1390,83 @@ describe("contribution fork validation and publication", () => {
 
 			await expect(git.isAncestor(source.path(), baseSha, unrelatedSha)).resolves.toBe(false);
 		} finally {
+			source.removeSync();
+		}
+	});
+
+	it("bounds actual worktree listing bytes before temporary metadata can grow past 32 MiB", async () => {
+		const source = TempDir.createSync("@pi-contribution-tree-listing-limit-");
+		const tempsBefore = snapshotWorktreeTreeTemps();
+		let restorePath = (): void => {};
+		let candidateListingBytesBeforeCleanup: number | null = null;
+		const realRm = fs.promises.rm as unknown as (...args: unknown[]) => Promise<void>;
+		vi.spyOn(fs.promises, "rm").mockImplementation((async (...args: unknown[]) => {
+			const temporaryRoot = String(args[0]);
+			if (temporaryRoot.includes("omp-worktree-tree-")) {
+				const candidateListing = `${temporaryRoot}/candidates`;
+				if (fs.existsSync(candidateListing)) candidateListingBytesBeforeCleanup = fs.statSync(candidateListing).size;
+			}
+			await realRm(...args);
+		}) as typeof fs.promises.rm);
+		try {
+			await $`git -C ${source.path()} init -b main`.quiet();
+			await Bun.write(`${source.path()}/base.txt`, "base\n");
+			await $`git -C ${source.path()} add base.txt`.quiet();
+			await $`git -C ${source.path()} -c user.name=OMP -c user.email=omp@example.invalid commit -m base`.quiet();
+			const indexBefore = fs.readFileSync(`${source.path()}/.git/index`);
+			const objectsBefore = snapshotFileSizes(`${source.path()}/.git/objects`);
+			restorePath = await installOversizedGitListingWrapper(source.path(), "bytes");
+
+			const outcome = await git.writeWorktreeTree(source.path()).then(
+				value => ({ value }),
+				(error: unknown) => ({ error }),
+			);
+			restorePath();
+			restorePath = (): void => {};
+
+			expect(outcome).toEqual({ error: expect.any(Error) });
+			if (!("error" in outcome) || !(outcome.error instanceof Error)) throw new Error("Expected listing limit error");
+			expect(outcome.error.message).toContain("32 MiB worktree metadata listing limit");
+			expect(fs.existsSync(`${source.path()}/.omp-listing-complete`)).toBe(false);
+			expect(candidateListingBytesBeforeCleanup).not.toBeNull();
+			expect(candidateListingBytesBeforeCleanup ?? Number.POSITIVE_INFINITY).toBeLessThanOrEqual(32 * 1024 * 1024);
+			expect(fs.readFileSync(`${source.path()}/.git/index`)).toEqual(indexBefore);
+			expect(snapshotFileSizes(`${source.path()}/.git/objects`)).toEqual(objectsBefore);
+			expect(snapshotWorktreeTreeTemps()).toEqual(tempsBefore);
+		} finally {
+			restorePath();
+			source.removeSync();
+		}
+	});
+
+	it("bounds worktree metadata records even when candidate files contain no payload bytes", async () => {
+		const source = TempDir.createSync("@pi-contribution-tree-entry-limit-");
+		const tempsBefore = snapshotWorktreeTreeTemps();
+		let restorePath = (): void => {};
+		try {
+			await $`git -C ${source.path()} init -b main`.quiet();
+			await Bun.write(`${source.path()}/base.txt`, "base\n");
+			await $`git -C ${source.path()} add base.txt`.quiet();
+			await $`git -C ${source.path()} -c user.name=OMP -c user.email=omp@example.invalid commit -m base`.quiet();
+			const indexBefore = fs.readFileSync(`${source.path()}/.git/index`);
+			const objectsBefore = snapshotFileSizes(`${source.path()}/.git/objects`);
+			restorePath = await installOversizedGitListingWrapper(source.path(), "records");
+
+			const outcome = await git.writeWorktreeTree(source.path()).then(
+				value => ({ value }),
+				(error: unknown) => ({ error }),
+			);
+			restorePath();
+			restorePath = (): void => {};
+
+			expect(outcome).toEqual({ error: expect.any(Error) });
+			if (!("error" in outcome) || !(outcome.error instanceof Error)) throw new Error("Expected entry limit error");
+			expect(outcome.error.message).toContain("100000-entry worktree metadata limit");
+			expect(fs.readFileSync(`${source.path()}/.git/index`)).toEqual(indexBefore);
+			expect(snapshotFileSizes(`${source.path()}/.git/objects`)).toEqual(objectsBefore);
+			expect(snapshotWorktreeTreeTemps()).toEqual(tempsBefore);
+		} finally {
+			restorePath();
 			source.removeSync();
 		}
 	});
@@ -2136,6 +2273,7 @@ interface IntegrationHarness {
 	readonly widgetUpdates: number;
 	widgetValues: unknown[];
 	setPendingMessages(value: boolean): void;
+	setIdle(value: boolean): void;
 	setStatusText(value: string): void;
 	setHeadSha(value: string): void;
 	setRefOccupied(value: boolean): void;
@@ -2210,6 +2348,7 @@ function createIntegrationHarness(cwd: string, options: IntegrationHarnessOption
 	];
 	let selectedModel = options.currentModel ?? models[0];
 	let pendingMessages = options.hasPendingMessages ?? false;
+	let idle = true;
 	let statusText = options.statusText ?? "";
 	let headSha = options.headSha ?? COMMIT_SHA;
 	let currentBranch = "main";
@@ -2449,7 +2588,7 @@ function createIntegrationHarness(cwd: string, options: IntegrationHarnessOption
 		getSystemPrompt: () => [],
 		hasPendingMessages: () => pendingMessages,
 		hasUI: true,
-		isIdle: () => true,
+		isIdle: () => idle,
 		modelRegistry: {},
 		navigateTree: async () => ({ cancelled: false }),
 		newSession: async () => ({ cancelled: false }),
@@ -2532,6 +2671,9 @@ function createIntegrationHarness(cwd: string, options: IntegrationHarnessOption
 		setPendingMessages(value: boolean): void {
 			pendingMessages = value;
 		},
+		setIdle(value: boolean): void {
+			idle = value;
+		},
 		setStatusText(value: string): void {
 			statusText = value;
 		},
@@ -2608,6 +2750,7 @@ interface KeptContributionOptions {
 	harnessProof?: "valid" | "missing" | "changed";
 	invocationProof?: "valid" | "missing" | "timeout-changed" | "config-changed";
 	redTreeProof?: "valid" | "same" | "missing";
+	redHeadProof?: "valid" | "missing" | "changed";
 }
 
 async function prepareKeptContribution(
@@ -2657,6 +2800,12 @@ async function prepareKeptContribution(
 								: {
 										[CONTRIBUTION_WORKTREE_TREE_ASI_KEY]:
 											options.redTreeProof === "same" ? CANDIDATE_TREE_SHA : RED_TREE_SHA,
+									}),
+							...(options.redHeadProof === "missing"
+								? {}
+								: {
+										[CONTRIBUTION_HEAD_SHA_ASI_KEY]:
+											options.redHeadProof === "changed" ? CURRENT_HEAD : COMMIT_SHA,
 									}),
 							...(options.invocationProof === "missing"
 								? {}
@@ -5166,6 +5315,8 @@ describe("process-local contribution lifecycle", () => {
 		{ name: "the prior failing proof is flagged", options: { redProof: "flagged" as const } },
 		{ name: "the proof harness identity is missing", options: { harnessProof: "missing" as const } },
 		{ name: "the proof harness changed between red and green", options: { harnessProof: "changed" as const } },
+		{ name: "the red proof HEAD identity is missing", options: { redHeadProof: "missing" as const } },
+		{ name: "red and green use different tested HEADs", options: { redHeadProof: "changed" as const } },
 		{ name: "the effective invocation identity is missing", options: { invocationProof: "missing" as const } },
 		{
 			name: "red and green use different effective timeout configuration",
@@ -5467,6 +5618,36 @@ describe("process-local contribution lifecycle", () => {
 			harness.ctx as ExtensionContext,
 		);
 		expect(harness.sentMessages).toHaveLength(1);
+	});
+
+	it("does not queue a stale contribution resume after a newer deliberate prompt starts", async () => {
+		const harness = createIntegrationHarness(cwd.path());
+		await startContribution(harness);
+		harness.sentMessages.length = 0;
+		const contributionBranch = harness.currentBranch();
+		const finalBranchLookupEntered = Promise.withResolvers<void>();
+		const releaseFinalBranchLookup = Promise.withResolvers<void>();
+		let branchLookupCount = 0;
+		vi.spyOn(git.branch, "current").mockImplementation(async () => {
+			branchLookupCount++;
+			if (branchLookupCount === 2) {
+				finalBranchLookupEntered.resolve();
+				await releaseFinalBranchLookup.promise;
+			}
+			return contributionBranch;
+		});
+		const agentEndPromise = handlerRequired<AgentEndEvent>(harness, "agent_end")(
+			terminalAgentEnd("stop"),
+			harness.ctx as ExtensionContext,
+		);
+		await finalBranchLookupEntered.promise;
+
+		harness.setIdle(false);
+		releaseFinalBranchLookup.resolve();
+		await agentEndPromise;
+		harness.setIdle(true);
+
+		expect(harness.sentMessages).toEqual([]);
 	});
 
 	it("continues indefinitely only for safe terminal contribution settles and stops on every guard", async () => {
