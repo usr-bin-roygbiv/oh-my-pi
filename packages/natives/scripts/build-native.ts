@@ -8,6 +8,11 @@ import { generateEnumExports } from "./gen-enums";
 // must not retain host Homebrew paths such as /opt/homebrew/opt/pcre2/*.dylib.
 process.env.PCRE2_SYS_STATIC ??= "1";
 
+// audiopus_sys builds its bundled opus via CMake; that opus tree declares a
+// cmake_minimum_required below 3.5, which CMake 4.x refuses without this
+// policy override.
+process.env.CMAKE_POLICY_VERSION_MINIMUM ??= "3.5";
+
 const repoRoot = path.join(import.meta.dir, "../../..");
 const rustDir = path.join(repoRoot, "crates/pi-natives");
 const nativeDir = path.join(import.meta.dir, "../native");
@@ -44,14 +49,15 @@ const effectiveVariant = resolveEffectiveVariant();
 const variantSuffix = effectiveVariant ? `-${effectiveVariant}` : "";
 
 // Pin Rust target-cpu so x64 baseline/modern variants get a reproducible ISA floor
-// instead of inheriting the host CPU when RUSTFLAGS is unset.
+// instead of inheriting the host CPU when RUSTFLAGS is unset. Non-x64 builds keep
+// the target's default CPU features: `-C target-cpu=native` would bake the build
+// host's CPU features into shipped artifacts and trips ring 0.17's aarch64-apple
+// const assertion (CAPS_STATIC == MIN_STATIC_FEATURES).
 if (!isCrossCompile && !Bun.env.RUSTFLAGS) {
 	if (effectiveVariant === "modern") {
 		Bun.env.RUSTFLAGS = "-C target-cpu=x86-64-v3";
 	} else if (effectiveVariant === "baseline") {
 		Bun.env.RUSTFLAGS = "-C target-cpu=x86-64-v2";
-	} else {
-		Bun.env.RUSTFLAGS = "-C target-cpu=native";
 	}
 }
 

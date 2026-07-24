@@ -125,6 +125,9 @@ runs:
         run: |
            sudo apt-get update
            sudo apt-get install -y build-essential
+      # audiopus_sys builds bundled libopus via CMake (Ninja generator for MSVC
+      # cross); GitHub-hosted images ship cmake/ninja, the omp-kata pods do not.
+      - uses: ./.github/actions/ensure-cmake
       - name: Prepend rustup toolchain bin to PATH (GitHub-hosted)
         if: steps.detect.outputs.on_infra == 'false'
         shell: bash
@@ -161,7 +164,13 @@ runs:
                  echo "Using caller-provided RUSTFLAGS=$RUSTFLAGS"
                  exit 0
                fi
-               rustflags="-C target-cpu=native"
+               # Non-x64 native builds (darwin arm64) keep the target's default
+               # CPU features. `-C target-cpu=native` both baked the CI host's
+               # CPU features into shipped artifacts and trips ring 0.17's
+               # aarch64-apple const assertion (CAPS_STATIC == MIN_STATIC_FEATURES)
+               # once extra static features are enabled.
+               echo "Using default target CPU features (no RUSTFLAGS)"
+               exit 0
                ;;
            esac
 
