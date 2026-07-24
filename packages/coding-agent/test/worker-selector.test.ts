@@ -35,3 +35,27 @@ describe("worker selector dispatch", () => {
 		expect(stderr).not.toHaveBeenCalledWith(expect.stringContaining("unknown worker selector"));
 	});
 });
+
+describe("computer worker entry", () => {
+	it("is side-effect-free to import and exposes a named start function", async () => {
+		// Dynamic import intentionally exercises module evaluation without a worker parent port.
+		const entry = await import("../src/tools/computer/worker-entry");
+		expect(entry.startComputerWorker).toBeFunction();
+	});
+
+	it("dispatches an immediately posted message through the CLI worker selector", async () => {
+		const worker = new Worker(new URL("../src/cli.ts", import.meta.url).href, {
+			type: "module",
+			argv: ["__omp_worker_computer"],
+		});
+		const response = Promise.withResolvers<unknown>();
+		worker.addEventListener("message", event => response.resolve(event.data));
+
+		try {
+			worker.postMessage({ type: "ping", id: "computer-worker-selector" });
+			expect(await response.promise).toEqual({ type: "pong", id: "computer-worker-selector" });
+		} finally {
+			worker.terminate();
+		}
+	});
+});
