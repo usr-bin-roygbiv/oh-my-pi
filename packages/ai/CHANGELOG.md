@@ -10,6 +10,9 @@
 ### Changed
 
 - Renamed the Z.AI feature quota row to `ZAI Zread Quota` (tier/id slug `zread`), replacing the 74-char `ZAI Web Search / Reader / Zread Quota (web-search-reader-zread)` title that wrapped `omp usage` rows
+### Fixed
+
+- Fixed every Claude (`anthropic-messages`) model on the `opencode-zen` provider failing with `401 Missing API key`: the gateway requires `x-api-key`, so `opencode-zen` now uses X-Api-Key auth like `opencode-go`/`umans` instead of bearer-only, and no longer sends the `context_management` field its Anthropic proxy rejects on thinking requests ([#6510](https://github.com/can1357/oh-my-pi/issues/6510)).
 
 ## [17.1.1] - 2026-07-24
 
