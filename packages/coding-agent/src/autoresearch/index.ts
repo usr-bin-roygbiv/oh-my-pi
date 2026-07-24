@@ -818,6 +818,7 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 		const captured = capturedRuntime.contribution;
 		const capturedOrdinarySessionOwner = capturedRuntime.ordinarySessionOwner;
 		const capturedSessionOwner = sessionOwnerForRuntime(capturedRuntime);
+		let capturedOwnerlessOrdinaryBranch: string | null | undefined;
 		if (captured.status === "review") {
 			throw new Error("Contribution review state does not authorize autoresearch mutation.");
 		}
@@ -864,6 +865,14 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 			async authorizeMutation(currentCtx, signal): Promise<void> {
 				throwIfAborted(signal);
 				assertProcessIdentity(currentCtx);
+				if (captured.status === "off" && capturedSessionOwner === null) {
+					const currentBranch = (await git.branch.current(currentCtx.cwd, signal)) ?? null;
+					if (capturedOwnerlessOrdinaryBranch === undefined) {
+						capturedOwnerlessOrdinaryBranch = currentBranch;
+					} else if (currentBranch !== capturedOwnerlessOrdinaryBranch) {
+						throw new ToolAbortError("Autoresearch ownerless initialization changed branches before mutation.");
+					}
+				}
 				if (capturedSessionOwner) {
 					const storage = await openAutoresearchStorageIfExists(currentCtx.cwd);
 					const currentBranch = await git.branch.current(currentCtx.cwd, signal);
@@ -2007,7 +2016,15 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 	api.on("before_agent_start", async (event, ctx) => {
 		let identity = captureLifecycleIdentity(ctx);
 		const runtime = identity.runtime;
-		if (!runtime.autoresearchMode || mutationAdmissionClosed(identity.sessionKey)) return;
+		if (mutationAdmissionClosed(identity.sessionKey)) return;
+		if (!runtime.autoresearchMode) {
+			if (runtime.contribution.status !== "off" || runtime.ordinarySessionOwner === null) return;
+			const control = reconstructControlState(ctx.sessionManager.getBranch());
+			if (!control.autoresearchMode) return;
+			await rehydrate(ctx);
+			identity = captureLifecycleIdentity(ctx);
+			if (!runtime.autoresearchMode || mutationAdmissionClosed(identity.sessionKey)) return;
+		}
 		// Re-check git branch on every agent start. If the user manually switched
 		// off the autoresearch/* branch between turns, we silently drop autoresearch
 		// from this turn — the widget hides, the experiment tools detach, and we do
