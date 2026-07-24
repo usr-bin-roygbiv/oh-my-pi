@@ -1808,7 +1808,7 @@ interface IntegrationHarnessOptions {
 	rollbackCheckoutFailure?: Error;
 	branchDeleteFailure?: Error;
 	onGoalRefRequest?(signal?: AbortSignal): void | Promise<void>;
-	onConfirm?(callNumber: number, title: string): void | Promise<void>;
+	onConfirm?(callNumber: number, title: string, signal?: AbortSignal): void | Promise<void>;
 	onSetModel?(callNumber: number): void | Promise<void>;
 	onCheckoutNewAt?(callNumber: number): void | Promise<void>;
 	onSetActiveTools?(callNumber: number, names: readonly string[]): void | Promise<void>;
@@ -2202,10 +2202,10 @@ function createIntegrationHarness(cwd: string, options: IntegrationHarnessOption
 		shutdown(): void {},
 		switchSession: async () => ({ cancelled: false }),
 		ui: {
-			confirm: async (title: string, message: string) => {
+			confirm: async (title: string, message: string, dialogOptions?: { signal?: AbortSignal }) => {
 				confirmCalls.push({ title, message });
 				gitEvents.push(`confirm:${confirmCalls.length}`);
-				await options.onConfirm?.(confirmCalls.length, title);
+				await options.onConfirm?.(confirmCalls.length, title, dialogOptions?.signal);
 				return confirmAnswers.shift() ?? false;
 			},
 			custom: async () => undefined,
@@ -4835,8 +4835,58 @@ describe("process-local contribution lifecycle", () => {
 		expect(reviewSignalAbortedBeforeRelease).toBe(true);
 		expect(reviewResult.status).toBe("fulfilled");
 		expect(offResult.status).toBe("fulfilled");
+
 		expect(harness.pushes).toEqual([]);
 		expect(harness.activeTools).toEqual(["read", "bash"]);
+		await commandRequired(harness, "contribute").handler("status", harness.ctx);
+		expect(harness.notifications.at(-1)?.message).toBe("Contribution mode is off.");
+	});
+
+	it("aborts and drains a pending review confirmation before off settles", async () => {
+		const reviewConfirmEntered = Promise.withResolvers<void>();
+		const releaseReviewConfirm = Promise.withResolvers<void>();
+		let reviewConfirmSignal: AbortSignal | undefined;
+		const harness = createIntegrationHarness(cwd.path(), {
+			confirmAnswers: [true, true, true],
+			async onConfirm(_callNumber, title, signal) {
+				if (title !== "Push exact contribution candidate for review?") return;
+				reviewConfirmSignal = signal;
+				reviewConfirmEntered.resolve();
+				await releaseReviewConfirm.promise;
+			},
+		});
+		await startContribution(harness);
+		await prepareKeptContribution(harness, cwd.path());
+
+		let reviewSettled = false;
+		const reviewPromise = commandRequired(harness, "contribute")
+			.handler("review", harness.ctx)
+			.finally(() => {
+				reviewSettled = true;
+			});
+		await reviewConfirmEntered.promise;
+		let offSettled = false;
+		const offPromise = commandRequired(harness, "contribute")
+			.handler("off", harness.ctx)
+			.finally(() => {
+				offSettled = true;
+			});
+		for (let turn = 0; turn < 4; turn++) await Promise.resolve();
+		const reviewSettledBeforeRelease = reviewSettled;
+		const offSettledBeforeRelease = offSettled;
+		const reviewSignalDefinedBeforeRelease = reviewConfirmSignal !== undefined;
+		const reviewSignalAbortedBeforeRelease = reviewConfirmSignal?.aborted;
+
+		releaseReviewConfirm.resolve();
+		const [reviewResult, offResult] = await Promise.allSettled([reviewPromise, offPromise]);
+
+		expect(reviewSettledBeforeRelease).toBe(false);
+		expect(offSettledBeforeRelease).toBe(false);
+		expect(reviewSignalDefinedBeforeRelease).toBe(true);
+		expect(reviewSignalAbortedBeforeRelease).toBe(true);
+		expect(reviewResult.status).toBe("fulfilled");
+		expect(offResult.status).toBe("fulfilled");
+		expect(harness.pushes).toEqual([]);
 		await commandRequired(harness, "contribute").handler("status", harness.ctx);
 		expect(harness.notifications.at(-1)?.message).toBe("Contribution mode is off.");
 	});
