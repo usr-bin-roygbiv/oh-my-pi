@@ -76,6 +76,7 @@ export interface BenchCommandArgs {
 
 export interface BenchModelRegistry {
 	getAll(): Model<Api>[];
+	getAvailable(): Model<Api>[];
 	getApiKey(model: Model<Api>, sessionId?: string): Promise<string | undefined>;
 	resolver(model: ApiKeyResolverModel, sessionId?: string): ApiKeyResolver;
 	hasConfiguredAuth?(model: Model<Api>): boolean;
