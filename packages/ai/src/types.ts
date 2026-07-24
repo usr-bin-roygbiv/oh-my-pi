@@ -352,6 +352,16 @@ export interface CodexCompactionRequestContext extends CodexCompactionMetadata {
 	operationId: string;
 }
 
+/** OpenAI's GPT-5.6+ explicit prompt-cache controls. */
+export interface OpenAIPromptCacheOptions {
+	/** `explicit` disables OpenAI's automatic latest-message breakpoint. */
+	mode: "implicit" | "explicit";
+	/** The only currently supported minimum breakpoint lifetime. */
+	ttl?: "30m";
+	/** By default, mark one existing block from stable history; `none` suppresses that marker. */
+	breakpoint?: "latest-stable-message" | "none";
+}
+
 export interface StreamOptions {
 	temperature?: number;
 	topP?: number;
@@ -422,6 +432,12 @@ export interface StreamOptions {
 	 * `x-grok-conv-id`; when omitted, they fall back to `sessionId`.
 	 */
 	promptCacheKey?: string;
+	/**
+	 * OpenAI GPT-5.6+ prompt-cache policy. Ignored by providers that do not
+	 * support explicit OpenAI cache breakpoints; explicit mode fails locally on
+	 * incompatible OpenAI-compatible endpoints.
+	 */
+	promptCache?: OpenAIPromptCacheOptions;
 	/**
 	 * Provider-scoped mutable state store for this agent session.
 	 * Providers can use this to persist transport/session state between turns.

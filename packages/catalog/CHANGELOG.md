@@ -8,6 +8,7 @@
 - Added the native Meta Model API provider and Muse Spark 1.1 with Responses API reasoning replay, image input, and the full supported reasoning-effort ladder ([#4941](https://github.com/can1357/oh-my-pi/issues/4941)).
 - Added an opt-in Vercel AI Gateway automatic prompt-cache compatibility option alongside provider routing preferences.
 - Added Vercel AI Gateway Responses cache-anchor and cache-lifetime compatibility controls.
+- Added resolved OpenAI GPT-5.6 prompt-cache breakpoint capability metadata, keeping older models and compatible endpoints opt-in only.
 
 ## [17.0.9] - 2026-07-23
 

@@ -163,6 +163,16 @@ describe("pi-native parseRequest", () => {
 		expect(parsed.options.cacheRetention).toBe("long");
 	});
 
+	it("forwards the explicit prompt-cache policy through the canonical options bag", () => {
+		const parsed = parseRequest({
+			modelId: "gpt-5.6",
+			context: baseContext,
+			options: { promptCache: { mode: "explicit", ttl: "30m", breakpoint: "none" } },
+		});
+
+		expect(parsed.options.promptCache).toEqual({ mode: "explicit", ttl: "30m", breakpoint: "none" });
+	});
+
 	it("rejects missing required fields", () => {
 		expect(() => parseRequest({ context: baseContext })).toThrow(/modelId/);
 		expect(() => parseRequest({ modelId: "x" })).toThrow(/context/);

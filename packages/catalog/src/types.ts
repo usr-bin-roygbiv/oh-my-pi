@@ -306,6 +306,14 @@ export interface OpenAICompat {
 	promptCacheSessionHeader?: "x-grok-conv-id";
 	/** Whether chat-completions payloads should include provider-specific prompt-cache markers. */
 	cacheControlFormat?: "anthropic" | undefined;
+	/**
+	 * Whether this endpoint/model accepts OpenAI's explicit
+	 * `prompt_cache_breakpoint` content markers and `prompt_cache_options`.
+	 * Defaults to the exact first-party model generation allowlist.
+	 */
+	supportsPromptCacheBreakpoints?: boolean;
+	/** The only currently supported minimum lifetime for explicit OpenAI cache breakpoints. */
+	promptCacheBreakpointTtl?: "30m";
 	/** Whether the provider supports the `strict` field in tool definitions. Default: auto-detected per provider/baseUrl (conservative for unknown providers). */
 	supportsStrictMode?: boolean;
 	/**
@@ -554,6 +562,14 @@ export interface ResolvedOpenAISharedCompat {
 	emptyLengthFinishIsContextError: boolean;
 	usesOpenAIToolCallIdLimit: boolean;
 	promptCacheSessionHeader?: OpenAICompat["promptCacheSessionHeader"];
+	/**
+	 * Whether this model accepts explicit OpenAI prompt-cache breakpoints.
+	 * Built catalog models always materialize this false-by-default value;
+	 * optionality preserves hand-authored resolved compat fixtures.
+	 */
+	supportsPromptCacheBreakpoints?: boolean;
+	/** Minimum cache lifetime supported by explicit OpenAI prompt-cache breakpoints. */
+	promptCacheBreakpointTtl?: "30m";
 	/** The model sits behind OpenRouter (routing prefs and max-token omission apply). */
 	isOpenRouterHost: boolean;
 	/** Whether this endpoint needs a max-token field even when caller did not set one. */
@@ -610,6 +626,8 @@ export type ResolvedOpenAICompat = ResolvedOpenAISharedCompat &
 			| "emptyLengthFinishIsContextError"
 			| "usesOpenAIToolCallIdLimit"
 			| "promptCacheSessionHeader"
+			| "supportsPromptCacheBreakpoints"
+			| "promptCacheBreakpointTtl"
 			| "openRouterRouting"
 			| "isOpenRouterHost"
 			| "supportsStrictMode"
