@@ -1872,21 +1872,28 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 			} catch (err) {
 				return usage(`Failed to save pending settings: ${errorMessage(err)}`, runtime);
 			}
+			const previousCwd = runtime.sessionManager.getCwd();
+			let moved = false;
+			let moveError: unknown;
 			try {
-				const moved = await runtime.session.moveSession(resolvedPath);
-				if (!moved) return commandConsumed();
+				moved = await runtime.session.moveSession(resolvedPath);
 			} catch (err) {
-				return usage(`Move failed: ${errorMessage(err)}`, runtime);
+				moveError = err;
 			}
-			setProjectDir(resolvedPath);
-			await runtime.settings.reloadForCwd(resolvedPath);
+			const cwd = runtime.sessionManager.getCwd();
+			const committed = path.resolve(cwd) !== path.resolve(previousCwd);
+			if (moveError && !committed) return usage(`Move failed: ${errorMessage(moveError)}`, runtime);
+			if (!moved && !committed) return commandConsumed();
+			setProjectDir(cwd);
+			await runtime.settings.reloadForCwd(cwd);
 			applyProviderGlobalsFromSettings(runtime.settings);
 			// Reload plugin/capability caches so the next prompt sees commands and
 			// capabilities scoped to the new cwd.
 			await runtime.reloadPlugins();
 			await runtime.notifyConfigChanged?.();
 			await runtime.notifyTitleChanged?.();
-			await runtime.output(`Moved to ${runtime.sessionManager.getCwd()}.`);
+			if (moveError) return usage(`Move completed, but finalization failed: ${errorMessage(moveError)}`, runtime);
+			await runtime.output(`Moved to ${cwd}.`);
 			return commandConsumed();
 		},
 		handleTui: async (command, runtime) => {

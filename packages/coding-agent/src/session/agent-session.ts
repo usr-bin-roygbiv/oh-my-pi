@@ -6102,6 +6102,15 @@ export class AgentSession {
 
 	/** Move the active session and artifacts through the cancellable transition lifecycle. */
 	async moveSession(newCwd: string, targetSessionDir?: string): Promise<boolean> {
+		const resolvedCwd = path.resolve(newCwd);
+		const resolvedTargetDir = targetSessionDir ? path.resolve(targetSessionDir) : undefined;
+		if (
+			resolvedCwd === path.resolve(this.sessionManager.getCwd()) &&
+			(!resolvedTargetDir || resolvedTargetDir === path.resolve(this.sessionManager.getSessionDir()))
+		) {
+			return true;
+		}
+
 		this.#assertVibeSessionTransitionAllowed("move the session");
 		return this.#runSessionTransition("move", transition =>
 			this.#moveSession(newCwd, targetSessionDir, transition),
@@ -6123,15 +6132,32 @@ export class AgentSession {
 		}
 
 		const previousCwd = this.sessionManager.getCwd();
-		await this.sessionManager.moveTo(newCwd, targetSessionDir);
+		const previousSessionDir = this.sessionManager.getSessionDir();
+		let moveError: unknown;
+		try {
+			await this.sessionManager.moveTo(newCwd, targetSessionDir);
+		} catch (error) {
+			moveError = error;
+		}
+		const cwd = this.sessionManager.getCwd();
+		const sessionDir = this.sessionManager.getSessionDir();
+		if (
+			moveError &&
+			path.resolve(cwd) === path.resolve(previousCwd) &&
+			path.resolve(sessionDir) === path.resolve(previousSessionDir)
+		) {
+			throw moveError;
+		}
+
 		transition.committed = true;
 		if (this.#extensionRunner) {
 			await this.#extensionRunner.emit({
 				type: "session_move",
 				previousCwd,
-				cwd: this.sessionManager.getCwd(),
+				cwd,
 			});
 		}
+		if (moveError) throw moveError;
 		return true;
 	}
 

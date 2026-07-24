@@ -835,6 +835,15 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 		hold.release();
 	};
 
+	const deactivateOrdinaryAfterMove = async (ctx: ExtensionContext): Promise<void> => {
+		const runtime = getRuntime(ctx);
+		if (runtime.contribution.status !== "off" || !runtime.autoresearchMode) return;
+		runtime.ordinaryOwnerlessBranch = undefined;
+		setMode(ctx, false, runtime.goal, "off");
+		dashboard.updateWidget(ctx, runtime);
+		const experimentTools = new Set(EXPERIMENT_TOOL_NAMES);
+		await api.setActiveTools(api.getActiveTools().filter(name => !experimentTools.has(name)));
+	};
 	const captureMutationAuthorization = (ctx: ExtensionContext): AutoresearchMutationAuthorization => {
 		const sessionKey = getSessionKey(ctx);
 		if (mutationAdmissionClosed(sessionKey)) {
@@ -1946,6 +1955,7 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 	api.on("session_before_branch", (event, ctx) => beginSessionTransition(event, ctx));
 	api.on("session_before_tree", (event, ctx) => beginSessionTransition(event, ctx));
 	api.on("session_switch", (_event, ctx) => rehydrate(ctx));
+	api.on("session_move", (_event, ctx) => deactivateOrdinaryAfterMove(ctx));
 	api.on("session_branch", (_event, ctx) => rehydrate(ctx));
 	api.on("session_tree", (_event, ctx) => rehydrate(ctx));
 	api.on("session_transition_end", event => finishSessionTransition(event.transitionId));

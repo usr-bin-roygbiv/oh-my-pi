@@ -376,12 +376,13 @@ interface CommandOptions {
 	readonly maxOutputBytes?: number;
 	readonly readOnly?: boolean;
 	readonly signal?: AbortSignal;
-	readonly stdin?: string | Uint8Array | ArrayBuffer | SharedArrayBuffer;
+	readonly stdin?: string | Uint8Array | ArrayBuffer | SharedArrayBuffer | number;
 	readonly timeoutMs?: number;
 }
 
-function normalizeStdin(input: CommandOptions["stdin"]): "ignore" | Uint8Array {
+function normalizeStdin(input: CommandOptions["stdin"]): "ignore" | Uint8Array | number {
 	if (input === undefined) return "ignore";
+	if (typeof input === "number") return input;
 	if (typeof input === "string") return new TextEncoder().encode(input);
 	if (input instanceof Uint8Array) return input;
 	return new Uint8Array(input);
@@ -1436,12 +1437,190 @@ export async function writeTree(cwd: string, options: Pick<CommandOptions, "env"
 	return (await runText(cwd, ["write-tree"], options)).trim();
 }
 
-/** Materialize the current tracked and untracked worktree bytes as an immutable tree without touching real Git state. */
+const WORKTREE_TREE_RECORD_LIMIT_BYTES = 1024 * 1024;
+const WORKTREE_TREE_INDEX_BATCH_BYTES = 1024 * 1024;
+
+async function runGitToFile(
+	cwd: string,
+	args: readonly string[],
+	outputPath: string,
+	options: Pick<CommandOptions, "env" | "signal">,
+): Promise<void> {
+	ensureAvailable();
+	const commandArgs = withShortLivedGitConfig(withNoOptionalLocks(args));
+	const output = await fs.promises.open(outputPath, "wx");
+	try {
+		const child = Bun.spawn(["git", ...commandArgs], {
+			cwd,
+			env: buildGitEnv(options.env),
+			signal: options.signal,
+			stdin: "ignore",
+			stdout: output.fd,
+			stderr: "pipe",
+			windowsHide: true,
+		});
+		const stderrStream = child.stderr;
+		if (!(stderrStream instanceof ReadableStream)) throw new Error("Failed to capture git command stderr.");
+		const stderrPromise = readCappedText(stderrStream, GIT_COMMAND_OUTPUT_LIMIT_BYTES);
+		const exit = await waitForExitWithTimeout(child, formatCommandLabel("git", commandArgs), GIT_COMMAND_TIMEOUT_MS);
+		if (exit.timedOut) {
+			void stderrPromise.catch(() => undefined);
+			await cancelOutput(stderrStream);
+			throw new GitCommandError(args, {
+				exitCode: GIT_COMMAND_TIMEOUT_EXIT_CODE,
+				stdout: "",
+				stderr: exit.stderr,
+			});
+		}
+		const stderr = await stderrPromise;
+		if (exit.exitCode !== 0) {
+			throw new GitCommandError(args, { exitCode: exit.exitCode ?? 0, stdout: "", stderr });
+		}
+	} finally {
+		await output.close();
+	}
+}
+
+async function* readNulRecords(filePath: string): AsyncGenerator<Buffer> {
+	let pending = Buffer.alloc(0);
+	for await (const value of fs.createReadStream(filePath)) {
+		const chunk = typeof value === "string" ? Buffer.from(value) : value;
+		let start = 0;
+		for (let separator = chunk.indexOf(0, start); separator >= 0; separator = chunk.indexOf(0, start)) {
+			const suffix = chunk.subarray(start, separator);
+			const record = pending.length === 0 ? suffix : Buffer.concat([pending, suffix]);
+			if (record.length === 0 || record.length > WORKTREE_TREE_RECORD_LIMIT_BYTES) {
+				throw new Error("Git returned an invalid worktree path record.");
+			}
+			yield record;
+			pending = Buffer.alloc(0);
+			start = separator + 1;
+		}
+		if (start < chunk.length) {
+			const suffix = chunk.subarray(start);
+			if (pending.length + suffix.length > WORKTREE_TREE_RECORD_LIMIT_BYTES) {
+				throw new Error("Git returned an oversized worktree path record.");
+			}
+			pending = pending.length === 0 ? Buffer.from(suffix) : Buffer.concat([pending, suffix]);
+		}
+	}
+	if (pending.length !== 0) throw new Error("Git returned an unterminated worktree path listing.");
+}
+
+function validateGitRelativePath(relativePath: Buffer): void {
+	if (relativePath.length === 0 || relativePath[0] === 0x2f || relativePath.at(-1) === 0x2f) {
+		throw new Error("Git returned an invalid worktree path.");
+	}
+	let segmentStart = 0;
+	for (let index = 0; index <= relativePath.length; index++) {
+		if (index !== relativePath.length && relativePath[index] !== 0x2f) continue;
+		const segment = relativePath.subarray(segmentStart, index);
+		if (
+			segment.length === 0 ||
+			(segment.length === 1 && segment[0] === 0x2e) ||
+			(segment.length === 2 && segment[0] === 0x2e && segment[1] === 0x2e)
+		) {
+			throw new Error("Git returned an unsafe worktree path.");
+		}
+		segmentStart = index + 1;
+	}
+}
+
+function decodeGitPath(relativePath: Buffer): string {
+	try {
+		return new TextDecoder("utf-8", { fatal: true }).decode(relativePath);
+	} catch {
+		throw new Error("Cannot inspect a submodule whose path is not valid UTF-8.");
+	}
+}
+
+function absoluteGitPath(repositoryRoot: string, relativePath: Buffer): string | Buffer {
+	if (process.platform === "win32") {
+		const decoded = decodeGitPath(relativePath);
+		if (decoded.includes("\\") || path.isAbsolute(decoded)) throw new Error("Git returned an unsafe worktree path.");
+		return path.join(repositoryRoot, decoded);
+	}
+	return Buffer.concat([Buffer.from(repositoryRoot), Buffer.from("/"), relativePath]);
+}
+
+type WorktreeSnapshotEntry = {
+	absolutePath: string | Buffer;
+	relativePath: Buffer;
+	stat: fs.Stats;
+};
+
+async function inspectWorktreePath(
+	repositoryRoot: string,
+	relativePath: Buffer,
+	replacedParents: Set<string>,
+): Promise<WorktreeSnapshotEntry | null> {
+	validateGitRelativePath(relativePath);
+	for (let index = 0; index <= relativePath.length; index++) {
+		if (index !== relativePath.length && relativePath[index] !== 0x2f) continue;
+		const prefix = relativePath.subarray(0, index);
+		const prefixKey = prefix.toString("hex");
+		if (replacedParents.has(prefixKey)) return null;
+		let entryStat: fs.Stats;
+		try {
+			entryStat = await fs.promises.lstat(absoluteGitPath(repositoryRoot, prefix));
+		} catch (err) {
+			if (isEnoent(err) || isEnotdir(err)) return null;
+			throw err;
+		}
+		if (index === relativePath.length || entryStat.isDirectory()) continue;
+		replacedParents.add(prefixKey);
+		return { absolutePath: absoluteGitPath(repositoryRoot, prefix), relativePath: Buffer.from(prefix), stat: entryStat };
+	}
+	const absolutePath = absoluteGitPath(repositoryRoot, relativePath);
+	return { absolutePath, relativePath, stat: await fs.promises.lstat(absolutePath) };
+}
+
+function parseObjectId(output: string, kind: "blob" | "submodule" | "tree"): string {
+	const objectId = output.trim();
+	if (!/^[0-9a-f]{40,64}$/.test(objectId)) throw new Error(`Git returned an invalid ${kind} object id.`);
+	return objectId;
+}
+
+async function hashWorktreeFile(
+	repositoryRoot: string,
+	absolutePath: string | Buffer,
+	env: Record<string, string>,
+	signal?: AbortSignal,
+): Promise<{ mode: "100644" | "100755"; objectId: string }> {
+	const noFollow = fs.constants.O_NOFOLLOW ?? 0;
+	const file = await fs.promises.open(absolutePath, fs.constants.O_RDONLY | noFollow);
+	try {
+		const fileStat = await file.stat();
+		if (!fileStat.isFile()) throw new Error("Worktree entry changed while it was being snapshotted.");
+		const objectId = parseObjectId(
+			await runText(repositoryRoot, ["hash-object", "-w", "--no-filters", "--stdin"], {
+				env,
+				signal,
+				stdin: file.fd,
+			}),
+			"blob",
+		);
+		return { mode: (fileStat.mode & 0o100) === 0 ? "100644" : "100755", objectId };
+	} finally {
+		await file.close();
+	}
+}
+
+/** Materialize current tracked and non-ignored untracked bytes without touching real Git state or filters. */
 export async function writeWorktreeTree(cwd: string, signal?: AbortSignal): Promise<string> {
+	let cwdStat: fs.Stats;
+	try {
+		cwdStat = await fs.promises.stat(cwd);
+	} catch (err) {
+		throw new Error(`Working directory does not exist: ${cwd}`, { cause: err });
+	}
+	if (!cwdStat.isDirectory()) throw new Error(`Working directory is not a directory: ${cwd}`);
 	const repository = await resolveRepository(cwd);
 	if (!repository) throw new Error("Not a Git repository.");
 	const temporaryRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), "omp-worktree-tree-"));
 	const temporaryObjectDirectory = path.join(temporaryRoot, "objects");
+	const stagedListing = path.join(temporaryRoot, "staged");
+	const candidateListing = path.join(temporaryRoot, "candidates");
 	const env = {
 		GIT_INDEX_FILE: path.join(temporaryRoot, "index"),
 		GIT_OBJECT_DIRECTORY: temporaryObjectDirectory,
@@ -1450,82 +1629,128 @@ export async function writeWorktreeTree(cwd: string, signal?: AbortSignal): Prom
 	try {
 		await fs.promises.mkdir(temporaryObjectDirectory);
 		await runEffect(repository.repoRoot, ["--no-replace-objects", "read-tree", "HEAD"], { env, signal });
-		const stagedOutput = await runText(repository.repoRoot, ["ls-files", "--stage", "--full-name", "-z"], {
+		await runGitToFile(repository.repoRoot, ["ls-files", "--stage", "--full-name", "-z"], stagedListing, {
 			env,
-			readOnly: true,
 			signal,
 		});
-		const candidateOutput = await runText(
+		await runGitToFile(
 			repository.repoRoot,
 			["ls-files", "--cached", "--others", "--exclude-standard", "--full-name", "-z"],
-			{ env, readOnly: true, signal },
+			candidateListing,
+			{ env, signal },
 		);
-		const trackedEntries = new Map<string, { mode: string; objectId: string }>();
-		for (const record of stagedOutput.split("\0")) {
-			if (!record) continue;
-			const separator = record.indexOf("\t");
+
+		const stagedRecords = readNulRecords(stagedListing)[Symbol.asyncIterator]();
+		type TrackedEntry = { relativePath: Buffer; mode: string; objectId: string };
+		const readTrackedEntry = async (): Promise<TrackedEntry | null> => {
+			const next = await stagedRecords.next();
+			if (next.done) return null;
+			const separator = next.value.indexOf(0x09);
 			if (separator < 0) throw new Error("Git returned an invalid index entry.");
-			const [mode, objectId, stage] = record.slice(0, separator).split(" ");
-			if (!mode || !objectId || stage !== "0" || !/^[0-9a-f]{40,64}$/.test(objectId)) {
-				throw new Error("Git returned an invalid index entry.");
+			const header = next.value.subarray(0, separator).toString("ascii");
+			const match = /^(100644|100755|120000|160000) ([0-9a-f]{40,64}) 0$/.exec(header);
+			if (!match?.[1] || !match[2]) throw new Error("Git returned an invalid index entry.");
+			const relativePath = next.value.subarray(separator + 1);
+			validateGitRelativePath(relativePath);
+			return { relativePath, mode: match[1], objectId: match[2] };
+		};
+		let nextTrackedEntry = await readTrackedEntry();
+		const findTrackedEntry = async (relativePath: Buffer): Promise<TrackedEntry | undefined> => {
+			while (nextTrackedEntry && Buffer.compare(nextTrackedEntry.relativePath, relativePath) < 0) {
+				nextTrackedEntry = await readTrackedEntry();
 			}
-			trackedEntries.set(record.slice(separator + 1), { mode, objectId });
-		}
-
-		const indexEntries: string[] = [];
-		for (const relativePath of candidateOutput.split("\0")) {
-			if (!relativePath) continue;
-			throwIfAborted(signal);
-			const absolutePath = path.join(repository.repoRoot, relativePath);
-			let entryStat: fs.Stats;
-			try {
-				entryStat = await fs.promises.lstat(absolutePath);
-			} catch (err) {
-				if (isEnoent(err) || isEnotdir(err)) continue;
-				throw err;
-			}
-
-			const trackedEntry = trackedEntries.get(relativePath);
-			if (entryStat.isDirectory()) {
-				if (trackedEntry?.mode === "160000") {
-					indexEntries.push(`160000 ${trackedEntry.objectId}\t${relativePath}\0`);
-				}
-				continue;
-			}
-
-			let mode: "100644" | "100755" | "120000";
-			let contents: Uint8Array;
-			if (entryStat.isSymbolicLink()) {
-				mode = "120000";
-				contents = await fs.promises.readlink(absolutePath, { encoding: "buffer" });
-			} else if (entryStat.isFile()) {
-				mode = (entryStat.mode & 0o111) === 0 ? "100644" : "100755";
-				contents = await fs.promises.readFile(absolutePath);
-			} else {
-				throw new Error(`Cannot snapshot unsupported filesystem entry: ${relativePath}`);
-			}
-			const objectId = (
-				await runText(repository.repoRoot, ["hash-object", "-w", "--no-filters", "--stdin"], {
-					env,
-					signal,
-					stdin: contents,
-				})
-			).trim();
-			if (!/^[0-9a-f]{40,64}$/.test(objectId)) throw new Error("Git returned an invalid blob object id.");
-			indexEntries.push(`${mode} ${objectId}\t${relativePath}\0`);
-		}
+			return nextTrackedEntry && Buffer.compare(nextTrackedEntry.relativePath, relativePath) === 0
+				? nextTrackedEntry
+				: undefined;
+		};
+		const trustFileMode =
+			(await tryText(repository.repoRoot, ["config", "--type=bool", "--get", "core.fileMode"], {
+				readOnly: true,
+				signal,
+			}))?.trim() !== "false";
+		const useFilesystemSymlinks =
+			(await tryText(repository.repoRoot, ["config", "--type=bool", "--get", "core.symlinks"], {
+				readOnly: true,
+				signal,
+			}))?.trim() !== "false";
 
 		await runEffect(repository.repoRoot, ["read-tree", "--empty"], { env, signal });
-		if (indexEntries.length > 0) {
+		const replacedParents = new Set<string>();
+		let indexBatch: Buffer[] = [];
+		let indexBatchBytes = 0;
+		const flushIndexBatch = async (): Promise<void> => {
+			if (indexBatchBytes === 0) return;
 			await runEffect(repository.repoRoot, ["update-index", "--add", "-z", "--index-info"], {
 				env,
 				signal,
-				stdin: indexEntries.join(""),
+				stdin: Buffer.concat(indexBatch, indexBatchBytes),
 			});
+			indexBatch = [];
+			indexBatchBytes = 0;
+		};
+		const appendIndexEntry = async (mode: string, objectId: string, relativePath: Buffer): Promise<void> => {
+			const entry = Buffer.concat([Buffer.from(`${mode} ${objectId}\t`), relativePath, Buffer.from([0])]);
+			if (indexBatchBytes > 0 && indexBatchBytes + entry.length > WORKTREE_TREE_INDEX_BATCH_BYTES) {
+				await flushIndexBatch();
+			}
+			indexBatch.push(entry);
+			indexBatchBytes += entry.length;
+		};
+
+		try {
+			for await (const relativePath of readNulRecords(candidateListing)) {
+				throwIfAborted(signal);
+				const candidateTrackedEntry = await findTrackedEntry(relativePath);
+				const entry = await inspectWorktreePath(repository.repoRoot, relativePath, replacedParents);
+				if (!entry) continue;
+				const trackedEntry = entry.relativePath.equals(relativePath) ? candidateTrackedEntry : undefined;
+			if (entry.stat.isDirectory()) {
+				if (trackedEntry?.mode !== "160000") continue;
+				const submodulePath = path.join(repository.repoRoot, decodeGitPath(entry.relativePath));
+				const submoduleRepository = await resolveRepository(submodulePath);
+				const objectId =
+					submoduleRepository && path.resolve(submoduleRepository.repoRoot) === path.resolve(submodulePath)
+						? parseObjectId(
+								await runText(submodulePath, ["--no-replace-objects", "rev-parse", "--verify", "HEAD^{commit}"], {
+									readOnly: true,
+									signal,
+								}),
+								"submodule",
+							)
+						: trackedEntry.objectId;
+				await appendIndexEntry("160000", objectId, entry.relativePath);
+				continue;
+			}
+			if (entry.stat.isSymbolicLink()) {
+				const contents = await fs.promises.readlink(entry.absolutePath, { encoding: "buffer" });
+				const objectId = parseObjectId(
+					await runText(repository.repoRoot, ["hash-object", "-w", "--no-filters", "--stdin"], {
+						env,
+						signal,
+						stdin: contents,
+					}),
+					"blob",
+				);
+				await appendIndexEntry("120000", objectId, entry.relativePath);
+				continue;
+			}
+			if (!entry.stat.isFile()) {
+				throw new Error(`Cannot snapshot unsupported filesystem entry: ${entry.relativePath.toString("hex")}`);
+			}
+			const hashed = await hashWorktreeFile(repository.repoRoot, entry.absolutePath, env, signal);
+			const mode =
+				!useFilesystemSymlinks && trackedEntry?.mode === "120000"
+					? "120000"
+					: !trustFileMode && (trackedEntry?.mode === "100644" || trackedEntry?.mode === "100755")
+						? trackedEntry.mode
+						: hashed.mode;
+				await appendIndexEntry(mode, hashed.objectId, entry.relativePath);
+			}
+		} finally {
+			await stagedRecords.return?.();
 		}
-		const treeSha = (await runText(repository.repoRoot, ["write-tree"], { env, signal })).trim();
-		if (!/^[0-9a-f]{40,64}$/.test(treeSha)) throw new Error("Git returned an invalid worktree tree object id.");
-		return treeSha;
+		await flushIndexBatch();
+		return parseObjectId(await runText(repository.repoRoot, ["write-tree"], { env, signal }), "tree");
 	} finally {
 		await fs.promises.rm(temporaryRoot, { force: true, recursive: true });
 	}

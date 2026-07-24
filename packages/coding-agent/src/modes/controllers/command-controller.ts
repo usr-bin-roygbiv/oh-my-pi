@@ -13,7 +13,7 @@ import {
 import { Loader, Markdown, padding, Spacer, Text, visibleWidth } from "@oh-my-pi/pi-tui";
 import { formatDuration, Snowflake, sanitizeText } from "@oh-my-pi/pi-utils";
 import { shouldEnableAppendOnlyContext } from "../../config/append-only-context-mode";
-import { type BashResult, isPersistentShellCdCommand } from "../../exec/bash-executor";
+import { type BashResult, isPersistentShellCdCommand, quoteShellArg } from "../../exec/bash-executor";
 import { type LoadedCustomShare, loadCustomShare } from "../../export/custom-share";
 import { parseExportArgs } from "../../export/html/args";
 import { shareSession } from "../../export/share";
@@ -1073,16 +1073,17 @@ export class CommandController {
 		}
 
 		try {
-			const moved = await this.ctx.session.moveSession(resolvedPath);
+			const moved = await this.#moveInteractiveCwd(resolvedPath);
 			if (!moved) return;
 		} catch (err) {
-			this.ctx.showError(`Move failed: ${err instanceof Error ? err.message : String(err)}`);
+			const committed = path.resolve(this.ctx.sessionManager.getCwd()) !== path.resolve(cwd);
+			this.ctx.showError(
+				`${committed ? "Move completed, but finalization failed" : "Move failed"}: ${
+					err instanceof Error ? err.message : String(err)
+				}`,
+			);
 			return;
 		}
-		await this.ctx.applyCwdChange(resolvedPath);
-
-		this.ctx.updateEditorBorderColor();
-		await this.ctx.reloadTodos();
 		this.ctx.ui.requestRender();
 
 		this.ctx.present([
@@ -1160,12 +1161,24 @@ export class CommandController {
 		this.ctx.ui.requestRender();
 	}
 
-	async #moveInteractiveCwd(resolvedPath: string): Promise<void> {
-		const moved = await this.ctx.session.moveSession(resolvedPath);
-		if (!moved) return;
-		await this.ctx.applyCwdChange(resolvedPath);
+	async #moveInteractiveCwd(resolvedPath: string): Promise<boolean> {
+		const previousCwd = this.ctx.sessionManager.getCwd();
+		let moved = false;
+		let moveError: unknown;
+		try {
+			moved = await this.ctx.session.moveSession(resolvedPath);
+		} catch (error) {
+			moveError = error;
+		}
+		const cwd = this.ctx.sessionManager.getCwd();
+		const committed = path.resolve(cwd) !== path.resolve(previousCwd);
+		if (moveError && !committed) throw moveError;
+		if (!moved && !committed) return false;
+		await this.ctx.applyCwdChange(cwd);
 		this.ctx.updateEditorBorderColor();
 		await this.ctx.reloadTodos();
+		if (moveError) throw moveError;
+		return true;
 	}
 
 	async #applyBashResultCwd(result: BashResult): Promise<void> {
@@ -1173,7 +1186,8 @@ export class CommandController {
 		if (!path.isAbsolute(result.workingDir)) return;
 
 		const resolvedPath = path.resolve(result.workingDir);
-		if (resolvedPath === path.resolve(this.ctx.sessionManager.getCwd())) return;
+		const sourceCwd = path.resolve(this.ctx.sessionManager.getCwd());
+		if (resolvedPath === sourceCwd) return;
 
 		let isDirectory = false;
 		try {
@@ -1183,7 +1197,20 @@ export class CommandController {
 		}
 		if (!isDirectory) return;
 
-		await this.#moveInteractiveCwd(resolvedPath);
+		if (await this.#moveInteractiveCwd(resolvedPath)) return;
+		const restoreResult = await this.ctx.session.executeBash(
+			`cd -- ${quoteShellArg(sourceCwd)}`,
+			undefined,
+			{ excludeFromContext: true, useUserShell: true },
+		);
+		if (
+			restoreResult.cancelled ||
+			restoreResult.exitCode !== 0 ||
+			!restoreResult.workingDir ||
+			path.resolve(restoreResult.workingDir) !== sourceCwd
+		) {
+			throw new Error(`Session move was cancelled and the shell could not restore ${sourceCwd}.`);
+		}
 	}
 
 	async handlePythonCommand(code: string, excludeFromContext = false): Promise<void> {
