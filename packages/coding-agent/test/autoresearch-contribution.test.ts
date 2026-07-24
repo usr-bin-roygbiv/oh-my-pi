@@ -4674,7 +4674,7 @@ describe("process-local contribution lifecycle", () => {
 			),
 		)
 			.then(result => {
-				transitionResult = result;
+				transitionResult = result ?? undefined;
 			})
 			.finally(() => {
 				transitionSettled = true;
