@@ -46,7 +46,7 @@ omp config set computer.enabled true
 omp config get computer.enabled
 ```
 
-Inside a running session, the `/computer` slash command (`/computer`, `/computer on|off|status`) toggles the tool for that session only; it never writes settings files. Backend, display, and image-size settings still snapshot when the session's desktop controller is created, so change those in config and start a new session.
+Inside a running session, the `/computer` slash command (`/computer`, `/computer on|off|status`) toggles the tool for that session only; it never writes settings files. `/computer status` reports the effective enabled/active state, backend, display and capture limits, active model, and whether that model receives native or function exposure. Explicit enablement and the desktop controller stay active across model switches; exposure is recomputed for the new model. Backend, display, and image-size settings still snapshot when the session's desktop controller is created, so change those in config and start a new session.
 
 ### Settings
 
@@ -81,6 +81,7 @@ Codex subscription endpoints and custom or proxy routes do not infer native supp
 Natively capable OpenAI Responses routes may receive a forced `{ "type": "computer" }` choice. Function-tool fallback forcing is provider-specific: OpenAI/Ollama use a named function, Anthropic/Bedrock use a named tool, Google uses required-tool mode, and adapters without a forcing form keep provider-default selection. Responses Lite moves tools into `additional_tools`; for an explicitly forced computer declaration it sends only that declaration and uses `tool_choice: "required"`, preserving both selection and forcing without an invalid object choice that refers to removed top-level tools.
 
 When a session switches from a native-capable API route to a subscription or proxy route, prior native computer history is converted to a representation the target accepts. Codex subscription requests replay it as named `computer` function calls and results, then declare the next computer call as the same named function. Other non-native OpenAI Responses-family targets may use stable assistant text notes; other provider adapters use their ordinary tool format.
+While the tool is active, the system prompt makes host-desktop routing explicit even for compact native-tool inventories: desktop requests must use `computer`, and every successful action must be followed by inspection of its fresh screenshot before the next action. This does not auto-enable the tool, bypass approval, or prevent a user-requested alternative after a computer error.
 
 If the tool never appears:
 
