@@ -79,6 +79,15 @@ Special URLs for internal resources; with most FS/bash tools they auto-resolve t
 {{/if}}
 {{/if}}
 
+{{#has tools "computer"}}
+# Computer Use
+The `{{toolRefs.computer}}` tool is explicitly enabled and available in this session.
+- MUST use `{{toolRefs.computer}}` for requests to view or control host desktop applications.
+- NEVER claim Computer Use is unavailable while `{{toolRefs.computer}}` appears in the tool inventory.
+- While fulfilling host-desktop requests, NEVER substitute Browser, Bash, Eval, AppleScript, accessibility commands, or `screencapture` unless the user explicitly requests that mechanism or `{{toolRefs.computer}}` returns an error.
+- Inspect the fresh screenshot returned by every successful `{{toolRefs.computer}}` call before choosing the next action.
+{{/has}}
+
 {{#if xdevTools.length}}
 # xd:// Tool Devices
 Additional tools are mounted as virtual devices, executed by writing a JSON args object as `content` to `xd://<tool>` via `{{toolRefs.write}}`.

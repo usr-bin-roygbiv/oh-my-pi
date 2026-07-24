@@ -1,5 +1,5 @@
 import type { DesktopAction, DesktopCapabilities, DesktopCapture, DesktopSessionOptions } from "@oh-my-pi/pi-natives";
-import { withTimeout, workerHostEntry } from "@oh-my-pi/pi-utils";
+import { logger, withTimeout, workerHostEntry } from "@oh-my-pi/pi-utils";
 import { ToolAbortError, ToolError } from "../tool-errors";
 import {
 	COMPUTER_WORKER_ARG,
@@ -138,11 +138,23 @@ export class ComputerSupervisor implements ComputerController {
 		if (this.#startPromise) return this.#startPromise;
 		const ready = Promise.withResolvers<void>();
 		try {
+			logger.debug("Starting native computer worker", {
+				backend: this.options.backend,
+				display: this.options.display,
+				maxWidth: this.options.maxWidth,
+				maxHeight: this.options.maxHeight,
+			});
 			const worker = this.createWorker();
 			this.#worker = worker;
 			this.#unsubscribeMessage = worker.onMessage(message => {
 				if (message.type === "ready") {
 					this.#capabilities = message.capabilities;
+					logger.debug("Native computer worker ready", {
+						backend: message.capabilities.backend,
+						capturePermission: message.capabilities.capturePermission,
+						inputPermission: message.capabilities.inputPermission,
+						displayCount: message.capabilities.displayCount,
+					});
 					ready.resolve();
 					return;
 				}
@@ -151,10 +163,22 @@ export class ComputerSupervisor implements ComputerController {
 					const pending = this.#pending.get(message.id);
 					this.#pending.delete(message.id);
 					pending?.resolve(message.capture);
+					logger.debug("Native computer capture completed", {
+						requestId: message.id,
+						backend: message.capture.backend,
+						capturePermission: message.capture.capturePermission,
+						inputPermission: message.capture.inputPermission,
+						width: message.capture.width,
+						height: message.capture.height,
+					});
 					return;
 				}
 				if (message.type === "error") {
 					const error = workerError(message.error);
+					logger.warn("Native computer worker request failed", {
+						requestId: message.id,
+						errorName: message.error.name,
+					});
 					if (message.id) {
 						const pending = this.#pending.get(message.id);
 						this.#pending.delete(message.id);
@@ -184,6 +208,9 @@ export class ComputerSupervisor implements ComputerController {
 	}
 
 	async #terminate(reason: unknown): Promise<void> {
+		logger.debug("Terminating native computer worker", {
+			reason: reason instanceof Error ? reason.name : typeof reason,
+		});
 		const worker = this.#worker;
 		this.#worker = undefined;
 		this.#startPromise = undefined;

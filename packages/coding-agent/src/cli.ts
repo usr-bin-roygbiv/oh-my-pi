@@ -28,8 +28,8 @@ import { declareWorkerHostEntry, installWorkerInbox } from "@oh-my-pi/pi-utils/w
 import { installProfileAlias, resolveProfileAliasCommandFromProcess } from "./cli/profile-alias";
 import { extractProfileFlags } from "./cli/profile-bootstrap";
 import { DAEMON_BROKER_WORKER_ARG } from "./launch/protocol";
-import { startComputerWorker } from "./tools/computer/worker-entry";
 import { smokeTestComputerWorker } from "./tools/computer/supervisor";
+import { startComputerWorker } from "./tools/computer/worker-entry";
 
 if (Bun.semver.order(Bun.version, MIN_BUN_VERSION) < 0) {
 	process.stderr.write(

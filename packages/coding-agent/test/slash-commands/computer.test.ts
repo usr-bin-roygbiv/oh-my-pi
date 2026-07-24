@@ -2,20 +2,50 @@ import { describe, expect, it, vi } from "bun:test";
 import { executeAcpBuiltinSlashCommand } from "@oh-my-pi/pi-coding-agent/slash-commands/acp-builtins";
 import type { SlashCommandRuntime } from "@oh-my-pi/pi-coding-agent/slash-commands/types";
 
-function acpRuntime(options?: { enabled?: boolean; applyResult?: boolean }) {
-	const store = { "computer.enabled": options?.enabled ?? false };
+function acpRuntime(options?: {
+	enabled?: boolean;
+	applyResult?: boolean;
+	supportsComputerUse?: boolean;
+	codex?: boolean;
+}) {
+	const store = {
+		"computer.enabled": options?.enabled ?? false,
+		"computer.backend": "auto",
+		"computer.display": "all",
+		"computer.maxWidth": 1920,
+		"computer.maxHeight": 1200,
+	};
 	const get = vi.fn((path: string) => store[path as keyof typeof store]);
 	const override = vi.fn((path: string, value: boolean) => {
-		store[path as keyof typeof store] = value;
+		if (path === "computer.enabled") store[path] = value;
 	});
 	const set = vi.fn();
 	const setComputerToolEnabled = vi.fn(async () => options?.applyResult ?? true);
+	const getEnabledToolNames = vi.fn(() => (store["computer.enabled"] ? ["computer"] : []));
 	const output = vi.fn();
+	const model = options?.codex
+		? {
+				provider: "openai-codex",
+				id: "gpt-5.6-sol",
+				api: "openai-codex-responses",
+				supportsComputerUse: options.supportsComputerUse ?? false,
+			}
+		: {
+				provider: "google",
+				id: "gemini-2.5-flash",
+				api: "google-generative-ai",
+				supportsComputerUse: options?.supportsComputerUse ?? false,
+			};
 	const runtime = {
-		session: { settings: { get, override, set }, setComputerToolEnabled },
+		session: {
+			settings: { get, override, set },
+			setComputerToolEnabled,
+			getEnabledToolNames,
+			model,
+		},
 		output,
 	} as unknown as SlashCommandRuntime;
-	return { get, override, set, setComputerToolEnabled, output, runtime };
+	return { get, override, set, setComputerToolEnabled, getEnabledToolNames, output, runtime };
 }
 
 describe("/computer slash command", () => {
@@ -28,7 +58,9 @@ describe("/computer slash command", () => {
 		expect(h.setComputerToolEnabled).toHaveBeenCalledWith(true);
 		expect(h.override).toHaveBeenCalledWith("computer.enabled", true);
 		expect(h.set).not.toHaveBeenCalled();
-		expect(h.output).toHaveBeenCalledWith("Computer use enabled for this session.");
+		expect(h.output).toHaveBeenCalledWith(
+			"Computer use enabled for this session. Computer use: enabled · tool: active · backend: auto · display: all · capture: 1920×1200 · model: google/gemini-2.5-flash · exposure: function",
+		);
 	});
 
 	it("toggles an enabled session off", async () => {
@@ -60,7 +92,29 @@ describe("/computer slash command", () => {
 
 		expect(h.setComputerToolEnabled).not.toHaveBeenCalled();
 		expect(h.override).not.toHaveBeenCalled();
-		expect(h.output).toHaveBeenCalledWith("Computer use is on.");
+		expect(h.output).toHaveBeenCalledWith(
+			"Computer use: enabled · tool: active · backend: auto · display: all · capture: 1920×1200 · model: google/gemini-2.5-flash · exposure: function",
+		);
+	});
+
+	it("reports subscription Codex computer exposure as a callable function", async () => {
+		const h = acpRuntime({ enabled: true, codex: true });
+
+		await executeAcpBuiltinSlashCommand("/computer status", h.runtime);
+
+		expect(h.output).toHaveBeenCalledWith(
+			"Computer use: enabled · tool: active · backend: auto · display: all · capture: 1920×1200 · model: openai-codex/gpt-5.6-sol · exposure: function",
+		);
+	});
+
+	it("reports explicit Codex native opt-in without masking the override", async () => {
+		const h = acpRuntime({ enabled: true, codex: true, supportsComputerUse: true });
+
+		await executeAcpBuiltinSlashCommand("/computer status", h.runtime);
+
+		expect(h.output).toHaveBeenCalledWith(
+			"Computer use: enabled · tool: active · backend: auto · display: all · capture: 1920×1200 · model: openai-codex/gpt-5.6-sol · exposure: native",
+		);
 	});
 
 	it("leaves the override untouched when the session cannot build the tool", async () => {
