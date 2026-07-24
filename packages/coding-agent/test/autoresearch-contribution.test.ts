@@ -981,6 +981,39 @@ describe("contribution fork validation and publication", () => {
 		expect(draft.body.match(/\bEMPTY\b/g)?.length ?? 0).toBeGreaterThanOrEqual(3);
 	});
 
+	it("rejects remote names that cannot survive durable publication recovery", async () => {
+		let authorizeCalls = 0;
+		let pushCalls = 0;
+		await expectContributionError(
+			publishContributionCandidate({
+				cwd: "/work/repo",
+				remoteName: "r".repeat(101),
+				confirmedRemoteUrl: FORK_URL,
+				confirmedPushRemoteUrl: FORK_URL,
+				branchName: CONTRIBUTION_BRANCH,
+				currentBranch: CONTRIBUTION_BRANCH,
+				worktreeClean: true,
+				goal: makeGoal(),
+				candidate: makeCandidate(),
+				currentSegment: 2,
+				currentHead: CURRENT_HEAD,
+				baseProof: makeBaseProof(),
+				approvedDraft: makeApprovedDraft(),
+				authorizePush: async () => {
+					authorizeCalls++;
+				},
+				git: makePublicationGit({
+					push: async () => {
+						pushCalls++;
+					},
+				}),
+				request: async () => ({ fork: true, parent: "can1357/oh-my-pi", source: "can1357/oh-my-pi" }),
+			}),
+			"remote_invalid",
+		);
+		expect({ authorizeCalls, pushCalls }).toEqual({ authorizeCalls: 0, pushCalls: 0 });
+	});
+
 	it("re-reads the exact fork URL, verifies ancestry, and pushes only the frozen candidate SHA", async () => {
 		const calls: string[] = [];
 		const pushes: Array<{
@@ -4498,6 +4531,110 @@ describe("process-local contribution lifecycle", () => {
 		expect(harness.confirmCalls).toEqual([
 			expect.objectContaining({ title: "Inspect official contribution prerequisites?" }),
 		]);
+		expect(harness.githubEndpoints).toEqual([]);
+		expect(harness.setModelCalls).toEqual([]);
+		expect(harness.checkoutNewCalls).toEqual([]);
+		expect(harness.activeTools).toEqual(initialTools);
+		expect(harness.appendEntries).toEqual([]);
+		expect(harness.sentUserMessages).toEqual([]);
+		expect(snapshotStorageArtifacts(dbDir.path())).toEqual([]);
+	});
+
+	it("invalidates a pending first contribution confirmation before off returns", async () => {
+		const preflightEntered = Promise.withResolvers<void>();
+		const releasePreflight = Promise.withResolvers<void>();
+		const harness = createIntegrationHarness(cwd.path(), {
+			confirmAnswers: [true, true],
+			async onConfirm(callNumber, title) {
+				if (callNumber !== 1 || title !== "Inspect official contribution prerequisites?") return;
+				preflightEntered.resolve();
+				await releasePreflight.promise;
+			},
+		});
+		const initialTools = [...harness.activeTools];
+		const startPromise = startContribution(harness);
+		await preflightEntered.promise;
+
+		let offSettled = false;
+		const offPromise = commandRequired(harness, "contribute")
+			.handler("off", harness.ctx)
+			.finally(() => {
+				offSettled = true;
+			});
+		for (let turn = 0; turn < 4; turn++) await Promise.resolve();
+		const offSettledBeforeRelease = offSettled;
+		releasePreflight.resolve();
+		const [startResult, offResult] = await Promise.allSettled([startPromise, offPromise]);
+		await commandRequired(harness, "contribute").handler("status", harness.ctx);
+		expect(offSettledBeforeRelease).toBe(true);
+		expect(startResult.status).toBe("fulfilled");
+		expect(offResult.status).toBe("fulfilled");
+		expect(harness.confirmCalls).toHaveLength(1);
+
+		expect(harness.notifications.at(-1)?.message).toBe("Contribution mode is off.");
+		expect(harness.githubEndpoints).toEqual([]);
+		expect(harness.setModelCalls).toEqual([]);
+		expect(harness.checkoutNewCalls).toEqual([]);
+		expect(harness.activeTools).toEqual(initialTools);
+		expect(harness.appendEntries).toEqual([]);
+		expect(harness.sentUserMessages).toEqual([]);
+		expect(snapshotStorageArtifacts(dbDir.path())).toEqual([]);
+	});
+
+	it("cancels a session move while the first contribution confirmation is pending", async () => {
+		const preflightEntered = Promise.withResolvers<void>();
+		const releasePreflight = Promise.withResolvers<void>();
+		const harness = createIntegrationHarness(cwd.path(), {
+			confirmAnswers: [true, true],
+			async onConfirm(callNumber, title) {
+				if (callNumber !== 1 || title !== "Inspect official contribution prerequisites?") return;
+				preflightEntered.resolve();
+				await releasePreflight.promise;
+			},
+		});
+		const initialTools = [...harness.activeTools];
+		const startPromise = startContribution(harness);
+		await preflightEntered.promise;
+		const transitionId = "move-during-contribution-preflight";
+
+		let transitionResult: { cancel?: boolean } | undefined;
+		let transitionSettled = false;
+		const transitionPromise = Promise.resolve(
+			handlerRequired<
+				{ type: "session_before_move"; transitionId: string; targetCwd: string },
+				{ cancel?: boolean }
+			>(harness, "session_before_move")(
+				{ type: "session_before_move", transitionId, targetCwd: "/tmp/contribution-preflight-target" },
+				harness.ctx as ExtensionContext,
+			),
+		)
+			.then(result => {
+				transitionResult = result;
+			})
+			.finally(() => {
+				transitionSettled = true;
+			});
+		for (let turn = 0; turn < 4; turn++) await Promise.resolve();
+		const transitionSettledBeforeRelease = transitionSettled;
+		releasePreflight.resolve();
+		const [startResult, beforeMoveResult] = await Promise.allSettled([startPromise, transitionPromise]);
+		await handlerRequired<{
+			type: "session_transition_end";
+			transitionId: string;
+			kind: "move";
+			committed: boolean;
+		}>(harness, "session_transition_end")(
+			{ type: "session_transition_end", transitionId, kind: "move", committed: false },
+			harness.ctx as ExtensionContext,
+		);
+		await commandRequired(harness, "contribute").handler("status", harness.ctx);
+
+		expect(transitionSettledBeforeRelease).toBe(true);
+		expect(startResult.status).toBe("fulfilled");
+		expect(beforeMoveResult.status).toBe("fulfilled");
+		expect(harness.confirmCalls).toHaveLength(1);
+		expect(transitionResult).toEqual({ cancel: true });
+		expect(harness.notifications.at(-1)?.message).toBe("Contribution mode is off.");
 		expect(harness.githubEndpoints).toEqual([]);
 		expect(harness.setModelCalls).toEqual([]);
 		expect(harness.checkoutNewCalls).toEqual([]);
