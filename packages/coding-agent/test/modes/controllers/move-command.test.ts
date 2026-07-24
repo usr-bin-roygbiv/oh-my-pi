@@ -6,15 +6,17 @@ import { CommandController } from "@oh-my-pi/pi-coding-agent/modes/controllers/c
 import { getThemeByName, setThemeInstance } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 
-function createMoveContext(sourceDir: string, settingsFlush?: () => Promise<void>) {
+function createMoveContext(sourceDir: string, settingsFlush?: () => Promise<void>, moveAllowed = true) {
 	const state = { cwd: sourceDir, movedTo: undefined as string | undefined };
 	const present = vi.fn();
 	const applyCwdChange = vi.fn(async (cwd: string) => {
 		expect(state.cwd).toBe(cwd);
 	});
 	const moveSession = vi.fn(async (cwd: string) => {
+		if (!moveAllowed) return false;
 		state.cwd = cwd;
 		state.movedTo = cwd;
+		return true;
 	});
 	const ctx = {
 		session: { isStreaming: false, moveSession },
@@ -67,6 +69,26 @@ describe("CommandController /move", () => {
 			await fs.rm(targetDir, { recursive: true, force: true });
 		}
 	});
+	it("does not re-scope cwd state when the session move lifecycle cancels", async () => {
+		const sourceDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-move-source-"));
+		const targetDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-move-target-"));
+		try {
+			const { ctx, state, present } = createMoveContext(sourceDir, undefined, false);
+			const controller = new CommandController(ctx);
+
+			await controller.handleMoveCommand(targetDir);
+
+			expect(state.cwd).toBe(sourceDir);
+			expect(state.movedTo).toBeUndefined();
+			expect(ctx.applyCwdChange).not.toHaveBeenCalled();
+			expect(ctx.reloadTodos).not.toHaveBeenCalled();
+			expect(present).not.toHaveBeenCalled();
+		} finally {
+			await fs.rm(sourceDir, { recursive: true, force: true });
+			await fs.rm(targetDir, { recursive: true, force: true });
+		}
+	});
+
 
 	it("aborts /move when pending settings flush fails, leaving cwd untouched", async () => {
 		const sourceDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-move-source-"));

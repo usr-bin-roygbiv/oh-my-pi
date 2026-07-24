@@ -76,12 +76,14 @@ const CONTRIBUTION_BRANCH = "autoresearch/faster-contributor-loop-20260723";
 const CONTRIBUTION_HARNESS_SHA256_ASI_KEY = "_omp_contribution_harness_sha256";
 const CONTRIBUTION_WORKTREE_TREE_ASI_KEY = "_omp_contribution_worktree_tree";
 const CONTRIBUTION_INVOCATION_SHA256_ASI_KEY = "_omp_contribution_invocation_sha256";
+const CONTRIBUTION_HEAD_SHA_ASI_KEY = "_omp_contribution_head_sha";
 const CONTRIBUTION_HARNESS_MAX_BYTES = 1024 * 1024;
 const HARNESS_SHA256 = "a".repeat(64);
 const CHANGED_HARNESS_SHA256 = "b".repeat(64);
 const INVOCATION_SHA256 = "d".repeat(64);
 const TIMEOUT_CHANGED_INVOCATION_SHA256 = "e".repeat(64);
 const CONFIG_CHANGED_INVOCATION_SHA256 = "f".repeat(64);
+const RED_TREE_SHA = "b".repeat(40);
 const CANDIDATE_TREE_SHA = "c".repeat(40);
 
 function snapshotFileSizes(root: string): string[] {
@@ -92,8 +94,12 @@ function snapshotFileSizes(root: string): string[] {
 			.readdirSync(directory, { withFileTypes: true })
 			.sort((a, b) => a.name.localeCompare(b.name))) {
 			const entryPath = `${directory}/${entry.name}`;
-			if (entry.isDirectory()) visit(entryPath);
-			else if (entry.isFile()) files.push(`${entryPath.slice(root.length + 1)}:${fs.statSync(entryPath).size}`);
+			if (entry.isDirectory()) {
+				visit(entryPath);
+			} else if (entry.isFile()) {
+				const bytes = fs.readFileSync(entryPath);
+				files.push(`${entryPath.slice(root.length + 1)}:${bytes.byteLength}:${Bun.hash(bytes).toString(16)}`);
+			}
 		}
 	};
 	visit(root);
@@ -1137,15 +1143,23 @@ describe("contribution fork validation and publication", () => {
 
 	it("isolates worktree snapshots from the real index and object database and removes every temporary artifact", async () => {
 		const source = TempDir.createSync("@pi-contribution-tree-objects-");
+		const expected = TempDir.createSync("@pi-contribution-tree-expected-");
 		try {
 			await $`git -C ${source.path()} init -b main`.quiet();
 			await Bun.write(`${source.path()}/tracked.txt`, "baseline\n");
-			await $`git -C ${source.path()} add tracked.txt`.quiet();
+			await Bun.write(`${source.path()}/deleted.txt`, "deleted baseline\n");
+			await $`git -C ${source.path()} add tracked.txt deleted.txt`.quiet();
 			await $`git -C ${source.path()} -c user.name=OMP -c user.email=omp@example.invalid commit -m baseline`.quiet();
 			await Bun.write(`${source.path()}/tracked.txt`, "staged user bytes\n");
 			await $`git -C ${source.path()} add tracked.txt`.quiet();
 			await Bun.write(`${source.path()}/tracked.txt`, "unstaged worktree bytes\n");
 			await Bun.write(`${source.path()}/untracked.txt`, "untracked worktree bytes\n");
+			await fs.promises.rm(`${source.path()}/deleted.txt`);
+			await Bun.write(`${source.path()}/executable.sh`, "#!/bin/sh\necho raw\n");
+			fs.chmodSync(`${source.path()}/executable.sh`, 0o755);
+			fs.symlinkSync("tracked.txt", `${source.path()}/tracked-link`);
+			await Bun.write(`${source.path()}/.gitignore`, "ignored.txt\n");
+			await Bun.write(`${source.path()}/ignored.txt`, "must stay ignored\n");
 
 			const indexPath = `${source.path()}/.git/index`;
 			const objectDirectory = `${source.path()}/.git/objects`;
@@ -1164,10 +1178,31 @@ describe("contribution fork validation and publication", () => {
 			expect(snapshotFileSizes(objectDirectory)).toEqual(beforeObjects);
 			expect(snapshotWorktreeTreeTemps()).toEqual(beforeTemps);
 
-			await Bun.write(`${source.path()}/.gitattributes`, "tracked.txt filter=snapshot-failure\n");
-			await $`git -C ${source.path()} config filter.snapshot-failure.clean false`.quiet();
-			await $`git -C ${source.path()} config filter.snapshot-failure.required true`.quiet();
-			await expect(git.writeWorktreeTree(source.path())).rejects.toThrow();
+			const filterMarker = `${source.path()}/.git/snapshot-filter-ran`;
+			const filterScript = `${source.path()}/.git/snapshot-filter.sh`;
+			await Bun.write(`${source.path()}/.gitattributes`, "tracked.txt filter=snapshot-filter\n");
+			await Bun.write(filterScript, `#!/bin/sh\nprintf invoked > ${JSON.stringify(filterMarker)}\nprintf transformed\n`);
+			fs.chmodSync(filterScript, 0o755);
+			await $`git -C ${expected.path()} init -b main`.quiet();
+			await Bun.write(`${expected.path()}/tracked.txt`, "unstaged worktree bytes\n");
+			await Bun.write(`${expected.path()}/untracked.txt`, "untracked worktree bytes\n");
+			await Bun.write(`${expected.path()}/executable.sh`, "#!/bin/sh\necho raw\n");
+			fs.chmodSync(`${expected.path()}/executable.sh`, 0o755);
+			fs.symlinkSync("tracked.txt", `${expected.path()}/tracked-link`);
+			await Bun.write(`${expected.path()}/.gitignore`, "ignored.txt\n");
+			await Bun.write(`${expected.path()}/ignored.txt`, "must stay ignored\n");
+			await Bun.write(`${expected.path()}/.gitattributes`, "tracked.txt filter=snapshot-filter\n");
+			await $`git -C ${expected.path()} add -A`.quiet();
+			const expectedTree = (await $`git -C ${expected.path()} write-tree`.quiet()).text().trim();
+			const rawTree = await git.writeWorktreeTree(source.path());
+			expect(rawTree).toBe(expectedTree);
+			await $`git -C ${source.path()} config filter.snapshot-filter.clean ${filterScript}`.quiet();
+			await $`git -C ${source.path()} config filter.snapshot-filter.required true`.quiet();
+
+			const configuredFilterTree = await git.writeWorktreeTree(source.path());
+
+			expect(configuredFilterTree).toBe(rawTree);
+			expect(fs.existsSync(filterMarker)).toBe(false);
 			expect(fs.readFileSync(indexPath)).toEqual(beforeIndex);
 			expect((await $`git -C ${source.path()} diff --cached --raw -z`.quiet()).arrayBuffer()).toEqual(
 				beforeIndexState,
@@ -1176,6 +1211,7 @@ describe("contribution fork validation and publication", () => {
 			expect(snapshotWorktreeTreeTemps()).toEqual(beforeTemps);
 		} finally {
 			source.removeSync();
+			expected.removeSync();
 		}
 	});
 
@@ -2216,6 +2252,7 @@ interface KeptContributionOptions {
 	redProof?: "valid" | "missing" | "passing" | "flagged";
 	harnessProof?: "valid" | "missing" | "changed";
 	invocationProof?: "valid" | "missing" | "timeout-changed" | "config-changed";
+	redTreeProof?: "valid" | "same" | "missing";
 }
 
 async function prepareKeptContribution(
@@ -2260,6 +2297,12 @@ async function prepareKeptContribution(
 					: {
 							hypothesis: "The focused contribution scenario should fail before the fix.",
 							[CONTRIBUTION_HARNESS_SHA256_ASI_KEY]: HARNESS_SHA256,
+							...(options.redTreeProof === "missing"
+								? {}
+								: {
+										[CONTRIBUTION_WORKTREE_TREE_ASI_KEY]:
+											options.redTreeProof === "same" ? CANDIDATE_TREE_SHA : RED_TREE_SHA,
+									}),
 							...(options.invocationProof === "missing"
 								? {}
 								: { [CONTRIBUTION_INVOCATION_SHA256_ASI_KEY]: INVOCATION_SHA256 }),
@@ -2305,6 +2348,7 @@ async function prepareKeptContribution(
 						[CONTRIBUTION_HARNESS_SHA256_ASI_KEY]:
 							options.harnessProof === "changed" ? CHANGED_HARNESS_SHA256 : HARNESS_SHA256,
 						[CONTRIBUTION_WORKTREE_TREE_ASI_KEY]: CANDIDATE_TREE_SHA,
+						[CONTRIBUTION_HEAD_SHA_ASI_KEY]: COMMIT_SHA,
 						...(options.invocationProof === "missing"
 							? {}
 							: {
@@ -2943,6 +2987,68 @@ describe("process-local contribution lifecycle", () => {
 		expect(harness.activeTools).toEqual(["read", "bash"]);
 	});
 
+	it("awaits shutdown until an abortable contribution run has drained", async () => {
+		const deactivated = Promise.withResolvers<void>();
+		const harness = createIntegrationHarness(cwd.path(), {
+			onSetActiveTools(_callNumber, names) {
+				if (names.length === 2 && names[0] === "read" && names[1] === "bash") deactivated.resolve();
+			},
+		});
+		await startContribution(harness);
+		const { session, storage } = await prepareInitializedContribution(harness, cwd.path());
+		const run = harness.tools.get("run_experiment");
+		if (!run) throw new Error("Expected run_experiment tool");
+		let processSignal: AbortSignal | undefined;
+		let shutdownPromise: Promise<void> | null = null;
+		let shutdownSettled = false;
+		let shutdownSettledDuringProcess = false;
+		vi.spyOn(bashExecutor, "executeBash").mockImplementation(async (_command, options) => {
+			processSignal = options?.signal;
+			shutdownPromise = Promise.resolve(
+				handlerRequired<SessionShutdownEvent>(harness, "session_shutdown")(
+					{ type: "session_shutdown" } as SessionShutdownEvent,
+					harness.ctx as ExtensionContext,
+				),
+			).finally(() => {
+				shutdownSettled = true;
+			});
+			for (let turn = 0; turn < 4; turn++) await Promise.resolve();
+			shutdownSettledDuringProcess = shutdownSettled;
+			if (processSignal?.aborted) {
+				throw processSignal.reason ?? new DOMException("Contribution run aborted by shutdown", "AbortError");
+			}
+			return {
+				output: "METRIC runtime_ms=1",
+				exitCode: 0,
+				cancelled: false,
+				truncated: false,
+				totalLines: 1,
+				totalBytes: 19,
+				outputLines: 1,
+				outputBytes: 19,
+			};
+		});
+
+		const [runResult] = await Promise.allSettled([
+			run.execute("run-during-shutdown", {}, undefined, undefined, harness.ctx as ExtensionContext),
+		]);
+		const startedShutdown = shutdownPromise as Promise<void> | null;
+		if (!startedShutdown) throw new Error("Expected shutdown to start during run execution");
+		const [shutdownResult] = await Promise.allSettled([startedShutdown]);
+		await deactivated.promise;
+
+		expect(shutdownSettledDuringProcess).toBe(false);
+		expect(processSignal).toBeDefined();
+		expect(processSignal?.aborted).toBe(true);
+		expect(runResult).toMatchObject({ status: "rejected", reason: { name: "ToolAbortError" } });
+		expect(shutdownResult.status).toBe("fulfilled");
+		const pendingRun = storage.getPendingRun(session.id);
+		expect(pendingRun).not.toBeNull();
+		expect(pendingRun?.completedAt).toBeNull();
+		expect(storage.listLoggedRuns(session.id)).toEqual([]);
+		expect(harness.activeTools).toEqual(["read", "bash"]);
+	});
+
 	it("does not complete or publish a passing run whose harness mutates source during execution", async () => {
 		await initializeRealContributionRepository(cwd.path());
 		const harness = createIntegrationHarness(cwd.path());
@@ -3300,6 +3406,47 @@ describe("process-local contribution lifecycle", () => {
 		expect(storage.listLoggedRuns(session.id)).toEqual([]);
 	});
 
+	it("refuses to log a passing contribution after HEAD changes with the tested tree unchanged", async () => {
+		await initializeRealContributionRepository(cwd.path());
+		const baseHead = (await $`git -C ${cwd.path()} rev-parse HEAD`.quiet()).text().trim();
+		const harness = createIntegrationHarness(cwd.path());
+		await startContribution(harness);
+		const { session, storage } = await prepareInitializedContribution(harness, cwd.path());
+		harness.setHeadSha(baseHead);
+		vi.spyOn(bashExecutor, "executeBash").mockResolvedValue({
+			output: "METRIC runtime_ms=1",
+			exitCode: 0,
+			cancelled: false,
+			truncated: false,
+			totalLines: 1,
+			totalBytes: 19,
+			outputLines: 1,
+			outputBytes: 19,
+		});
+		const run = harness.tools.get("run_experiment");
+		const log = harness.tools.get("log_experiment");
+		if (!run || !log) throw new Error("Expected contribution run and log tools");
+		await run.execute("passing-before-head-drift", {}, undefined, undefined, harness.ctx as ExtensionContext);
+		await $`git -C ${cwd.path()} commit --allow-empty -m untested-ancestry`.quiet();
+		const untestedHead = (await $`git -C ${cwd.path()} rev-parse HEAD`.quiet()).text().trim();
+		harness.setHeadSha(untestedHead);
+		harness.setStatusText("");
+
+		const logResult = await log.execute(
+			"keep-after-head-drift",
+			{ status: "keep", metric: 1, description: "must reject untested ancestry" },
+			undefined,
+			undefined,
+			harness.ctx as ExtensionContext,
+		);
+		const logText = logResult.content.map(part => (part.type === "text" ? part.text : "")).join("\n");
+
+		expect(logText).toContain("HEAD changed after the harness execution");
+		expect(untestedHead).not.toBe(baseHead);
+		expect(storage.getPendingRun(session.id)).not.toBeNull();
+		expect(storage.listLoggedRuns(session.id)).toEqual([]);
+	});
+
 	it("aborts and drains update_notes before SQLite and runtime mutation on session transition", async () => {
 		const harness = createIntegrationHarness(cwd.path());
 		await startContribution(harness);
@@ -3347,6 +3494,41 @@ describe("process-local contribution lifecycle", () => {
 		expect(storage.getSessionById(session.id)?.notes).toBe(originalNotes);
 		expect(harness.widgetUpdates).toBe(widgetUpdatesBefore);
 		await commandRequired(harness, "contribute").handler("off", harness.ctx);
+		expect(harness.activeTools).toEqual(["read", "bash"]);
+	});
+
+	it("cancels a contribution move and settles it through the shared lifecycle", async () => {
+		const deactivated = Promise.withResolvers<void>();
+		const harness = createIntegrationHarness(cwd.path(), {
+			onSetActiveTools(_callNumber, names) {
+				if (names.length === 2 && names[0] === "read" && names[1] === "bash") deactivated.resolve();
+			},
+		});
+		await startContribution(harness);
+		const transitionId = "contribution-move";
+		const moveHandler = handlerRequired<
+			{ type: "session_before_move"; transitionId: string; targetCwd: string },
+			{ cancel?: boolean }
+		>(harness, "session_before_move");
+
+		const result = await moveHandler(
+			{ type: "session_before_move", transitionId, targetCwd: "/tmp/contribution-move-target" },
+			harness.ctx as ExtensionContext,
+		);
+		await handlerRequired<{
+			type: "session_transition_end";
+			transitionId: string;
+			kind: "move";
+			committed: boolean;
+		}>(harness, "session_transition_end")(
+			{ type: "session_transition_end", transitionId, kind: "move", committed: false },
+			harness.ctx as ExtensionContext,
+		);
+		await deactivated.promise;
+
+		expect(result).toEqual({ cancel: true });
+		await commandRequired(harness, "contribute").handler("status", harness.ctx);
+		expect(harness.notifications.at(-1)?.message).toBe("Contribution mode is off.");
 		expect(harness.activeTools).toEqual(["read", "bash"]);
 	});
 
@@ -4356,6 +4538,64 @@ describe("process-local contribution lifecycle", () => {
 			green?.parsedAsi?.[CONTRIBUTION_INVOCATION_SHA256_ASI_KEY],
 		);
 		expect(harness.pushes).toEqual([]);
+
+		expect(harness.notifications.at(-1)).toMatchObject({
+			type: "error",
+			message: expect.stringContaining("TDD"),
+		});
+	});
+
+	it("rejects a flaky red and green result executed against the same worktree tree", async () => {
+		await initializeRealContributionRepository(cwd.path());
+		const harness = createIntegrationHarness(cwd.path(), { confirmAnswers: [true, true, true] });
+		await startContribution(harness);
+		const { session, storage } = await prepareInitializedContribution(harness, cwd.path());
+		const run = harness.tools.get("run_experiment");
+		const log = harness.tools.get("log_experiment");
+		if (!run || !log) throw new Error("Expected contribution run and log tools");
+		let execution = 0;
+		vi.spyOn(bashExecutor, "executeBash").mockImplementation(async () => {
+			execution++;
+			const passed = execution === 2;
+			return {
+				output: passed ? "METRIC runtime_ms=1" : "focused scenario failed",
+				exitCode: passed ? 0 : 1,
+				cancelled: false,
+				truncated: false,
+				totalLines: 1,
+				totalBytes: 23,
+				outputLines: 1,
+				outputBytes: 23,
+			};
+		});
+
+		await run.execute("same-tree-red", {}, undefined, undefined, harness.ctx as ExtensionContext);
+		await log.execute(
+			"same-tree-red-log",
+			{ status: "checks_failed", metric: 0, description: "same tree failed once" },
+			undefined,
+			undefined,
+			harness.ctx as ExtensionContext,
+		);
+		await run.execute("same-tree-green", {}, undefined, undefined, harness.ctx as ExtensionContext);
+		await log.execute(
+			"same-tree-green-log",
+			{ status: "keep", metric: 1, description: "same tree passed once" },
+			undefined,
+			undefined,
+			harness.ctx as ExtensionContext,
+		);
+		const [red, green] = storage.listLoggedRuns(session.id);
+
+		await commandRequired(harness, "contribute").handler("review", harness.ctx);
+
+		expect(red).toMatchObject({ status: "checks_failed", exitCode: 1, timedOut: false });
+		expect(green).toMatchObject({ status: "keep", exitCode: 0, timedOut: false });
+		expect(red?.parsedAsi?.[CONTRIBUTION_WORKTREE_TREE_ASI_KEY]).toMatch(/^[0-9a-f]{40,64}$/);
+		expect(red?.parsedAsi?.[CONTRIBUTION_WORKTREE_TREE_ASI_KEY]).toBe(
+			green?.parsedAsi?.[CONTRIBUTION_WORKTREE_TREE_ASI_KEY],
+		);
+		expect(harness.pushes).toEqual([]);
 		expect(harness.notifications.at(-1)).toMatchObject({
 			type: "error",
 			message: expect.stringContaining("TDD"),
@@ -4377,6 +4617,10 @@ describe("process-local contribution lifecycle", () => {
 		{
 			name: "red and green use different effective command invocation configuration",
 			options: { invocationProof: "config-changed" as const },
+		},
+		{
+			name: "red and green use the same tested worktree tree",
+			options: { redTreeProof: "same" as const },
 		},
 	] as const) {
 		it(`rejects publication when ${testCase.name}`, async () => {
@@ -4692,6 +4936,58 @@ describe("process-local contribution lifecycle", () => {
 			harness.ctx as ExtensionContext,
 		);
 		expect(harness.sentMessages).toEqual([]);
+	});
+
+	it("starts fresh ordinary autoresearch on branch B while branch A retains an active session", async () => {
+		const harness = createIntegrationHarness(cwd.path());
+		const branchA = "autoresearch/ordinary-fresh-a";
+		const branchB = "autoresearch/ordinary-fresh-b";
+		harness.setCurrentBranch(branchA);
+		await commandRequired(harness, "autoresearch").handler("branch A goal", harness.ctx);
+		await Bun.write(`${cwd.path()}/autoresearch.sh`, "#!/usr/bin/env bash\necho METRIC runtime_ms=1\n");
+		const init = harness.tools.get("init_experiment");
+		if (!init) throw new Error("Expected init_experiment tool");
+		await init.execute(
+			"branch-a-session",
+			{ name: "branch A", primary_metric: "runtime_ms" },
+			undefined,
+			undefined,
+			harness.ctx as ExtensionContext,
+		);
+		const storage = await openAutoresearchStorage(cwd.path());
+		const sessionA = storage.getActiveSessionForBranch(branchA);
+		if (!sessionA) throw new Error("Expected active branch A session");
+
+		harness.setCurrentBranch(branchB);
+		await commandRequired(harness, "autoresearch").handler("branch B goal", harness.ctx);
+		const beforeAgentStart = handlerRequired<BeforeAgentStartEvent, { systemPrompt?: string[] }>(
+			harness,
+			"before_agent_start",
+		);
+		const promptOnB = await beforeAgentStart(
+			{ type: "before_agent_start", prompt: "start branch B", systemPrompt: ["base prompt"] },
+			harness.ctx as ExtensionContext,
+		);
+		const initB = await init.execute(
+			"branch-b-session",
+			{ name: "branch B", primary_metric: "runtime_ms" },
+			undefined,
+			undefined,
+			harness.ctx as ExtensionContext,
+		);
+
+		expect(storage.getActiveSessionForBranch(branchA)?.id).toBe(sessionA.id);
+		expect(storage.getActiveSessionForBranch(branchB)).not.toBeNull();
+		expect(promptOnB?.systemPrompt?.[0]).toContain("branch B goal");
+		expect(initB.details).toMatchObject({ createdSession: true });
+		expect(harness.activeTools).toEqual([
+			"read",
+			"bash",
+			"init_experiment",
+			"run_experiment",
+			"log_experiment",
+			"update_notes",
+		]);
 	});
 
 	it("leaves ordinary /autoresearch persistence, start behavior, and approval mode unchanged", async () => {
@@ -5226,10 +5522,18 @@ describe("process-local contribution lifecycle", () => {
 		await startContribution(harness);
 		await Bun.write(`${cwd.path()}/autoresearch.sh`, "#!/usr/bin/env bash\necho METRIC runtime_ms=1\n");
 		const init = harness.tools.get("init_experiment");
-		if (!init) throw new Error("Expected init_experiment tool");
-		if (typeof init.concurrency !== "function") throw new Error("Expected argument-aware init concurrency");
-		expect(init.concurrency({ new_segment: true })).toBe("exclusive");
-		expect(init.concurrency({ new_segment: false })).toBe("exclusive");
+		const runTool = harness.tools.get("run_experiment");
+		const logTool = harness.tools.get("log_experiment");
+		const updateNotesTool = harness.tools.get("update_notes");
+		if (!init || !runTool || !logTool || !updateNotesTool) {
+			throw new Error("Expected all autoresearch mutation tools");
+		}
+		for (const tool of [init, runTool, logTool, updateNotesTool]) {
+			const concurrency =
+				typeof tool.concurrency === "function" ? tool.concurrency({} as never) : tool.concurrency;
+			expect(concurrency).toBe("exclusive");
+		}
+		expect(init.concurrency?.({ new_segment: true })).toBe("exclusive");
 		await init.execute(
 			"initial",
 			{ name: "initial", primary_metric: "runtime_ms" },

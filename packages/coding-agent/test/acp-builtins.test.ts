@@ -24,6 +24,7 @@ interface FakeAcpBuiltinSession {
 	_todoPhases: Array<{ name: string; tasks: Array<{ content: string; status: string }> }>;
 	_switchedTo: string | undefined;
 	_movedFromEmptySessionFile: string | undefined;
+	_moveAllowed: boolean;
 	toggleFastMode(): boolean;
 	setFastMode(enabled: boolean): boolean;
 	isFastModeEnabled(): boolean;
@@ -38,7 +39,7 @@ interface FakeAcpBuiltinSession {
 	model: { provider: string; id: string } | undefined;
 	newSession(opts?: { drop?: boolean; parentSession?: string }): Promise<boolean>;
 	switchSession(sessionPath: string): Promise<boolean>;
-	moveSession(newCwd: string, targetSessionDir?: string): Promise<void>;
+	moveSession(newCwd: string, targetSessionDir?: string): Promise<boolean>;
 	markMovedFromEmptySessionFile(sessionFile: string): void;
 	fork(): Promise<boolean>;
 	handoff(instr?: string): Promise<{ document: string; savedPath?: string } | undefined>;
@@ -91,6 +92,7 @@ function createRuntime() {
 		_todoPhases: [],
 		_switchedTo: undefined,
 		_movedFromEmptySessionFile: undefined,
+		_moveAllowed: true,
 		toggleFastMode() {
 			this.fastMode = !this.fastMode;
 			return this.fastMode;
@@ -123,8 +125,10 @@ function createRuntime() {
 			return true;
 		},
 		async moveSession(newCwd: string, _targetSessionDir?: string) {
+			if (!this._moveAllowed) return false;
 			if (!fakeSessionManager) throw new Error("fake session manager not initialized");
 			await fakeSessionManager.moveTo(newCwd);
+			return true;
 		},
 		markMovedFromEmptySessionFile(sessionFile: string) {
 			this._movedFromEmptySessionFile = path.resolve(sessionFile);
@@ -804,6 +808,29 @@ describe("wave 3 commands", () => {
 			expect(reloadForCwd).toHaveBeenCalledWith(targetDir);
 			expect(configNotified).toBe(1);
 			expect(output[0]).toContain(`Moved to ${targetDir}.`);
+		} finally {
+			setProjectDir(originalProjectDir);
+			await fs.rm(targetDir, { recursive: true, force: true });
+		}
+	});
+
+	it("/move: leaves ACP cwd and settings unchanged when the session lifecycle cancels", async () => {
+		const { output, runtime, session, fakeSessionManager } = createRuntime();
+		const targetDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-move-target-"));
+		const originalProjectDir = process.cwd();
+		const originalCwd = fakeSessionManager.getCwd();
+		const reloadForCwd = spyOn(runtime.settings, "reloadForCwd");
+		session._moveAllowed = false;
+
+		try {
+			const result = await executeAcpBuiltinSlashCommand(`/move ${targetDir}`, runtime);
+
+			expect(result).toEqual({ consumed: true });
+			expect(fakeSessionManager.getCwd()).toBe(originalCwd);
+			expect(fakeSessionManager._movedTo).toBeUndefined();
+			expect(reloadForCwd).not.toHaveBeenCalled();
+			expect(output).toEqual([]);
+			expect(process.cwd()).toBe(originalProjectDir);
 		} finally {
 			setProjectDir(originalProjectDir);
 			await fs.rm(targetDir, { recursive: true, force: true });

@@ -38,6 +38,10 @@ function createCwdContext(sourceDir: string, isStreaming = false) {
 		session: {
 			isStreaming,
 			executeBash,
+			moveSession: vi.fn(async (cwd: string) => {
+				state.cwd = cwd;
+				return true;
+			}),
 		},
 		sessionManager: {
 			getCwd: () => state.cwd,
@@ -150,6 +154,9 @@ describe("bash shortcut command", () => {
 			expect(state.cwd).toBe(sourceDir);
 			expect(state.executedCwds).toEqual([sourceDir, childDir, sourceDir]);
 			expect(executeBash).toHaveBeenCalledTimes(3);
+			expect(ctx.session.moveSession).toHaveBeenNthCalledWith(1, childDir);
+			expect(ctx.session.moveSession).toHaveBeenNthCalledWith(2, sourceDir);
+			expect(ctx.sessionManager.moveTo).not.toHaveBeenCalled();
 			expect(executeBash).toHaveBeenNthCalledWith(1, "cd child", expect.any(Function), {
 				excludeFromContext: false,
 				useUserShell: true,

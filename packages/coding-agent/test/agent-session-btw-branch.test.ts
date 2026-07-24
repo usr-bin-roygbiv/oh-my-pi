@@ -184,6 +184,54 @@ describe("AgentSession.branchFromBtw", () => {
 		});
 	});
 
+	it("cancels session moves through the shared transition lifecycle", async () => {
+		const emitted: Array<{
+			type: string;
+			transitionId?: string;
+			kind?: string;
+			committed?: boolean;
+			targetCwd?: string;
+		}> = [];
+		const emit = vi.fn(
+			async (event: {
+				type: string;
+				transitionId?: string;
+				kind?: string;
+				committed?: boolean;
+				targetCwd?: string;
+			}) => {
+				emitted.push(event);
+				return event.type === "session_before_move" ? { cancel: true } : undefined;
+			},
+		);
+		const extensionRunner = {
+			hasHandlers: vi.fn(
+				(eventType: string) => eventType === "session_before_move" || eventType === "session_transition_end",
+			),
+			emit,
+		} as unknown as ExtensionRunner;
+		const activeSession = await createSession({ extensionRunner });
+		const originalCwd = activeSession.sessionManager.getCwd();
+		const targetCwd = path.join(tempDir, "move-target");
+		fs.mkdirSync(targetCwd);
+
+		const moved: unknown = await activeSession.moveSession(targetCwd);
+
+		expect(moved).toBe(false);
+		expect(activeSession.sessionManager.getCwd()).toBe(originalCwd);
+		expect(emitted[0]).toMatchObject({
+			type: "session_before_move",
+			targetCwd,
+			transitionId: expect.any(String),
+		});
+		expect(emitted[1]).toMatchObject({
+			type: "session_transition_end",
+			kind: "move",
+			committed: false,
+			transitionId: emitted[0]?.transitionId,
+		});
+	});
+
 	it("syncs promoted /btw messages into live context even when hooks skip conversation restore", async () => {
 		const extensionRunner = {
 			hasHandlers: vi.fn((eventType: string) => eventType === "session_before_branch"),
