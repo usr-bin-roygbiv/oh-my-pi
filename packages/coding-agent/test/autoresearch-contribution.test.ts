@@ -4193,6 +4193,7 @@ describe("process-local contribution lifecycle", () => {
 	});
 
 	it("rejects an oversized contribution harness before allocating execution output or launching it", async () => {
+		await initializeRealContributionRepository(cwd.path());
 		const harness = createIntegrationHarness(cwd.path());
 		await startContribution(harness);
 		const { session, storage } = await prepareInitializedContribution(harness, cwd.path());
