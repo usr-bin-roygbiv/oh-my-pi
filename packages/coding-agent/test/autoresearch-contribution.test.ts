@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { Database } from "bun:sqlite";
 import { Buffer } from "node:buffer";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -442,6 +443,31 @@ function openHistoricalSession(cwd: string) {
 	});
 }
 
+async function openUncachedActiveSession(cwd: string): Promise<autoresearchStorage.AutoresearchStorage> {
+	const { storage, session } = await openHistoricalSession(cwd);
+	storage.closeSession(session.id);
+	const dbPath = storage.dbPath;
+	const projectDir = storage.projectDir;
+	closeAllAutoresearchStorages();
+	const uncached = new autoresearchStorage.AutoresearchStorage(dbPath, projectDir);
+	uncached.openSession({
+		name: "concurrent active session",
+		goal: "active only in the current SQLite snapshot",
+		primaryMetric: "runtime_ms",
+		metricUnit: "ms",
+		direction: "lower",
+		preferredCommand: "bash autoresearch.sh",
+		branch: "autoresearch/concurrent-active",
+		baselineCommit: COMMIT_SHA,
+		maxIterations: 3,
+		scopePaths: [],
+		offLimits: [],
+		constraints: [],
+		secondaryMetrics: [],
+	});
+	return uncached;
+}
+
 describe("read-only contribution storage preflight", () => {
 	let cwd: TempDir;
 	let dbDir: TempDir;
@@ -528,6 +554,86 @@ describe("read-only contribution storage preflight", () => {
 			expect(probeTemps()).toEqual(tempsBefore);
 		});
 	}
+
+	it("cannot lose an active WAL row when a checkpoint races the read-only probe", async () => {
+		const writer = await openUncachedActiveSession(cwd.path());
+		const dbPath = writer.dbPath;
+		const realCopyFileSync = fs.copyFileSync;
+		let databaseCopies = 0;
+		let checkpointedAfterDatabaseCopy = false;
+		const checkpointer: { current: Database | null } = { current: null };
+		vi.spyOn(fs, "copyFileSync").mockImplementation((source, destination) => {
+			realCopyFileSync(source, destination);
+			if (String(source) !== dbPath || checkpointedAfterDatabaseCopy) return;
+			databaseCopies++;
+			checkpointer.current = new Database(dbPath);
+			checkpointer.current.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+			checkpointedAfterDatabaseCopy = true;
+		});
+
+		let probeResult: boolean | undefined;
+		let sourceStayedActive = false;
+		try {
+			probeResult = await hasActiveAutoresearchSession(cwd.path());
+			const inspector = new Database(dbPath, { readonly: true, create: false });
+			try {
+				sourceStayedActive =
+					inspector.query<{ active: number }, []>("SELECT 1 AS active FROM sessions WHERE closed_at IS NULL LIMIT 1").get() !==
+					null;
+			} finally {
+				inspector.close();
+			}
+		} finally {
+			checkpointer.current?.close();
+			writer.close();
+		}
+
+		expect(databaseCopies === 0 || checkpointedAfterDatabaseCopy).toBe(true);
+		expect(sourceStayedActive).toBe(true);
+		expect(probeResult).toBe(true);
+	});
+
+	it("rejects source growth after the initial size check without attempting an unbounded copy", async () => {
+		await openHistoricalSession(cwd.path());
+		closeAllAutoresearchStorages();
+		const dbName = fs.readdirSync(dbDir.path()).find(name => name.endsWith(".db"));
+		if (!dbName) throw new Error("Expected autoresearch database fixture");
+		const dbPath = `${dbDir.path()}/${dbName}`;
+		const walPath = `${dbPath}-wal`;
+		fs.writeFileSync(walPath, Buffer.alloc(32));
+		const realLstatSync = fs.lstatSync as unknown as (...args: unknown[]) => fs.Stats;
+		let growthInjected = false;
+		vi.spyOn(fs, "lstatSync").mockImplementation(
+			((...args: unknown[]) => {
+				const stat = realLstatSync(...args);
+				if (!growthInjected && String(args[0]) === walPath) {
+					growthInjected = true;
+					fs.truncateSync(walPath, 512 * 1024 * 1024 + 1);
+				}
+				return stat;
+			}) as typeof fs.lstatSync,
+		);
+		const realCopyFileSync = fs.copyFileSync;
+		let unboundedCopyAttempted = false;
+		vi.spyOn(fs, "copyFileSync").mockImplementation((source, destination) => {
+			if (fs.statSync(source).size > 512 * 1024 * 1024) {
+				unboundedCopyAttempted = true;
+				throw new Error("Test intercepted an unbounded state copy");
+			}
+			realCopyFileSync(source, destination);
+		});
+
+		const result = await hasActiveAutoresearchSession(cwd.path()).then(
+			value => ({ value }),
+			(error: unknown) => ({ error }),
+		);
+
+		expect(growthInjected).toBe(true);
+		expect(result).toEqual({ error: expect.any(Error) });
+		if (!("error" in result) || !(result.error instanceof Error)) throw new Error("Expected bounded probe error");
+		expect(result.error.message).toContain("read-only probe limit");
+		expect(unboundedCopyAttempted).toBe(false);
+	});
 
 	it("reuses one storage when concurrent creators resume from the same authorization gate", async () => {
 		const bothCreatorsEntered = Promise.withResolvers<void>();
@@ -1189,6 +1295,46 @@ describe("contribution fork validation and publication", () => {
 			}) as typeof Bun.file);
 
 			await expect(git.isAncestor(source.path(), baseSha, unrelatedSha)).resolves.toBe(false);
+		} finally {
+			source.removeSync();
+		}
+	});
+
+	it("rejects a worktree proof file above the 32 MiB materialization limit", async () => {
+		const source = TempDir.createSync("@pi-contribution-tree-file-limit-");
+		const tempsBefore = snapshotWorktreeTreeTemps();
+		try {
+			await $`git -C ${source.path()} init -b main`.quiet();
+			await Bun.write(`${source.path()}/base.txt`, "base\n");
+			await $`git -C ${source.path()} add base.txt`.quiet();
+			await $`git -C ${source.path()} -c user.name=OMP -c user.email=omp@example.invalid commit -m base`.quiet();
+			const oversizedPath = `${source.path()}/oversized.bin`;
+			fs.closeSync(fs.openSync(oversizedPath, "w"));
+			fs.truncateSync(oversizedPath, 32 * 1024 * 1024 + 1);
+
+			await expect(git.writeWorktreeTree(source.path())).rejects.toThrow("32 MiB");
+			expect(snapshotWorktreeTreeTemps()).toEqual(tempsBefore);
+		} finally {
+			source.removeSync();
+		}
+	});
+
+	it("rejects worktree proof files above the 256 MiB aggregate materialization limit", async () => {
+		const source = TempDir.createSync("@pi-contribution-tree-total-limit-");
+		const tempsBefore = snapshotWorktreeTreeTemps();
+		try {
+			await $`git -C ${source.path()} init -b main`.quiet();
+			await Bun.write(`${source.path()}/base.txt`, "base\n");
+			await $`git -C ${source.path()} add base.txt`.quiet();
+			await $`git -C ${source.path()} -c user.name=OMP -c user.email=omp@example.invalid commit -m base`.quiet();
+			for (let index = 0; index < 9; index++) {
+				const partPath = `${source.path()}/part-${index}.bin`;
+				fs.closeSync(fs.openSync(partPath, "w"));
+				fs.truncateSync(partPath, 32 * 1024 * 1024);
+			}
+
+			await expect(git.writeWorktreeTree(source.path())).rejects.toThrow("256 MiB");
+			expect(snapshotWorktreeTreeTemps()).toEqual(tempsBefore);
 		} finally {
 			source.removeSync();
 		}
@@ -3210,6 +3356,129 @@ describe("process-local contribution lifecycle", () => {
 		expect(pendingRun).not.toBeNull();
 		expect(pendingRun?.completedAt).toBeNull();
 		expect(storage.listLoggedRuns(session.id)).toEqual([]);
+		expect(harness.activeTools).toEqual(["read", "bash"]);
+	});
+
+	it("awaits an in-flight ordinary clear before shutdown releases its runtime", async () => {
+		const harness = createIntegrationHarness(cwd.path());
+		const branch = "autoresearch/shutdown-clear";
+		harness.setCurrentBranch(branch);
+		await commandRequired(harness, "autoresearch").handler("shutdown clear", harness.ctx);
+		const storage = await openAutoresearchStorage(cwd.path());
+		const session = storage.openSession({
+			name: "shutdown clear",
+			goal: "shutdown clear",
+			primaryMetric: "runtime_ms",
+			metricUnit: "ms",
+			direction: "lower",
+			preferredCommand: "bash autoresearch.sh",
+			branch,
+			baselineCommit: COMMIT_SHA,
+			maxIterations: 10,
+			scopePaths: [],
+			offLimits: [],
+			constraints: [],
+			secondaryMetrics: [],
+		});
+		const resetEntered = Promise.withResolvers<void>();
+		const releaseReset = Promise.withResolvers<void>();
+		vi.spyOn(git, "reset").mockImplementation(async () => {
+			resetEntered.resolve();
+			await releaseReset.promise;
+		});
+		vi.spyOn(git, "clean").mockResolvedValue();
+
+		const clearPromise = commandRequired(harness, "autoresearch").handler("clear", harness.ctx);
+		await resetEntered.promise;
+		let shutdownSettled = false;
+		const shutdownPromise = Promise.resolve(
+			handlerRequired<SessionShutdownEvent>(harness, "session_shutdown")(
+				{ type: "session_shutdown" } as SessionShutdownEvent,
+				harness.ctx as ExtensionContext,
+			),
+		).finally(() => {
+			shutdownSettled = true;
+		});
+		const shutdownFence = Promise.withResolvers<void>();
+		setImmediate(shutdownFence.resolve);
+		await shutdownFence.promise;
+		const shutdownSettledDuringReset = shutdownSettled;
+		releaseReset.resolve();
+		const [clearResult, shutdownResult] = await Promise.allSettled([clearPromise, shutdownPromise]);
+
+		expect(shutdownSettledDuringReset).toBe(false);
+		expect(clearResult.status).toBe("fulfilled");
+		expect(shutdownResult.status).toBe("fulfilled");
+		expect(storage.getSessionById(session.id)).toMatchObject({ id: session.id, closedAt: expect.any(Number) });
+		expect(harness.activeTools).toEqual(["read", "bash"]);
+	});
+
+	it("awaits an in-flight ordinary rehydrate before shutdown deactivates tools", async () => {
+		const harness = createIntegrationHarness(cwd.path());
+		const branch = "autoresearch/shutdown-rehydrate";
+		harness.setCurrentBranch(branch);
+		const storage = await openAutoresearchStorage(cwd.path());
+		storage.openSession({
+			name: "shutdown rehydrate",
+			goal: "shutdown rehydrate",
+			primaryMetric: "runtime_ms",
+			metricUnit: "ms",
+			direction: "lower",
+			preferredCommand: "bash autoresearch.sh",
+			branch,
+			baselineCommit: COMMIT_SHA,
+			maxIterations: 10,
+			scopePaths: [],
+			offLimits: [],
+			constraints: [],
+			secondaryMetrics: [],
+		});
+		harness.setSessionBranch([
+			{
+				type: "custom",
+				customType: "autoresearch-control",
+				data: { mode: "on", goal: "shutdown rehydrate" },
+			},
+		]);
+		const branchReadEntered = Promise.withResolvers<void>();
+		const releaseBranchRead = Promise.withResolvers<void>();
+		let branchReads = 0;
+		vi.spyOn(git.branch, "current").mockImplementation(async () => {
+			branchReads++;
+			if (branchReads === 1) {
+				branchReadEntered.resolve();
+				await releaseBranchRead.promise;
+			}
+			return branch;
+		});
+
+		const rehydratePromise = Promise.resolve(
+			handlerRequired<SessionStartEvent>(harness, "session_start")(
+				{ type: "session_start" } as SessionStartEvent,
+				harness.ctx as ExtensionContext,
+			),
+		);
+		await branchReadEntered.promise;
+		let shutdownSettled = false;
+		const shutdownPromise = Promise.resolve(
+			handlerRequired<SessionShutdownEvent>(harness, "session_shutdown")(
+				{ type: "session_shutdown" } as SessionShutdownEvent,
+				harness.ctx as ExtensionContext,
+			),
+		).finally(() => {
+			shutdownSettled = true;
+		});
+		const shutdownFence = Promise.withResolvers<void>();
+		setImmediate(shutdownFence.resolve);
+		await shutdownFence.promise;
+		const shutdownSettledDuringRehydrate = shutdownSettled;
+		releaseBranchRead.resolve();
+		const [rehydrateResult, shutdownResult] = await Promise.allSettled([rehydratePromise, shutdownPromise]);
+
+		expect(shutdownSettledDuringRehydrate).toBe(false);
+		expect(rehydrateResult.status).toBe("fulfilled");
+		expect(shutdownResult.status).toBe("fulfilled");
+		expect(branchReads).toBeGreaterThanOrEqual(2);
 		expect(harness.activeTools).toEqual(["read", "bash"]);
 	});
 
