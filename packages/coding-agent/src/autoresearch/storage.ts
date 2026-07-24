@@ -644,7 +644,11 @@ function copyProbeFileBounded(
 	try {
 		const opened = probeFileSnapshotFromStat(fs.fstatSync(source, { bigint: true }), label);
 		if (!probeFileSnapshotsEqual(expected, opened)) throwProbeSourceChanged();
-		destination = fs.openSync(destinationPath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL, 0o600);
+		destination = fs.openSync(
+			destinationPath,
+			fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL,
+			0o600,
+		);
 		const buffer = Buffer.allocUnsafe(AUTORESEARCH_READONLY_PROBE_COPY_BUFFER_BYTES);
 		let copied = 0n;
 		while (true) {
@@ -665,7 +669,11 @@ function copyProbeFileBounded(
 		if (copied !== expected.size) throwProbeSourceChanged();
 		const copiedSource = probeFileSnapshotFromStat(fs.fstatSync(source, { bigint: true }), label);
 		const currentPath = readProbeFileSnapshot(sourcePath, label);
-		if (!currentPath || !probeFileSnapshotsEqual(expected, copiedSource) || !probeFileSnapshotsEqual(expected, currentPath)) {
+		if (
+			!currentPath ||
+			!probeFileSnapshotsEqual(expected, copiedSource) ||
+			!probeFileSnapshotsEqual(expected, currentPath)
+		) {
 			throwProbeSourceChanged();
 		}
 	} finally {

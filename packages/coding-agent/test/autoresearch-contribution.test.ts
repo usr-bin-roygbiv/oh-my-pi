@@ -1,5 +1,5 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import { Database } from "bun:sqlite";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import { Buffer } from "node:buffer";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -607,8 +607,9 @@ describe("read-only contribution storage preflight", () => {
 			const inspector = new Database(dbPath, { readonly: true, create: false });
 			try {
 				sourceStayedActive =
-					inspector.query<{ active: number }, []>("SELECT 1 AS active FROM sessions WHERE closed_at IS NULL LIMIT 1").get() !==
-					null;
+					inspector
+						.query<{ active: number }, []>("SELECT 1 AS active FROM sessions WHERE closed_at IS NULL LIMIT 1")
+						.get() !== null;
 			} finally {
 				inspector.close();
 			}
@@ -638,16 +639,14 @@ describe("read-only contribution storage preflight", () => {
 		fs.writeFileSync(walPath, Buffer.alloc(32));
 		const realLstatSync = fs.lstatSync as unknown as (...args: unknown[]) => fs.Stats;
 		let growthInjected = false;
-		vi.spyOn(fs, "lstatSync").mockImplementation(
-			((...args: unknown[]) => {
-				const stat = realLstatSync(...args);
-				if (!growthInjected && String(args[0]) === walPath) {
-					growthInjected = true;
-					fs.truncateSync(walPath, 512 * 1024 * 1024 + 1);
-				}
-				return stat;
-			}) as typeof fs.lstatSync,
-		);
+		vi.spyOn(fs, "lstatSync").mockImplementation(((...args: unknown[]) => {
+			const stat = realLstatSync(...args);
+			if (!growthInjected && String(args[0]) === walPath) {
+				growthInjected = true;
+				fs.truncateSync(walPath, 512 * 1024 * 1024 + 1);
+			}
+			return stat;
+		}) as typeof fs.lstatSync);
 		const realCopyFileSync = fs.copyFileSync;
 		let unboundedCopyAttempted = false;
 		vi.spyOn(fs, "copyFileSync").mockImplementation((source, destination) => {
