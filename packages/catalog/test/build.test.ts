@@ -144,6 +144,48 @@ describe("buildModel", () => {
 			expect(buildModel(completionsSpec({ name })).name).toBe(name);
 		}
 	});
+	it("limits inferred GA computer capability to first-party Responses transports", () => {
+		const common = {
+			id: "gpt-5.6-terra",
+			name: "GPT-5.6 Terra",
+			reasoning: true,
+			input: ["text", "image"] as Array<"text" | "image">,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 400_000,
+			maxTokens: 128_000,
+		};
+		const direct = {
+			...common,
+			api: "openai-responses" as const,
+			provider: "openai",
+			baseUrl: "https://api.openai.com/v1",
+		} satisfies ModelSpec<"openai-responses">;
+
+		expect(buildModel(direct).supportsComputerUse).toBe(true);
+		expect(buildModel({ ...direct, baseUrl: "https://gateway.example/v1" }).supportsComputerUse).toBe(false);
+		expect(buildModel({ ...direct, provider: "gpt-proxy" }).supportsComputerUse).toBe(false);
+
+		const subscription = {
+			...common,
+			api: "openai-codex-responses" as const,
+			provider: "openai-codex",
+			baseUrl: "https://chatgpt.com/backend-api",
+		} satisfies ModelSpec<"openai-codex-responses">;
+		for (const id of ["gpt-5.3-codex-spark", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"]) {
+			expect(buildModel({ ...subscription, id, name: id }).supportsComputerUse).toBe(false);
+		}
+		expect(buildModel({ ...subscription, supportsComputerUse: true }).supportsComputerUse).toBe(true);
+
+		const azure = {
+			...common,
+			api: "azure-openai-responses" as const,
+			provider: "azure",
+			baseUrl: "",
+		} satisfies ModelSpec<"azure-openai-responses">;
+		expect(buildModel(azure).supportsComputerUse).toBe(true);
+		expect(buildModel({ ...azure, provider: "custom-azure-proxy" }).supportsComputerUse).toBe(false);
+		expect(buildModel({ ...azure, baseUrl: "https://gateway.example/openai/v1" }).supportsComputerUse).toBe(false);
+	});
 });
 
 describe("xAI-OAuth Responses reasoning-effort suppression", () => {

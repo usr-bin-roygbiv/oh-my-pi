@@ -74,11 +74,13 @@ Models with native OpenAI GA computer-use support receive the wire declaration `
 OMP marks a model natively capable when either:
 
 - its catalog metadata explicitly sets `supportsComputerUse: true`, or
-- it uses `openai-responses`, `openai-codex-responses`, or `azure-openai-responses` and resolves to an OpenAI/OpenAI Codex or Azure model ID matching `gpt-5.4` or later in the `gpt-5.x` family.
+- it uses a direct OpenAI Responses or Azure OpenAI Responses endpoint and resolves to a model ID matching `gpt-5.4` or later in the `gpt-5.x` family.
 
-An explicit `supportsComputerUse: false` disables automatic derivation and routes the model through the function-tool form.
+Codex subscription endpoints and custom or proxy routes do not infer native support from the model ID. They receive the regular `computer` function tool unless catalog metadata explicitly opts into the GA contract. An explicit `supportsComputerUse: false` also disables automatic derivation.
 
-Natively capable OpenAI Responses routes may receive a forced `{ "type": "computer" }` choice. Function-tool fallback forcing is provider-specific: OpenAI/Ollama use a named function, Anthropic/Bedrock use a named tool, Google uses required-tool mode, and adapters without a forcing form keep provider-default selection. When native computer history is replayed to a non-native OpenAI Responses-family model, that adapter converts prior `computer_call` and `computer_call_output` items into stable text notes rather than sending invalid native items. Other provider adapters serialize the generic call and result through their ordinary tool format.
+Natively capable OpenAI Responses routes may receive a forced `{ "type": "computer" }` choice. Function-tool fallback forcing is provider-specific: OpenAI/Ollama use a named function, Anthropic/Bedrock use a named tool, Google uses required-tool mode, and adapters without a forcing form keep provider-default selection. Responses Lite moves tools into `additional_tools`; for an explicitly forced computer declaration it sends only that declaration and uses `tool_choice: "required"`, preserving both selection and forcing without an invalid object choice that refers to removed top-level tools.
+
+When a session switches from a native-capable API route to a subscription or proxy route, prior native computer history is converted to a representation the target accepts. Codex subscription requests replay it as named `computer` function calls and results, then declare the next computer call as the same named function. Other non-native OpenAI Responses-family targets may use stable assistant text notes; other provider adapters use their ordinary tool format.
 
 If the tool never appears:
 

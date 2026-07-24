@@ -26,8 +26,8 @@ User setup, safety guidance, platform permissions, and verified limitations: [Na
 - Concurrency: `exclusive`.
 - Native descriptor: `{ type: "computer" }`.
 - Providers serialize the native descriptor only when `model.supportsComputerUse === true`; every other function-calling model receives `computer` as a regular function tool with the typed action schema below.
-- Automatic capability derivation covers GA `gpt-5.4+` IDs on OpenAI Responses, OpenAI Codex Responses, and Azure OpenAI Responses; explicit model metadata overrides derivation.
-- When OpenAI Responses-family history is replayed to a model without native support, native call/output items become stable assistant text notes. Other provider adapters serialize the generic call/result in their ordinary tool format.
+- Automatic capability derivation covers GA `gpt-5.4+` IDs only on direct OpenAI Responses and Azure OpenAI Responses endpoints. Codex subscription and custom or proxy routes fall back unless explicit model metadata opts in.
+- When a session switches from a native-capable API route to a non-native route, native history is adapted instead of being replayed as invalid GA items. Codex subscription requests use named function calls/results and the next declaration is a named function; other OpenAI Responses-family targets may use stable assistant text notes. Responses Lite preserves an explicit computer choice by placing only the selected declaration in `additional_tools` and using `tool_choice: "required"`. Other provider adapters use their ordinary tool format.
 
 Unlike `browser`, `computer` operates the entire visible host session. It can act in IDEs, terminals, native applications, browser windows, and system dialogs, but has no structured application/DOM inspection.
 

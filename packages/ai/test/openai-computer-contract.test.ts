@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+	buildTransformedCodexRequestBody,
 	convertCodexResponsesMessages,
 	convertOpenAICodexResponsesTools,
 	normalizeCodexToolChoice,
@@ -16,7 +17,7 @@ import {
 	convertResponsesAssistantMessage,
 	processResponsesStream,
 } from "@oh-my-pi/pi-ai/providers/openai-shared";
-import type { AssistantMessage, Model, ModelSpec, Tool, ToolResultMessage } from "@oh-my-pi/pi-ai/types";
+import type { AssistantMessage, Context, Model, ModelSpec, Tool, ToolResultMessage } from "@oh-my-pi/pi-ai/types";
 import { sanitizeOpenAIResponsesHistoryItemsForReplay } from "@oh-my-pi/pi-ai/utils";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { type } from "arktype";
@@ -126,6 +127,66 @@ describe("OpenAI GA computer contract", () => {
 		});
 	});
 
+	test("uses the function fallback for every tested subscription model in regular and Lite requests", async () => {
+		const otherTool: Tool = { name: "read", description: "read", parameters: type({ path: "string" }) };
+		for (const id of ["gpt-5.3-codex-spark", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"]) {
+			const subscription = model("openai-codex-responses", id);
+			const context: Context = {
+				messages: [{ role: "user", content: "capture the screen", timestamp: 1 }],
+				tools: [computerTool, otherTool],
+			};
+			expect(subscription.supportsComputerUse).toBe(false);
+
+			const regular = await buildTransformedCodexRequestBody(subscription, context, {
+				toolChoice: { type: "computer" },
+				responsesLite: false,
+			});
+			expect(regular.tools).toMatchObject([
+				{ type: "function", name: "computer" },
+				{ type: "function", name: "read" },
+			]);
+			expect(regular.tool_choice).toEqual({ type: "function", name: "computer" });
+
+			const lite = await buildTransformedCodexRequestBody(subscription, context, {
+				toolChoice: { type: "computer" },
+				responsesLite: true,
+			});
+			expect(lite.tools).toBeUndefined();
+			expect(lite.input?.[0]).toMatchObject({
+				type: "additional_tools",
+				tools: [{ type: "function", name: "computer" }],
+			});
+			expect(lite.tool_choice).toBe("required");
+		}
+	});
+
+	test("preserves an explicit future Codex native opt-in through regular and Lite requests", async () => {
+		const optedIn = buildModel({
+			...model("openai-codex-responses", "gpt-5.6-terra"),
+			supportsComputerUse: true,
+		} as ModelSpec<"openai-codex-responses">);
+		const context: Context = {
+			messages: [{ role: "user", content: "capture", timestamp: 1 }],
+			tools: [computerTool],
+		};
+		expect(convertOpenAICodexResponsesTools([computerTool], optedIn)).toEqual([{ type: "computer" }]);
+		expect(normalizeCodexToolChoice({ type: "computer" }, [computerTool], optedIn)).toEqual({ type: "computer" });
+
+		const regular = await buildTransformedCodexRequestBody(optedIn, context, {
+			toolChoice: { type: "computer" },
+			responsesLite: false,
+		});
+		expect(regular.tools).toEqual([{ type: "computer" }]);
+		expect(regular.tool_choice).toEqual({ type: "computer" });
+
+		const lite = await buildTransformedCodexRequestBody(optedIn, context, {
+			toolChoice: { type: "computer" },
+			responsesLite: true,
+		});
+		expect(lite.tools).toBeUndefined();
+		expect(lite.input?.[0]).toEqual({ type: "additional_tools", role: "developer", tools: [{ type: "computer" }] });
+		expect(lite.tool_choice).toBe("required");
+	});
 	test("parses batched streamed actions, stable item id, and safety checks", async () => {
 		const output = assistant([]);
 		const emitted: unknown[] = [];
@@ -502,5 +563,71 @@ describe("OpenAI GA computer contract", () => {
 			replay.some(item => item.type === "function_call_output" && item.call_id === "call_internal_computer"),
 		).toBe(true);
 		expect(JSON.stringify(replay)).toContain("data:image/png;base64,cG5n");
+	});
+
+	test("unrolls direct API computer history after switching to a subscription model", async () => {
+		const current = model("openai-codex-responses", "gpt-5.6-terra");
+		const call = assistant([
+			{
+				type: "toolCall",
+				id: "call_direct_computer|item_direct_computer",
+				name: "computer",
+				arguments: {},
+				providerMetadata: {
+					type: "computer",
+					providerItemId: "item_direct_computer",
+					actions: [{ type: "screenshot" }],
+					pendingSafetyChecks: [],
+				},
+			},
+		]);
+		const result: ToolResultMessage = {
+			role: "toolResult",
+			toolCallId: "call_direct_computer|item_direct_computer",
+			toolName: "computer",
+			content: [{ type: "image", data: "cG5n", mimeType: "image/png", detail: "original" }],
+			isError: false,
+			timestamp: 2,
+			providerMetadata: {
+				type: "computer",
+				screenshot: { type: "computer_screenshot", image_url: "data:image/png;base64,cG5n" },
+				acknowledgedSafetyChecks: [],
+			},
+		};
+
+		const replay = convertCodexResponsesMessages(current, { messages: [call, result] });
+		expect(replay.some(item => item.type === "computer_call" || item.type === "computer_call_output")).toBe(false);
+		expect(replay).toContainEqual(
+			expect.objectContaining({ type: "function_call", name: "computer", call_id: "call_direct_computer" }),
+		);
+		expect(replay).toContainEqual(
+			expect.objectContaining({ type: "function_call_output", call_id: "call_direct_computer" }),
+		);
+
+		const context: Context = {
+			messages: [call, result, { role: "user", content: "continue", timestamp: 3 }],
+			tools: [computerTool],
+		};
+		for (const responsesLite of [false, true]) {
+			const body = await buildTransformedCodexRequestBody(current, context, {
+				toolChoice: { type: "computer" },
+				responsesLite,
+			});
+			const serialized = JSON.stringify(body);
+			expect(serialized).not.toContain('"type":"computer_call"');
+			expect(serialized).not.toContain('"type":"computer_call_output"');
+			expect(serialized).toContain('"type":"function_call"');
+			expect(serialized).toContain('"type":"function_call_output"');
+			if (responsesLite) {
+				expect(body.input?.[0]).toMatchObject({
+					type: "additional_tools",
+					tools: [{ type: "function", name: "computer" }],
+				});
+				expect(body.tool_choice).toBe("required");
+			} else {
+				expect(body.tools).toMatchObject([{ type: "function", name: "computer" }]);
+				expect(body.tool_choice).toEqual({ type: "function", name: "computer" });
+			}
+		}
 	});
 });

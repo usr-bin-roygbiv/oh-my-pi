@@ -20,18 +20,35 @@ import { cleanModelName } from "./utils";
 
 const OPENAI_GA_COMPUTER_MODEL_RE = /^gpt-5\.(?:[4-9]|[1-9]\d)(?:[.-]|$)/i;
 
+function isDirectOpenAIResponsesEndpoint(spec: ModelSpec<Api>): boolean {
+	if (spec.api === "openai-responses") {
+		if (spec.provider !== "openai") return false;
+		if (!spec.baseUrl) return true;
+		try {
+			const url = new URL(spec.baseUrl);
+			return url.protocol === "https:" && url.hostname === "api.openai.com";
+		} catch {
+			return false;
+		}
+	}
+	if (spec.api !== "azure-openai-responses" || (spec.provider !== "azure" && spec.provider !== "azure-openai")) {
+		return false;
+	}
+	if (!spec.baseUrl) return spec.provider === "azure";
+	try {
+		const url = new URL(spec.baseUrl);
+		return (
+			url.protocol === "https:" &&
+			(url.hostname.endsWith(".openai.azure.com") || url.hostname === "models.inference.ai.azure.com")
+		);
+	} catch {
+		return false;
+	}
+}
+
 function supportsOpenAIGAComputerUse(spec: ModelSpec<Api>): boolean {
 	if (spec.supportsComputerUse !== undefined) return spec.supportsComputerUse;
-	if (
-		spec.api !== "openai-responses" &&
-		spec.api !== "openai-codex-responses" &&
-		spec.api !== "azure-openai-responses"
-	) {
-		return false;
-	}
-	if (spec.api !== "azure-openai-responses" && spec.provider !== "openai" && spec.provider !== "openai-codex") {
-		return false;
-	}
+	if (!isDirectOpenAIResponsesEndpoint(spec)) return false;
 	return OPENAI_GA_COMPUTER_MODEL_RE.test(spec.requestModelId ?? spec.id);
 }
 

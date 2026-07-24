@@ -1195,10 +1195,15 @@ export function buildParams(
 			const emittedNames = new Set(
 				params.tools.map(t => (t as { name?: string }).name).filter((n): n is string => n !== undefined),
 			);
+			const emittedComputer = params.tools.some(tool => tool.type === "computer");
 			const survivingTools =
 				params.tools.length === context.tools.length
 					? context.tools
-					: context.tools.filter(t => emittedNames.has(t.customWireName ?? t.name));
+					: context.tools.filter(
+							t =>
+								emittedNames.has(t.customWireName ?? t.name) ||
+								(t.native?.type === "computer" && emittedComputer),
+						);
 			const toolChoice = mapOpenAIResponsesToolChoiceForTools(options.toolChoice, survivingTools, model);
 			if (toolChoice !== undefined && params.tools.length > 0) {
 				params.tool_choice = toolChoice;
