@@ -1404,7 +1404,8 @@ describe("contribution fork validation and publication", () => {
 			const temporaryRoot = String(args[0]);
 			if (temporaryRoot.includes("omp-worktree-tree-")) {
 				const candidateListing = `${temporaryRoot}/candidates`;
-				if (fs.existsSync(candidateListing)) candidateListingBytesBeforeCleanup = fs.statSync(candidateListing).size;
+				if (fs.existsSync(candidateListing))
+					candidateListingBytesBeforeCleanup = fs.statSync(candidateListing).size;
 			}
 			await realRm(...args);
 		}) as typeof fs.promises.rm);
@@ -1425,7 +1426,8 @@ describe("contribution fork validation and publication", () => {
 			restorePath = (): void => {};
 
 			expect(outcome).toEqual({ error: expect.any(Error) });
-			if (!("error" in outcome) || !(outcome.error instanceof Error)) throw new Error("Expected listing limit error");
+			if (!("error" in outcome) || !(outcome.error instanceof Error))
+				throw new Error("Expected listing limit error");
 			expect(outcome.error.message).toContain("32 MiB worktree metadata listing limit");
 			expect(fs.existsSync(`${source.path()}/.omp-listing-complete`)).toBe(false);
 			expect(candidateListingBytesBeforeCleanup).not.toBeNull();
