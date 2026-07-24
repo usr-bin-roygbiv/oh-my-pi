@@ -159,7 +159,7 @@ type SessionBeforeEvent = Extract<
 			| "session_before_branch"
 			| "session_before_compact"
 			| "session_before_tree";
-	},
+	}
 >;
 
 type SessionBeforeEventResult =
