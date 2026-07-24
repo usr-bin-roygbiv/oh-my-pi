@@ -9,6 +9,7 @@ import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
+import { HookRunner } from "@oh-my-pi/pi-coding-agent/extensibility/hooks/runner";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -360,6 +361,24 @@ describe("AgentSession.branchFromBtw", () => {
 		]);
 		expect(moveCallCount).toBe(1);
 		expect(activeSession.sessionManager.getCwd()).toBe(targetCwd);
+	});
+
+	it("uses the relocated session cwd in hook command contexts", async () => {
+		const activeSession = await createSession({ persisted: false });
+		if (!authStorage) throw new Error("Expected auth storage");
+		const originalCwd = activeSession.sessionManager.getCwd();
+		const targetCwd = path.join(tempDir, "hook-context-move-target");
+		fs.mkdirSync(targetCwd);
+		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "hook-models.yml"));
+		const hookRunner = new HookRunner([], originalCwd, activeSession.sessionManager, modelRegistry);
+
+		await activeSession.sessionManager.moveTo(targetCwd);
+		const commandContext = hookRunner.createCommandContext();
+
+		expect({ cwd: commandContext.cwd, sessionCwd: commandContext.sessionManager.getCwd() }).toEqual({
+			cwd: targetCwd,
+			sessionCwd: targetCwd,
+		});
 	});
 
 	it("coalesces a queued duplicate move after the first reaches its target", async () => {

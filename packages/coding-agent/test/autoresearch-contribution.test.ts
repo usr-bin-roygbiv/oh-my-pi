@@ -1287,6 +1287,42 @@ describe("contribution fork validation and publication", () => {
 		}
 	});
 
+	it("preserves the selected remote identity for the normal pre-push hook", async () => {
+		const source = TempDir.createSync("@pi-contribution-hook-remote-source-");
+		const remote = TempDir.createSync("@pi-contribution-hook-remote-target-");
+		try {
+			await $`git init --bare ${remote.path()}`.quiet();
+			await $`git -C ${source.path()} init -b main`.quiet();
+			await $`git -C ${source.path()} config user.name OMP`.quiet();
+			await $`git -C ${source.path()} config user.email omp@example.invalid`.quiet();
+			await Bun.write(`${source.path()}/candidate.txt`, "candidate\n");
+			await $`git -C ${source.path()} add candidate.txt`.quiet();
+			await $`git -C ${source.path()} commit -m candidate`.quiet();
+			const candidateSha = (await $`git -C ${source.path()} rev-parse HEAD`.quiet()).text().trim();
+			const remoteUrl = `file://${remote.path()}`;
+			await $`git -C ${source.path()} remote add origin ${remoteUrl}`.quiet();
+			const hookMarker = `${source.path()}/pre-push-remote`;
+			const hookPath = `${source.path()}/.git/hooks/pre-push`;
+			await Bun.write(hookPath, `#!/bin/sh\nprintf '%s\\n%s\\n' "$1" "$2" > ${JSON.stringify(hookMarker)}\n`);
+			fs.chmodSync(hookPath, 0o755);
+
+			await git.push(source.path(), {
+				remote: "origin",
+				verifiedRemoteUrl: remoteUrl,
+				refspec: `${candidateSha}:refs/heads/${CONTRIBUTION_BRANCH}`,
+				forceWithLease: `refs/heads/${CONTRIBUTION_BRANCH}:`,
+			});
+
+			expect((await Bun.file(hookMarker).text()).trim().split("\n")).toEqual(["origin", remoteUrl]);
+			expect(
+				(await $`git --git-dir ${remote.path()} rev-parse refs/heads/${CONTRIBUTION_BRANCH}`.quiet()).text().trim(),
+			).toBe(candidateSha);
+		} finally {
+			source.removeSync();
+			remote.removeSync();
+		}
+	});
+
 	it("leaves the candidate ref absent when the normal pre-push hook rejects", async () => {
 		const source = TempDir.createSync("@pi-contribution-rejected-push-source-");
 		const remote = TempDir.createSync("@pi-contribution-rejected-push-remote-");
@@ -1399,6 +1435,102 @@ describe("contribution fork validation and publication", () => {
 			source.removeSync();
 		}
 	});
+
+	it("fails closed when raw ancestry proof exceeds its commit traversal bound", async () => {
+		const source = TempDir.createSync("@pi-contribution-ancestry-bound-");
+		try {
+			await $`git -C ${source.path()} init -b main`.quiet();
+			await Bun.write(`${source.path()}/proof.txt`, "base\n");
+			await $`git -C ${source.path()} add proof.txt`.quiet();
+			await $`git -C ${source.path()} -c user.name=OMP -c user.email=omp@example.invalid commit -m base`.quiet();
+			const treeSha = (await $`git -C ${source.path()} rev-parse HEAD^{tree}`.quiet()).text().trim();
+			const unrelatedSha = (
+				await $`git -C ${source.path()} -c user.name=OMP -c user.email=omp@example.invalid commit-tree ${treeSha} -m unrelated`.quiet()
+			)
+				.text()
+				.trim();
+			let descendantSha = (await $`git -C ${source.path()} rev-parse HEAD`.quiet()).text().trim();
+			for (let index = 0; index < 2; index++) {
+				descendantSha = (
+					await $`git -C ${source.path()} -c user.name=OMP -c user.email=omp@example.invalid commit-tree ${treeSha} -p ${descendantSha} -m ${`descendant-${index}`}`.quiet()
+				)
+					.text()
+					.trim();
+			}
+			const boundedIsAncestor = git.isAncestor as (
+				cwd: string,
+				ancestor: string,
+				descendant: string,
+				signal: AbortSignal | undefined,
+				maxCommits: number,
+			) => Promise<boolean>;
+
+			await expect(
+				boundedIsAncestor(source.path(), unrelatedSha, descendantSha, undefined, 2),
+			).rejects.toThrow("Raw Git ancestry proof exceeds the 2-commit traversal limit.");
+		} finally {
+			source.removeSync();
+		}
+	});
+
+	it(
+		"enforces the fixed ancestry ceiling on the production four-argument call",
+		async () => {
+			const source = TempDir.createSync("@pi-contribution-default-ancestry-bound-");
+			try {
+				await $`git -C ${source.path()} init -b main`.quiet();
+				await Bun.write(`${source.path()}/proof.txt`, "base\n");
+				await $`git -C ${source.path()} add proof.txt`.quiet();
+				await $`git -C ${source.path()} -c user.name=OMP -c user.email=omp@example.invalid commit -m base`.quiet();
+				const unrelatedSha = (await $`git -C ${source.path()} rev-parse HEAD`.quiet()).text().trim();
+				const treeSha = (await $`git -C ${source.path()} rev-parse HEAD^{tree}`.quiet()).text().trim();
+				const objectDirectory = `${source.path()}/commit-objects`;
+				await fs.promises.mkdir(objectDirectory);
+				const parentObjectPaths = Array.from({ length: 257 }, (_, index) => `commit-objects/parent-${index}`);
+				await Promise.all(
+					parentObjectPaths.map((relativePath, index) =>
+						Bun.write(
+							`${source.path()}/${relativePath}`,
+							`tree ${treeSha}\nauthor OMP <omp@example.invalid> 1 +0000\ncommitter OMP <omp@example.invalid> 1 +0000\n\nparent-${index}\n`,
+						),
+					),
+				);
+				const gitBinary = $which("git");
+				if (!gitBinary) throw new Error("Expected git binary for ancestry fixture");
+				const hashParents = Bun.spawn([gitBinary, "hash-object", "-w", "-t", "commit", "--stdin-paths"], {
+					cwd: source.path(),
+					stdin: new Blob([`${parentObjectPaths.join("\n")}\n`]),
+					stdout: "pipe",
+					stderr: "pipe",
+				});
+				const [hashExitCode, hashOutput, hashError] = await Promise.all([
+					hashParents.exited,
+					new Response(hashParents.stdout).text(),
+					new Response(hashParents.stderr).text(),
+				]);
+				if (hashExitCode !== 0) throw new Error(`Unable to build ancestry fixture: ${hashError}`);
+				const parentShas = hashOutput.trim().split("\n");
+				if (parentShas.length !== 257) throw new Error("Expected 257 raw parent commits");
+				const descendantObject = `${objectDirectory}/descendant`;
+				await Bun.write(
+					descendantObject,
+					`tree ${treeSha}\n${parentShas.map(sha => `parent ${sha}`).join("\n")}\nauthor OMP <omp@example.invalid> 2 +0000\ncommitter OMP <omp@example.invalid> 2 +0000\n\ndescendant\n`,
+				);
+				const descendantSha = (
+					await $`git -C ${source.path()} hash-object -w -t commit ${descendantObject}`.quiet()
+				)
+					.text()
+					.trim();
+
+				await expect(git.isAncestor(source.path(), unrelatedSha, descendantSha)).rejects.toThrow(
+					"Raw Git ancestry proof exceeds the 256-commit traversal limit.",
+				);
+			} finally {
+				source.removeSync();
+			}
+		},
+		60_000,
+	);
 
 	it("does not inspect legacy graft content before raw ancestry traversal", async () => {
 		const source = TempDir.createSync("@pi-contribution-graft-read-");
@@ -2246,6 +2378,7 @@ interface IntegrationHarnessOptions {
 	checkoutFailure?: Error;
 	rollbackCheckoutFailure?: Error;
 	branchDeleteFailure?: Error;
+	forkRemoteName?: string;
 	onGoalRefRequest?(signal?: AbortSignal): void | Promise<void>;
 	onConfirm?(callNumber: number, title: string, signal?: AbortSignal): void | Promise<void>;
 	onSetModel?(callNumber: number): void | Promise<void>;
@@ -2400,6 +2533,7 @@ function createIntegrationHarness(cwd: string, options: IntegrationHarnessOption
 	let goalLoadCount = 0;
 	let forkMetadataRequestCount = 0;
 	let ancestryRequestCount = 0;
+	const forkRemoteName = options.forkRemoteName ?? "origin";
 
 	const realWriteWorktreeTree = git.writeWorktreeTree;
 	const realWriteTree = git.writeTree;
@@ -2477,12 +2611,12 @@ function createIntegrationHarness(cwd: string, options: IntegrationHarnessOption
 		gitEvents.push(`delete:${branch}`);
 		if (options.branchDeleteFailure) throw options.branchDeleteFailure;
 	});
-	vi.spyOn(git.remote, "list").mockResolvedValue(["origin", "upstream"]);
+	vi.spyOn(git.remote, "list").mockResolvedValue([forkRemoteName, "upstream"]);
 	vi.spyOn(git.remote, "url").mockImplementation(async (_workDir, remote) =>
-		remote === "origin" ? FORK_URL : "https://github.com/can1357/oh-my-pi.git",
+		remote === forkRemoteName ? FORK_URL : "https://github.com/can1357/oh-my-pi.git",
 	);
 	vi.spyOn(git.remote, "pushUrl").mockImplementation(async (_workDir, remote) =>
-		remote === "origin" ? FORK_URL : "https://github.com/can1357/oh-my-pi.git",
+		remote === forkRemoteName ? FORK_URL : "https://github.com/can1357/oh-my-pi.git",
 	);
 	vi.spyOn(git, "push").mockImplementation(async (_workDir, pushOptions) => {
 		gitEvents.push("push");
@@ -3968,6 +4102,85 @@ describe("process-local contribution lifecycle", () => {
 		expect(storage.listLoggedRuns(session.id)).toEqual([]);
 	});
 
+	it("rejects an ignored untracked contribution harness omitted from the materialized tree", async () => {
+		await initializeRealContributionRepository(cwd.path());
+		await $`git -C ${cwd.path()} rm autoresearch.sh`.quiet();
+		await $`git -C ${cwd.path()} commit -m remove-harness-from-base`.quiet();
+		await Bun.write(`${cwd.path()}/.git/info/exclude`, "autoresearch.sh\n");
+		await Bun.write(`${cwd.path()}/autoresearch.sh`, "#!/usr/bin/env bash\necho METRIC runtime_ms=1\n");
+		const harness = createIntegrationHarness(cwd.path());
+		await startContribution(harness);
+		const { session, storage } = await prepareInitializedContribution(harness, cwd.path());
+		const run = harness.tools.get("run_experiment");
+		if (!run) throw new Error("Expected contribution run tool");
+		let executionCalls = 0;
+		vi.spyOn(bashExecutor, "executeBash").mockImplementation(async () => {
+			executionCalls++;
+			return {
+				output: "METRIC runtime_ms=1",
+				exitCode: 0,
+				cancelled: false,
+				truncated: false,
+				totalLines: 1,
+				totalBytes: 19,
+				outputLines: 1,
+				outputBytes: 19,
+			};
+		});
+
+		await Promise.allSettled([
+			run.execute("ignored-untracked-harness", {}, undefined, undefined, harness.ctx as ExtensionContext),
+		]);
+		const pending = storage.getPendingRun(session.id);
+
+		expect(executionCalls).toBe(0);
+		expect(pending).not.toBeNull();
+		expect(pending?.completedAt).toBeNull();
+		expect(storage.listLoggedRuns(session.id)).toEqual([]);
+	});
+
+	it("rejects a symlinked contribution harness before executing its external target", async () => {
+		const external = TempDir.createSync("@pi-contribution-external-harness-");
+		try {
+			await initializeRealContributionRepository(cwd.path());
+			const harness = createIntegrationHarness(cwd.path());
+			await startContribution(harness);
+			const { session, storage } = await prepareInitializedContribution(harness, cwd.path());
+			const externalHarness = `${external.path()}/passing.sh`;
+			await Bun.write(externalHarness, "#!/usr/bin/env bash\necho METRIC runtime_ms=1\n");
+			await fs.promises.rm(`${cwd.path()}/autoresearch.sh`);
+			await fs.promises.symlink(externalHarness, `${cwd.path()}/autoresearch.sh`);
+			const run = harness.tools.get("run_experiment");
+			if (!run) throw new Error("Expected contribution run tool");
+			let executionCalls = 0;
+			vi.spyOn(bashExecutor, "executeBash").mockImplementation(async () => {
+				executionCalls++;
+				return {
+					output: "METRIC runtime_ms=1",
+					exitCode: 0,
+					cancelled: false,
+					truncated: false,
+					totalLines: 1,
+					totalBytes: 19,
+					outputLines: 1,
+					outputBytes: 19,
+				};
+			});
+
+			await Promise.allSettled([
+				run.execute("symlinked-harness", {}, undefined, undefined, harness.ctx as ExtensionContext),
+			]);
+			const pending = storage.getPendingRun(session.id);
+
+			expect(executionCalls).toBe(0);
+			expect(pending).not.toBeNull();
+			expect(pending?.completedAt).toBeNull();
+			expect(storage.listLoggedRuns(session.id)).toEqual([]);
+		} finally {
+			external.removeSync();
+		}
+	});
+
 	it("runs normal commit hooks and logs only the exact one-parent passing-tree commit", async () => {
 		await initializeRealContributionRepository(cwd.path());
 		const baseHead = (await $`git -C ${cwd.path()} rev-parse HEAD`.quiet()).text().trim();
@@ -4597,6 +4810,29 @@ describe("process-local contribution lifecycle", () => {
 			expect.objectContaining({ title: "Inspect official contribution prerequisites?" }),
 		]);
 		expect(harness.githubEndpoints).toEqual([]);
+		expect(harness.setModelCalls).toEqual([]);
+		expect(harness.checkoutNewCalls).toEqual([]);
+		expect(harness.activeTools).toEqual(initialTools);
+		expect(harness.appendEntries).toEqual([]);
+		expect(harness.sentUserMessages).toEqual([]);
+		expect(snapshotStorageArtifacts(dbDir.path())).toEqual([]);
+	});
+
+	it("rejects overlong fork remote names before final consent or activation", async () => {
+		const harness = createIntegrationHarness(cwd.path(), {
+			confirmAnswers: [true, true],
+			forkRemoteName: "r".repeat(101),
+		});
+		const initialTools = [...harness.activeTools];
+
+		await startContribution(harness);
+
+		expect(harness.confirmCalls.map(call => call.title)).toEqual(["Inspect official contribution prerequisites?"]);
+		expect(harness.selectCalls.map(call => call.title)).toEqual(["Select authenticated contribution model"]);
+		expect(harness.notifications.at(-1)).toEqual({
+			message: "No eligible GitHub fork remote is configured for can1357/oh-my-pi.",
+			type: "error",
+		});
 		expect(harness.setModelCalls).toEqual([]);
 		expect(harness.checkoutNewCalls).toEqual([]);
 		expect(harness.activeTools).toEqual(initialTools);
