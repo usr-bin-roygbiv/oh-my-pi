@@ -4643,6 +4643,253 @@ describe("process-local contribution lifecycle", () => {
 		]);
 	});
 
+	for (const lifecycleCommand of ["off", "clear"] as const) {
+		it(`aborts and drains an admitted ordinary mutation before /autoresearch ${lifecycleCommand} settles`, async () => {
+			await initializeRealContributionRepository(cwd.path());
+			const repositoryHead = (await $`git -C ${cwd.path()} rev-parse HEAD`.quiet()).text().trim();
+			const harness = createIntegrationHarness(cwd.path());
+			const branchA = "autoresearch/ordinary-lifecycle-a";
+			const branchB = "autoresearch/ordinary-lifecycle-b";
+			harness.setCurrentBranch(branchA);
+			harness.setHeadSha(repositoryHead);
+			await commandRequired(harness, "autoresearch").handler("branch A lifecycle goal", harness.ctx);
+			const init = harness.tools.get("init_experiment");
+			const updateNotes = harness.tools.get("update_notes");
+			if (!init || !updateNotes) throw new Error("Expected ordinary autoresearch tools");
+			await init.execute(
+				`ordinary-${lifecycleCommand}-session`,
+				{ name: "ordinary lifecycle", primary_metric: "runtime_ms", metric_unit: "ms" },
+				undefined,
+				undefined,
+				harness.ctx as ExtensionContext,
+			);
+			const storage = await openAutoresearchStorage(cwd.path());
+			const sessionA = storage.getActiveSessionForBranch(branchA);
+			if (!sessionA) throw new Error("Expected initialized branch A session");
+			const sessionB = storage.openSession({
+				name: "unrelated branch B session",
+				goal: "branch B remains open",
+				primaryMetric: "runtime_ms",
+				metricUnit: "ms",
+				direction: "lower",
+				preferredCommand: "bash autoresearch.sh",
+				branch: branchB,
+				baselineCommit: repositoryHead,
+				maxIterations: null,
+				scopePaths: [],
+				offLimits: [],
+				constraints: [],
+				secondaryMetrics: [],
+			});
+			await Bun.write(`${cwd.path()}/source.ts`, "export const value = 'candidate';\n");
+			const notesBefore = sessionA.notes;
+			const mutationEntered = Promise.withResolvers<void>();
+			const releaseMutation = Promise.withResolvers<void>();
+			let mutationSignal: AbortSignal | undefined;
+			vi.spyOn(git.branch, "current").mockImplementation(async (_workDir, signal) => {
+				if (signal) {
+					mutationSignal = signal;
+					mutationEntered.resolve();
+					await releaseMutation.promise;
+					if (signal.aborted) {
+						throw signal.reason ?? new DOMException("Ordinary notes mutation invalidated", "AbortError");
+					}
+				}
+				return harness.currentBranch();
+			});
+
+			const settlementOrder: string[] = [];
+			let mutationSettled = false;
+			const mutationPromise = updateNotes
+				.execute(
+					`ordinary-notes-during-${lifecycleCommand}`,
+					{ body: "stale notes must not publish" },
+					undefined,
+					undefined,
+					harness.ctx as ExtensionContext,
+				)
+				.finally(() => {
+					mutationSettled = true;
+					settlementOrder.push("mutation");
+				});
+			await mutationEntered.promise;
+			let commandSettled = false;
+			const commandPromise = commandRequired(harness, "autoresearch")
+				.handler(lifecycleCommand, harness.ctx)
+				.finally(() => {
+					commandSettled = true;
+					settlementOrder.push("command");
+				});
+			for (let turn = 0; turn < 4; turn++) await Promise.resolve();
+
+			const mutationSettledBeforeRelease = mutationSettled;
+			const commandSettledBeforeRelease = commandSettled;
+			const mutationSignalDefinedBeforeRelease = mutationSignal !== undefined;
+			const mutationSignalAbortedBeforeRelease = mutationSignal?.aborted;
+
+			releaseMutation.resolve();
+			const [mutationResult, commandResult] = await Promise.allSettled([mutationPromise, commandPromise]);
+			expect(mutationSettledBeforeRelease).toBe(false);
+			expect(commandSettledBeforeRelease).toBe(false);
+			expect(mutationSignalDefinedBeforeRelease).toBe(true);
+			expect(mutationSignalAbortedBeforeRelease).toBe(true);
+			expect(mutationResult).toMatchObject({ status: "rejected", reason: { name: "ToolAbortError" } });
+			expect(commandResult.status).toBe("fulfilled");
+			expect(settlementOrder.indexOf("mutation")).toBeLessThan(settlementOrder.indexOf("command"));
+			expect(storage.getSessionById(sessionA.id)?.notes).toBe(notesBefore);
+			expect(storage.getSessionById(sessionB.id)?.closedAt).toBeNull();
+			expect(harness.activeTools).toEqual(["read", "bash"]);
+			expect(harness.widgetValues.at(-1)).toBeUndefined();
+			expect((await $`git -C ${cwd.path()} rev-parse HEAD`.quiet()).text().trim()).toBe(repositoryHead);
+			if (lifecycleCommand === "clear") {
+				expect(storage.getSessionById(sessionA.id)?.closedAt).not.toBeNull();
+				expect(storage.getActiveSessionForBranch(branchA)).toBeNull();
+				expect(await Bun.file(`${cwd.path()}/source.ts`).text()).toBe("export const value = 'baseline';\n");
+				expect(harness.appendEntries.at(-1)).toEqual({
+					customType: "autoresearch-control",
+					data: { mode: "clear", goal: null },
+				});
+			} else {
+				expect(storage.getSessionById(sessionA.id)?.closedAt).toBeNull();
+				expect(storage.getActiveSessionForBranch(branchA)?.id).toBe(sessionA.id);
+				expect(await Bun.file(`${cwd.path()}/source.ts`).text()).toBe("export const value = 'candidate';\n");
+				expect(harness.appendEntries.at(-1)).toEqual({
+					customType: "autoresearch-control",
+					data: { mode: "off", goal: "branch A lifecycle goal" },
+				});
+			}
+
+			const settledState = {
+				notes: storage.getSessionById(sessionA.id)?.notes,
+				closedAt: storage.getSessionById(sessionA.id)?.closedAt,
+				activeTools: [...harness.activeTools],
+				widgetUpdates: harness.widgetUpdates,
+				head: (await $`git -C ${cwd.path()} rev-parse HEAD`.quiet()).text().trim(),
+			};
+			for (let turn = 0; turn < 4; turn++) await Promise.resolve();
+			expect({
+				notes: storage.getSessionById(sessionA.id)?.notes,
+				closedAt: storage.getSessionById(sessionA.id)?.closedAt,
+				activeTools: [...harness.activeTools],
+				widgetUpdates: harness.widgetUpdates,
+				head: (await $`git -C ${cwd.path()} rev-parse HEAD`.quiet()).text().trim(),
+			}).toEqual(settledState);
+		});
+	}
+
+	it("binds an ordinary session to branch A and restores it only after returning from branch B", async () => {
+		const harness = createIntegrationHarness(cwd.path());
+		const branchA = "autoresearch/branch-owned-a";
+		const branchB = "autoresearch/branch-owned-b";
+		const goal = "branch-owned ordinary goal";
+		harness.setCurrentBranch(branchA);
+		await commandRequired(harness, "autoresearch").handler(goal, harness.ctx);
+		await Bun.write(`${cwd.path()}/autoresearch.sh`, "#!/usr/bin/env bash\necho METRIC runtime_ms=1\n");
+		const init = harness.tools.get("init_experiment");
+		const updateNotes = harness.tools.get("update_notes");
+		if (!init || !updateNotes) throw new Error("Expected ordinary autoresearch tools");
+		await init.execute(
+			"branch-owned-session",
+			{ name: "branch owned", primary_metric: "runtime_ms", metric_unit: "ms" },
+			undefined,
+			undefined,
+			harness.ctx as ExtensionContext,
+		);
+		await updateNotes.execute(
+			"branch-a-notes",
+			{ body: "branch A durable notes" },
+			undefined,
+			undefined,
+			harness.ctx as ExtensionContext,
+		);
+		const storage = await openAutoresearchStorage(cwd.path());
+		const sessionA = storage.getActiveSessionForBranch(branchA);
+		if (!sessionA) throw new Error("Expected initialized branch A session");
+		const storedABeforeB = {
+			notes: storage.getSessionById(sessionA.id)?.notes,
+			closedAt: storage.getSessionById(sessionA.id)?.closedAt,
+			currentSegment: storage.getSessionById(sessionA.id)?.currentSegment,
+		};
+		harness.setSessionBranch([
+			{
+				type: "custom",
+				customType: "autoresearch-control",
+				id: "branch-owned-control",
+				parentId: null,
+				timestamp: new Date(0).toISOString(),
+				data: { mode: "on", goal },
+			},
+		]);
+		const rehydrate = handlerRequired<{ type: "session_branch" }>(harness, "session_branch");
+		const beforeAgentStart = handlerRequired<BeforeAgentStartEvent, { systemPrompt?: string[] }>(
+			harness,
+			"before_agent_start",
+		);
+		const promptOnA = await beforeAgentStart(
+			{ type: "before_agent_start", prompt: "continue on A", systemPrompt: ["base prompt"] },
+			harness.ctx as ExtensionContext,
+		);
+		expect(promptOnA?.systemPrompt?.[0]).toContain("branch A durable notes");
+
+		harness.setCurrentBranch(branchB);
+		await rehydrate({ type: "session_branch" }, harness.ctx as ExtensionContext);
+		const promptOnB = await beforeAgentStart(
+			{ type: "before_agent_start", prompt: "continue on B", systemPrompt: ["base prompt"] },
+			harness.ctx as ExtensionContext,
+		);
+		const [mutationOnB] = await Promise.allSettled([
+			updateNotes.execute(
+				"branch-b-stale-notes",
+				{ body: "branch B must not mutate branch A" },
+				undefined,
+				undefined,
+				harness.ctx as ExtensionContext,
+			),
+		]);
+
+		expect(storage.getActiveSessionForBranch(branchB)).toBeNull();
+		expect(promptOnB).toBeUndefined();
+		expect(harness.activeTools).toEqual(["read", "bash"]);
+		expect(harness.widgetValues.at(-1)).toBeUndefined();
+		expect(mutationOnB).toMatchObject({ status: "rejected", reason: { name: "ToolAbortError" } });
+		expect({
+			notes: storage.getSessionById(sessionA.id)?.notes,
+			closedAt: storage.getSessionById(sessionA.id)?.closedAt,
+			currentSegment: storage.getSessionById(sessionA.id)?.currentSegment,
+		}).toEqual(storedABeforeB);
+
+		harness.setCurrentBranch(branchA);
+		await rehydrate({ type: "session_branch" }, harness.ctx as ExtensionContext);
+		const restoredPrompt = await beforeAgentStart(
+			{ type: "before_agent_start", prompt: "continue on A again", systemPrompt: ["base prompt"] },
+			harness.ctx as ExtensionContext,
+		);
+		expect(storage.getActiveSessionForBranch(branchA)?.id).toBe(sessionA.id);
+		expect(storage.getActiveSessionForBranch(branchB)).toBeNull();
+		expect(restoredPrompt?.systemPrompt?.[0]).toContain(goal);
+		expect(restoredPrompt?.systemPrompt?.[0]).toContain("branch A durable notes");
+		expect(harness.activeTools).toEqual([
+			"read",
+			"bash",
+			"init_experiment",
+			"run_experiment",
+			"log_experiment",
+			"update_notes",
+		]);
+		expect(harness.widgetValues.at(-1)).not.toBeUndefined();
+		const [restoredMutation] = await Promise.allSettled([
+			updateNotes.execute(
+				"branch-a-restored-notes",
+				{ body: "branch A restored notes" },
+				undefined,
+				undefined,
+				harness.ctx as ExtensionContext,
+			),
+		]);
+		expect(restoredMutation.status).toBe("fulfilled");
+		expect(storage.getSessionById(sessionA.id)?.notes).toBe("branch A restored notes");
+	});
+
 	it("does not abort an ordinary mutation when contribution mode is already off", async () => {
 		const harness = createIntegrationHarness(cwd.path());
 		await commandRequired(harness, "autoresearch").handler("ordinary mutation", harness.ctx);
