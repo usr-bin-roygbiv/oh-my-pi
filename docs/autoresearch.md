@@ -187,11 +187,12 @@ and candidate SHA.
 Safe terminal turns continue automatically in the same native OMP process.
 Automatic continuation stops for queued human input, an explicit
 `[CONTRIBUTE_PAUSE]` gate, an interrupted/aborted turn, a provider/tool error,
-`/contribute review`, `/contribute off`, session or tree/branch switching, or
-session exit. A switch, branch, or tree transition attempted while contribution
-startup, mutation, shutdown, or publication work is settling is canceled
-immediately; wait for the stop to finish, inspect `/contribute status`, then retry
-the transition. After an interruption or input gate, resolve the gate explicitly,
+`/contribute review`, `/contribute off`, a working-directory move, session or
+tree/branch switching, or session exit. A move, switch, branch, or tree transition
+attempted while contribution startup, mutation, shutdown, or publication work is
+settling is canceled immediately; wait for the stop to finish, inspect
+`/contribute status`, then retry the transition.
+After an interruption or input gate, resolve the gate explicitly,
 then send a deliberate message or stop the flow. There is no background restart.
 
 `/contribute off` closes the process-local experiment session and deactivates its
