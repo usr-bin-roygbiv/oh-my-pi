@@ -19,7 +19,11 @@ const CHUNK: usize = 64 * 1024;
 pub fn run(argv: Vec<OsString>) -> i32 {
 	let mut args = argv.into_iter().skip(1).peekable();
 	let mut invert = false;
-	match args.peek().map(|a| a.to_string_lossy().into_owned()).as_deref() {
+	match args
+		.peek()
+		.map(|a| a.to_string_lossy().into_owned())
+		.as_deref()
+	{
 		Some("-n") => {
 			invert = true;
 			args.next();
@@ -90,11 +94,7 @@ fn spawn_and_pump(command: &[OsString], first: Option<u8>, stdin: &mut impl Read
 	{
 		Ok(child) => child,
 		Err(err) => {
-			let _ = writeln!(
-				pi_uutils_ctx::stderr(),
-				"ifne: {}: {err}",
-				command[0].to_string_lossy()
-			);
+			let _ = writeln!(pi_uutils_ctx::stderr(), "ifne: {}: {err}", command[0].to_string_lossy());
 			return 127;
 		},
 	};
@@ -120,9 +120,7 @@ fn spawn_and_pump(command: &[OsString], first: Option<u8>, stdin: &mut impl Read
 		// Ignore BrokenPipe: the child may exit before consuming its stdin
 		// (e.g. `ifne head -1`).
 		let pump = match copy_cancellable(stdin, &mut child_stdin, first) {
-			Err(CopyError::Io(err)) if err.kind() != ErrorKind::BrokenPipe => {
-				Err(CopyError::Io(err))
-			},
+			Err(CopyError::Io(err)) if err.kind() != ErrorKind::BrokenPipe => Err(CopyError::Io(err)),
 			Err(CopyError::Cancelled) => Err(CopyError::Cancelled),
 			_ => Ok(()),
 		};
@@ -170,7 +168,7 @@ fn copy_cancellable(
 	if let Some(byte) = first {
 		dst.write_all(&[byte]).map_err(CopyError::Io)?;
 	}
-	let mut buf = [0u8; CHUNK];
+	let mut buf = vec![0u8; CHUNK].into_boxed_slice();
 	loop {
 		if pi_uutils_ctx::is_cancelled() {
 			return Err(CopyError::Cancelled);
@@ -231,14 +229,14 @@ mod tests {
 		let stdout = Arc::new(Mutex::new(Vec::new()));
 		let stderr = Arc::new(Mutex::new(Vec::new()));
 		let io = ScopeIo {
-			stdin: Box::new(Cursor::new(stdin.to_vec())),
-			stdin_fd: None,
+			stdin:                 Box::new(Cursor::new(stdin.to_vec())),
+			stdin_fd:              None,
 			stdin_is_search_input: false,
-			stdout: Box::new(SharedWriter(Arc::clone(&stdout))),
-			stderr: Box::new(SharedWriter(Arc::clone(&stderr))),
-			cwd: std::env::temp_dir(),
-			env: HashMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]),
-			cancel: Arc::new(AtomicBool::new(false)),
+			stdout:                Box::new(SharedWriter(Arc::clone(&stdout))),
+			stderr:                Box::new(SharedWriter(Arc::clone(&stderr))),
+			cwd:                   std::env::temp_dir(),
+			env:                   HashMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]),
+			cancel:                Arc::new(AtomicBool::new(false)),
 		};
 		let argv = std::iter::once("ifne")
 			.chain(args.iter().copied())

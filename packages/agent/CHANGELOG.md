@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [17.1.2] - 2026-07-24
+
 ### Added
 
 - Added `resolveFallbackTool` option to allow routing unadvertised tool calls to host-side transports (e.g., device mounts)

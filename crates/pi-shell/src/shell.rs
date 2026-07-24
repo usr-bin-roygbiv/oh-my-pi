@@ -2234,13 +2234,14 @@ mod tests {
 		params.set_fd(OpenFiles::STDERR_FD, null_file().expect("null stderr"));
 		let source_info = SourceInfo::from("pi-natives:test");
 
-		let script = "PATH=/definitely-missing\n\
-			echo x | ts -s '%H:%M:%S' | sponge out || exit 10\n\
-			isutf8 out || exit 11\n\
-			echo x | combine - and out || exit 12\n\
-			ifne /definitely-missing/tool || exit 13";
-		let result =
-			session.shell.run_string(script, &source_info, &params).await.expect("moreutils script");
+		let script = "PATH=/definitely-missing\necho x | ts -s '%H:%M:%S' | sponge out || exit \
+		              10\nisutf8 out || exit 11\necho x | combine - and out || exit 12\nifne \
+		              /definitely-missing/tool || exit 13";
+		let result = session
+			.shell
+			.run_string(script, &source_info, &params)
+			.await
+			.expect("moreutils script");
 		assert_eq!(exit_code(&result), 0);
 
 		// `ts -s` stamps the first line with zero elapsed time: `HH:MM:SS x`.

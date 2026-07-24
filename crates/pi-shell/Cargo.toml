@@ -80,6 +80,7 @@ uu_sed = { path = "../vendor/uu-sed" }
 uu_xargs = { path = "../vendor/uu-xargs" }
 jaq = { path = "../vendor/jaq" }
 jiff = { version = "0.2", features = ["tzdb-bundle-platform"] }
+memchr = "2"
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

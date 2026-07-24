@@ -5,7 +5,7 @@
 //! byte strings; membership comparison strips a trailing `\n`, so a final line
 //! without a newline still matches, and is emitted as-is (no newline added).
 //! Usage errors (wrong arg count, unknown OP, both sides stdin) exit 1, unlike
-//! moreutils' die() exit 255.
+//! moreutils' `die()` exit 255.
 
 use std::{
 	collections::HashSet,
@@ -36,7 +36,7 @@ enum Error {
 
 impl From<String> for Error {
 	fn from(msg: String) -> Self {
-		Error::Msg(msg)
+		Self::Msg(msg)
 	}
 }
 
@@ -56,9 +56,15 @@ pub fn run(argv: Vec<OsString>) -> i32 {
 		},
 	};
 
-	let file1 = matches.get_one::<OsString>(ARG_FILE1).expect("required").clone();
+	let file1 = matches
+		.get_one::<OsString>(ARG_FILE1)
+		.expect("required")
+		.clone();
 	let op = matches.get_one::<String>(ARG_OP).expect("required");
-	let file2 = matches.get_one::<OsString>(ARG_FILE2).expect("required").clone();
+	let file2 = matches
+		.get_one::<OsString>(ARG_FILE2)
+		.expect("required")
+		.clone();
 
 	match execute(&file1, op, &file2) {
 		Ok(()) => 0,
@@ -158,8 +164,7 @@ fn open_input(name: &OsStr) -> Result<Box<dyn BufRead>, Error> {
 		return Ok(Box::new(BufReader::new(pi_uutils_ctx::stdin())));
 	}
 	let path = pi_uutils_ctx::resolve(name);
-	let file =
-		File::open(path).map_err(|err| Error::Msg(input_error(name, &err.to_string())))?;
+	let file = File::open(path).map_err(|err| Error::Msg(input_error(name, &err.to_string())))?;
 	Ok(Box::new(BufReader::new(file)))
 }
 
@@ -202,7 +207,8 @@ fn key(line: &[u8]) -> &[u8] {
 }
 
 fn write_line(out: &mut impl Write, line: &[u8]) -> Result<(), Error> {
-	out.write_all(line).map_err(|err| Error::Msg(err.to_string()))
+	out.write_all(line)
+		.map_err(|err| Error::Msg(err.to_string()))
 }
 
 fn input_error(name: &OsStr, err: &str) -> String {

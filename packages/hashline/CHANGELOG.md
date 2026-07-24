@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [17.1.2] - 2026-07-24
+
 ### Changed
 
 - Bare `- ` bullet body rows are now auto-accepted as literal content with a warning when the hunk is unambiguously a Markdown bullet list (every `-` row bullet-shaped and no plain `+new` diff counterpart); ambiguous `-` rows still fail with the teaching error.

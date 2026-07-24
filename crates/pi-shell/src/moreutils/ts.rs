@@ -6,8 +6,8 @@
 //! - `-i`: time elapsed since the previous line (default format `%H:%M:%S`)
 //! - `-s`: time elapsed since program start (default format `%H:%M:%S`)
 //! - `-m`: use the monotonic clock for `-i`/`-s` elapsed computation
-//! - `-r`: rewrite an existing leading timestamp (RFC3339/ISO8601 or syslog
-//!   `%b %d %H:%M:%S`) into a human-relative form
+//! - `-r`: rewrite an existing leading timestamp (RFC3339/ISO8601 or syslog `%b
+//!   %d %H:%M:%S`) into a human-relative form
 //!
 //! Elapsed durations are formatted as if they were seconds since the Unix
 //! epoch rendered in UTC (matching moreutils), so 90 elapsed seconds with
@@ -100,8 +100,16 @@ fn command() -> Command {
 				.action(ArgAction::SetTrue),
 		)
 		.arg(Arg::new("help").long("help").action(ArgAction::Help))
-		.arg(Arg::new("version").long("version").action(ArgAction::Version))
-		.arg(Arg::new(ARG_FORMAT).value_name("FORMAT").help("strftime format string"))
+		.arg(
+			Arg::new("version")
+				.long("version")
+				.action(ArgAction::Version),
+		)
+		.arg(
+			Arg::new(ARG_FORMAT)
+				.value_name("FORMAT")
+				.help("strftime format string"),
+		)
 }
 
 /// Timestamping mode selected by the flags.
@@ -149,7 +157,9 @@ fn timestamp_lines(matches: &ArgMatches) -> Result<i32, String> {
 			return Ok(130);
 		}
 		buf.clear();
-		let n = reader.read_until(b'\n', &mut buf).map_err(|err| err.to_string())?;
+		let n = reader
+			.read_until(b'\n', &mut buf)
+			.map_err(|err| err.to_string())?;
 		if n == 0 {
 			break;
 		}
@@ -162,8 +172,10 @@ fn timestamp_lines(matches: &ArgMatches) -> Result<i32, String> {
 				let year = now.to_zoned(tz.clone()).year();
 				if let Some((consumed, then)) = parse_leading_timestamp(content, year, &tz) {
 					let rel = render_relative(then, now);
-					out.write_all(rel.as_bytes()).map_err(|err| err.to_string())?;
-					out.write_all(&content[consumed..]).map_err(|err| err.to_string())?;
+					out.write_all(rel.as_bytes())
+						.map_err(|err| err.to_string())?;
+					out.write_all(&content[consumed..])
+						.map_err(|err| err.to_string())?;
 				} else {
 					out.write_all(content).map_err(|err| err.to_string())?;
 				}
@@ -171,24 +183,34 @@ fn timestamp_lines(matches: &ArgMatches) -> Result<i32, String> {
 			Mode::Absolute => {
 				let zoned = Timestamp::now().to_zoned(tz.clone());
 				let stamp = strtime::format(&format, &zoned).map_err(|err| err.to_string())?;
-				out.write_all(stamp.as_bytes()).map_err(|err| err.to_string())?;
+				out.write_all(stamp.as_bytes())
+					.map_err(|err| err.to_string())?;
 				out.write_all(b" ").map_err(|err| err.to_string())?;
 				out.write_all(content).map_err(|err| err.to_string())?;
 			},
 			Mode::SinceLast | Mode::SinceStart => {
 				let nanos = if monotonic {
 					let now = Instant::now();
-					let anchor = if mode == Mode::SinceLast { last_mono } else { start_mono };
+					let anchor = if mode == Mode::SinceLast {
+						last_mono
+					} else {
+						start_mono
+					};
 					last_mono = now;
 					i128::try_from(now.duration_since(anchor).as_nanos()).unwrap_or(i128::MAX)
 				} else {
 					let now = Timestamp::now();
-					let anchor = if mode == Mode::SinceLast { last_wall } else { start_wall };
+					let anchor = if mode == Mode::SinceLast {
+						last_wall
+					} else {
+						start_wall
+					};
 					last_wall = now;
 					now.duration_since(anchor).as_nanos().max(0)
 				};
 				let stamp = format_elapsed(nanos, &format)?;
-				out.write_all(stamp.as_bytes()).map_err(|err| err.to_string())?;
+				out.write_all(stamp.as_bytes())
+					.map_err(|err| err.to_string())?;
 				out.write_all(b" ").map_err(|err| err.to_string())?;
 				out.write_all(content).map_err(|err| err.to_string())?;
 			},
@@ -262,11 +284,11 @@ fn expand_subseconds(format: &str) -> String {
 
 /// Length of the UTF-8 sequence introduced by `first` (1 for continuation or
 /// invalid bytes, which only arise from already-valid `&str` input here).
-fn utf8_len(first: u8) -> usize {
+const fn utf8_len(first: u8) -> usize {
 	match first {
-		0xC0..=0xDF => 2,
-		0xE0..=0xEF => 3,
-		0xF0..=0xF7 => 4,
+		0xc0..=0xdf => 2,
+		0xe0..=0xef => 3,
+		0xf0..=0xf7 => 4,
 		_ => 1,
 	}
 }
@@ -364,14 +386,14 @@ mod tests {
 		let stdout = Arc::new(Mutex::new(Vec::new()));
 		let stderr = Arc::new(Mutex::new(Vec::new()));
 		let io = ScopeIo {
-			stdin: Box::new(Cursor::new(stdin.to_vec())),
-			stdin_fd: None,
+			stdin:                 Box::new(Cursor::new(stdin.to_vec())),
+			stdin_fd:              None,
 			stdin_is_search_input: false,
-			stdout: Box::new(SharedWriter(Arc::clone(&stdout))),
-			stderr: Box::new(SharedWriter(Arc::clone(&stderr))),
-			cwd: std::env::temp_dir(),
-			env: HashMap::from([("TZ".to_string(), "UTC".to_string())]),
-			cancel: Arc::new(AtomicBool::new(false)),
+			stdout:                Box::new(SharedWriter(Arc::clone(&stdout))),
+			stderr:                Box::new(SharedWriter(Arc::clone(&stderr))),
+			cwd:                   std::env::temp_dir(),
+			env:                   HashMap::from([("TZ".to_string(), "UTC".to_string())]),
+			cancel:                Arc::new(AtomicBool::new(false)),
 		};
 		let argv = std::iter::once("ts")
 			.chain(args.iter().copied())
@@ -444,7 +466,7 @@ mod tests {
 
 	#[test]
 	fn relative_conflicts_with_elapsed_modes() {
-		let (code, _, _) = run_in(b"", &["-r", "-i"]);
+		let (code, ..) = run_in(b"", &["-r", "-i"]);
 		assert_eq!(code, 2);
 	}
 
@@ -475,8 +497,7 @@ mod tests {
 		assert_eq!(ts, "2024-01-01T17:00:00.5Z".parse::<Timestamp>().unwrap());
 
 		// Civil datetime without offset resolves in the provided timezone.
-		let (consumed, ts) =
-			parse_leading_timestamp(b"2024-01-01T12:00:00 x", 2024, &tz).unwrap();
+		let (consumed, ts) = parse_leading_timestamp(b"2024-01-01T12:00:00 x", 2024, &tz).unwrap();
 		assert_eq!(consumed, 19);
 		assert_eq!(ts, "2024-01-01T12:00:00Z".parse::<Timestamp>().unwrap());
 

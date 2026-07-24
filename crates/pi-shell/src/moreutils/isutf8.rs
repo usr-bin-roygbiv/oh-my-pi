@@ -57,8 +57,7 @@ pub fn run(argv: Vec<OsString>) -> i32 {
 	let invert = matches.get_flag(OPT_INVERT);
 	let files: Vec<OsString> = matches
 		.get_many::<OsString>(ARG_FILES)
-		.map(|values| values.cloned().collect())
-		.unwrap_or_else(|| vec![OsString::from("-")]);
+		.map_or_else(|| vec![OsString::from("-")], |values| values.cloned().collect());
 
 	let mut any_failed = false;
 	let mut io_error = false;
@@ -91,13 +90,7 @@ pub fn run(argv: Vec<OsString>) -> i32 {
 		}
 	}
 
-	if io_error {
-		2
-	} else if any_failed {
-		1
-	} else {
-		0
-	}
+	if io_error { 2 } else { i32::from(any_failed) }
 }
 
 fn command() -> Command {
@@ -202,9 +195,9 @@ fn validate(input: &mut impl Read) -> io::Result<Verdict> {
 /// Updates line/char counters over `text`, a slice already known to be valid
 /// UTF-8 (chars are counted as non-continuation bytes, so no re-decode).
 fn advance(text: &[u8], line: &mut u64, chars_in_line: &mut u64) {
-	match text.iter().rposition(|&b| b == b'\n') {
+	match memchr::memrchr(b'\n', text) {
 		Some(last) => {
-			*line += text.iter().filter(|&&b| b == b'\n').count() as u64;
+			*line += memchr::memchr_iter(b'\n', text).count() as u64;
 			*chars_in_line = count_chars(&text[last + 1..]);
 		},
 		None => *chars_in_line += count_chars(text),
@@ -212,7 +205,7 @@ fn advance(text: &[u8], line: &mut u64, chars_in_line: &mut u64) {
 }
 
 fn count_chars(bytes: &[u8]) -> u64 {
-	bytes.iter().filter(|&&b| (b & 0xC0) != 0x80).count() as u64
+	bytes.iter().filter(|&&b| (b & 0xc0) != 0x80).count() as u64
 }
 
 fn display_name(name: &OsStr) -> String {
@@ -319,7 +312,7 @@ mod tests {
 	fn truncated_sequence_at_chunk_boundary_is_invalid() {
 		let (_dir, root) = tempdir();
 		let mut bytes = vec![b'a'; 65535];
-		bytes.push(0xC3); // incomplete at the exact chunk boundary
+		bytes.push(0xc3); // incomplete at the exact chunk boundary
 		bytes.extend_from_slice(b"zzz");
 		fs::write(root.join("cut"), &bytes).unwrap();
 
@@ -374,7 +367,10 @@ mod tests {
 	fn stdin_is_validated_when_no_files_given() {
 		let (_dir, root) = tempdir();
 
-		assert_eq!(run_in(root.clone(), "héllo\n".as_bytes(), &[]), (0, String::new(), String::new()));
+		assert_eq!(
+			run_in(root.clone(), "héllo\n".as_bytes(), &[]),
+			(0, String::new(), String::new())
+		);
 
 		let (code, stdout, _) = run_in(root, b"h\xFFi", &[]);
 		assert_eq!(code, 1);

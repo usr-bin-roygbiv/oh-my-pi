@@ -85,7 +85,11 @@ fn command() -> Command {
 				.action(ArgAction::SetTrue),
 		)
 		.arg(Arg::new("help").long("help").action(ArgAction::Help))
-		.arg(Arg::new("version").long("version").action(ArgAction::Version))
+		.arg(
+			Arg::new("version")
+				.long("version")
+				.action(ArgAction::Version),
+		)
 		.arg(
 			Arg::new(ARG_FILE)
 				.value_name("FILE")
@@ -103,7 +107,7 @@ enum SoakError {
 fn soak_stdin() -> Result<Vec<u8>, SoakError> {
 	let mut stdin = pi_uutils_ctx::stdin();
 	let mut buffer = Vec::new();
-	let mut chunk = [0u8; CHUNK_SIZE];
+	let mut chunk = vec![0u8; CHUNK_SIZE].into_boxed_slice();
 	loop {
 		if pi_uutils_ctx::is_cancelled() {
 			return Err(SoakError::Cancelled);
@@ -135,7 +139,12 @@ fn replace_atomically(target: &Path, buffer: &[u8]) -> io::Result<()> {
 	result
 }
 
-fn write_and_swap(target: &Path, temp_path: &Path, temp: &mut File, buffer: &[u8]) -> io::Result<()> {
+fn write_and_swap(
+	target: &Path,
+	temp_path: &Path,
+	temp: &mut File,
+	buffer: &[u8],
+) -> io::Result<()> {
 	temp.write_all(buffer)?;
 	temp.flush()?;
 	if let Ok(metadata) = fs::metadata(target) {
@@ -148,8 +157,14 @@ fn write_and_swap(target: &Path, temp_path: &Path, temp: &mut File, buffer: &[u8
 /// `target` with `create_new`, retrying on collision.
 fn create_sibling_temp(target: &Path) -> io::Result<(PathBuf, File)> {
 	static COUNTER: AtomicU64 = AtomicU64::new(0);
-	let dir = target.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
-	let base = target.file_name().unwrap_or(OsStr::new("sponge")).to_string_lossy();
+	let dir = target
+		.parent()
+		.filter(|p| !p.as_os_str().is_empty())
+		.unwrap_or_else(|| Path::new("."));
+	let base = target
+		.file_name()
+		.unwrap_or_else(|| OsStr::new("sponge"))
+		.to_string_lossy();
 	for _ in 0..32 {
 		let nanos = SystemTime::now()
 			.duration_since(UNIX_EPOCH)

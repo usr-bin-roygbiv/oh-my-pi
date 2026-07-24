@@ -9,8 +9,7 @@
 //! then name; `--search` prints entries whose description contains all the
 //! given words case-insensitively.
 
-use std::ffi::OsString;
-use std::io::Write;
+use std::{ffi::OsString, io::Write};
 
 use clap::{Arg, ArgAction, Command};
 use pi_uutils_ctx::format_usage;
@@ -144,7 +143,7 @@ pub fn run(argv: Vec<OsString>) -> i32 {
 			failed = true;
 		}
 	}
-	if failed { 1 } else { 0 }
+	i32::from(failed)
 }
 
 fn command() -> Command {
@@ -203,17 +202,15 @@ fn lookup(arg: &str) -> bool {
 			},
 			None => false,
 		}
+	} else if let Some((name, value)) = ERRNOS
+		.iter()
+		.find(|(name, _)| name.eq_ignore_ascii_case(arg))
+	{
+		print_entry(name, *value);
+		true
 	} else {
-		match ERRNOS.iter().find(|(name, _)| name.eq_ignore_ascii_case(arg)) {
-			Some((name, value)) => {
-				print_entry(name, *value);
-				true
-			},
-			None => {
-				let _ = writeln!(pi_uutils_ctx::stderr(), "errno: unknown errno {arg}");
-				false
-			},
-		}
+		let _ = writeln!(pi_uutils_ctx::stderr(), "errno: unknown errno {arg}");
+		false
 	}
 }
 
@@ -272,14 +269,14 @@ mod tests {
 		let stdout = Arc::new(Mutex::new(Vec::new()));
 		let stderr = Arc::new(Mutex::new(Vec::new()));
 		let io = ScopeIo {
-			stdin: Box::new(Cursor::new(Vec::new())),
-			stdin_fd: None,
+			stdin:                 Box::new(Cursor::new(Vec::new())),
+			stdin_fd:              None,
 			stdin_is_search_input: false,
-			stdout: Box::new(SharedWriter(Arc::clone(&stdout))),
-			stderr: Box::new(SharedWriter(Arc::clone(&stderr))),
-			cwd: std::env::temp_dir(),
-			env: HashMap::new(),
-			cancel: Arc::new(AtomicBool::new(false)),
+			stdout:                Box::new(SharedWriter(Arc::clone(&stdout))),
+			stderr:                Box::new(SharedWriter(Arc::clone(&stderr))),
+			cwd:                   std::env::temp_dir(),
+			env:                   HashMap::new(),
+			cancel:                Arc::new(AtomicBool::new(false)),
 		};
 		let argv = std::iter::once("errno")
 			.chain(args.iter().copied())
