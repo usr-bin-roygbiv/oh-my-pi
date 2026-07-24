@@ -351,7 +351,7 @@ describe("AgentSession.branchFromBtw", () => {
 		expect(activeSession.sessionManager.getCwd()).toBe(targetCwd);
 		expect(emitted.filter(event => event.type === "session_before_move")).toHaveLength(1);
 		expect(emitted.filter(event => event.type === "session_move")).toHaveLength(1);
-		expect(emitted.filter(event => event.type === "session_transition_end")).toHaveLength(2);
+		expect(emitted.filter(event => event.type === "session_transition_end")).toHaveLength(1);
 		expect(emitted.filter(event => event.type === "session_transition_end" && event.committed === true)).toHaveLength(1);
 	});
 
