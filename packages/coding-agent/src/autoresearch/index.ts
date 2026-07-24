@@ -407,7 +407,10 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 	const contributionPublicationOperations = new Map<string, ContributionPublicationOperation>();
 	const contributionStopOperations = new Map<string, Promise<string[]>>();
 	const autoresearchMutationOperations = new Map<string, Set<AutoresearchMutationOperation>>();
-	const autoresearchCommandOperations = new Map<string, symbol>();
+	const autoresearchCommandOperations = new Map<
+		string,
+		{ token: symbol; settlement: Promise<void>; settle: () => void }
+	>();
 	const mutationAdmissionHolds = new Map<string, number>();
 	const transitionAdmissionHolds = new Map<string, TransitionAdmissionHold>();
 	const rehydrateOperations = new Map<string, Promise<void>>();
@@ -1068,14 +1071,20 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 			}
 
 			const operationToken = Symbol("autoresearch-command-operation");
+			const operationSettlement = Promise.withResolvers<void>();
+			const operation = {
+				token: operationToken,
+				settlement: operationSettlement.promise,
+				settle: () => operationSettlement.resolve(),
+			};
 			const initialContribution = runtime.contribution;
-			autoresearchCommandOperations.set(sessionKey, operationToken);
+			autoresearchCommandOperations.set(sessionKey, operation);
 			const releaseAdmission = acquireMutationAdmissionHold(sessionKey);
 			const operationIsCurrent = (): boolean =>
 				getSessionKey(ctx) === sessionKey &&
 				getRuntime(ctx) === runtime &&
 				runtime.contribution === initialContribution &&
-				autoresearchCommandOperations.get(sessionKey) === operationToken;
+				autoresearchCommandOperations.get(sessionKey)?.token === operationToken;
 			try {
 				if (trimmed === "" && runtime.autoresearchMode) {
 					await drainAutoresearchMutationOperations(sessionKey);
@@ -1187,10 +1196,11 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 					ctx.ui.notify("Autoresearch enabled—describe what to optimize in your next message.", "info");
 				}
 			} finally {
-				if (autoresearchCommandOperations.get(sessionKey) === operationToken) {
+				if (autoresearchCommandOperations.get(sessionKey)?.token === operationToken) {
 					autoresearchCommandOperations.delete(sessionKey);
 				}
 				releaseAdmission();
+				operation.settle();
 			}
 		},
 	});
@@ -2006,12 +2016,15 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 		const publicationPhase = contributionPublicationOperations.get(sessionKey)?.phase;
 		const transportStarted = publicationPhase === "pushing" || publicationPhase === "committed";
 		dashboard.clear(ctx);
-		const settlement = stopContributionRuntime(ctx, runtime)
-			.then(async () => {
-				if (getSessionKey(ctx) !== sessionKey || getRuntime(ctx) !== runtime) return;
-				const experimentTools = new Set(EXPERIMENT_TOOL_NAMES);
-				await api.setActiveTools(api.getActiveTools().filter(name => !experimentTools.has(name)));
-			})
+		const commandSettlement = autoresearchCommandOperations.get(sessionKey)?.settlement;
+		const rehydrateSettlement = rehydrateOperations.get(sessionKey);
+		const settlement = (async () => {
+			await Promise.allSettled([commandSettlement, rehydrateSettlement]);
+			await stopContributionRuntime(ctx, runtime);
+			if (getSessionKey(ctx) !== sessionKey || getRuntime(ctx) !== runtime) return;
+			const experimentTools = new Set(EXPERIMENT_TOOL_NAMES);
+			await api.setActiveTools(api.getActiveTools().filter(name => !experimentTools.has(name)));
+		})()
 			.catch(error => {
 				logger.warn("Failed to settle contribution shutdown", {
 					error: describeContributionError(error),
