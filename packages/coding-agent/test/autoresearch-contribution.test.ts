@@ -1579,72 +1579,66 @@ describe("contribution fork validation and publication", () => {
 				maxCommits: number,
 			) => Promise<boolean>;
 
-			await expect(
-				boundedIsAncestor(source.path(), unrelatedSha, descendantSha, undefined, 2),
-			).rejects.toThrow("Raw Git ancestry proof exceeds the 2-commit traversal limit.");
+			await expect(boundedIsAncestor(source.path(), unrelatedSha, descendantSha, undefined, 2)).rejects.toThrow(
+				"Raw Git ancestry proof exceeds the 2-commit traversal limit.",
+			);
 		} finally {
 			source.removeSync();
 		}
 	});
 
-	it(
-		"enforces the fixed ancestry ceiling on the production four-argument call",
-		async () => {
-			const source = TempDir.createSync("@pi-contribution-default-ancestry-bound-");
-			try {
-				await $`git -C ${source.path()} init -b main`.quiet();
-				await Bun.write(`${source.path()}/proof.txt`, "base\n");
-				await $`git -C ${source.path()} add proof.txt`.quiet();
-				await $`git -C ${source.path()} -c user.name=OMP -c user.email=omp@example.invalid commit -m base`.quiet();
-				const unrelatedSha = (await $`git -C ${source.path()} rev-parse HEAD`.quiet()).text().trim();
-				const treeSha = (await $`git -C ${source.path()} rev-parse HEAD^{tree}`.quiet()).text().trim();
-				const objectDirectory = `${source.path()}/commit-objects`;
-				await fs.promises.mkdir(objectDirectory);
-				const parentObjectPaths = Array.from({ length: 257 }, (_, index) => `commit-objects/parent-${index}`);
-				await Promise.all(
-					parentObjectPaths.map((relativePath, index) =>
-						Bun.write(
-							`${source.path()}/${relativePath}`,
-							`tree ${treeSha}\nauthor OMP <omp@example.invalid> 1 +0000\ncommitter OMP <omp@example.invalid> 1 +0000\n\nparent-${index}\n`,
-						),
+	it("enforces the fixed ancestry ceiling on the production four-argument call", async () => {
+		const source = TempDir.createSync("@pi-contribution-default-ancestry-bound-");
+		try {
+			await $`git -C ${source.path()} init -b main`.quiet();
+			await Bun.write(`${source.path()}/proof.txt`, "base\n");
+			await $`git -C ${source.path()} add proof.txt`.quiet();
+			await $`git -C ${source.path()} -c user.name=OMP -c user.email=omp@example.invalid commit -m base`.quiet();
+			const unrelatedSha = (await $`git -C ${source.path()} rev-parse HEAD`.quiet()).text().trim();
+			const treeSha = (await $`git -C ${source.path()} rev-parse HEAD^{tree}`.quiet()).text().trim();
+			const objectDirectory = `${source.path()}/commit-objects`;
+			await fs.promises.mkdir(objectDirectory);
+			const parentObjectPaths = Array.from({ length: 257 }, (_, index) => `commit-objects/parent-${index}`);
+			await Promise.all(
+				parentObjectPaths.map((relativePath, index) =>
+					Bun.write(
+						`${source.path()}/${relativePath}`,
+						`tree ${treeSha}\nauthor OMP <omp@example.invalid> 1 +0000\ncommitter OMP <omp@example.invalid> 1 +0000\n\nparent-${index}\n`,
 					),
-				);
-				const gitBinary = $which("git");
-				if (!gitBinary) throw new Error("Expected git binary for ancestry fixture");
-				const hashParents = Bun.spawn([gitBinary, "hash-object", "-w", "-t", "commit", "--stdin-paths"], {
-					cwd: source.path(),
-					stdin: new Blob([`${parentObjectPaths.join("\n")}\n`]),
-					stdout: "pipe",
-					stderr: "pipe",
-				});
-				const [hashExitCode, hashOutput, hashError] = await Promise.all([
-					hashParents.exited,
-					new Response(hashParents.stdout).text(),
-					new Response(hashParents.stderr).text(),
-				]);
-				if (hashExitCode !== 0) throw new Error(`Unable to build ancestry fixture: ${hashError}`);
-				const parentShas = hashOutput.trim().split("\n");
-				if (parentShas.length !== 257) throw new Error("Expected 257 raw parent commits");
-				const descendantObject = `${objectDirectory}/descendant`;
-				await Bun.write(
-					descendantObject,
-					`tree ${treeSha}\n${parentShas.map(sha => `parent ${sha}`).join("\n")}\nauthor OMP <omp@example.invalid> 2 +0000\ncommitter OMP <omp@example.invalid> 2 +0000\n\ndescendant\n`,
-				);
-				const descendantSha = (
-					await $`git -C ${source.path()} hash-object -w -t commit ${descendantObject}`.quiet()
-				)
-					.text()
-					.trim();
+				),
+			);
+			const gitBinary = $which("git");
+			if (!gitBinary) throw new Error("Expected git binary for ancestry fixture");
+			const hashParents = Bun.spawn([gitBinary, "hash-object", "-w", "-t", "commit", "--stdin-paths"], {
+				cwd: source.path(),
+				stdin: new Blob([`${parentObjectPaths.join("\n")}\n`]),
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			const [hashExitCode, hashOutput, hashError] = await Promise.all([
+				hashParents.exited,
+				new Response(hashParents.stdout).text(),
+				new Response(hashParents.stderr).text(),
+			]);
+			if (hashExitCode !== 0) throw new Error(`Unable to build ancestry fixture: ${hashError}`);
+			const parentShas = hashOutput.trim().split("\n");
+			if (parentShas.length !== 257) throw new Error("Expected 257 raw parent commits");
+			const descendantObject = `${objectDirectory}/descendant`;
+			await Bun.write(
+				descendantObject,
+				`tree ${treeSha}\n${parentShas.map(sha => `parent ${sha}`).join("\n")}\nauthor OMP <omp@example.invalid> 2 +0000\ncommitter OMP <omp@example.invalid> 2 +0000\n\ndescendant\n`,
+			);
+			const descendantSha = (await $`git -C ${source.path()} hash-object -w -t commit ${descendantObject}`.quiet())
+				.text()
+				.trim();
 
-				await expect(git.isAncestor(source.path(), unrelatedSha, descendantSha)).rejects.toThrow(
-					"Raw Git ancestry proof exceeds the 256-commit traversal limit.",
-				);
-			} finally {
-				source.removeSync();
-			}
-		},
-		60_000,
-	);
+			await expect(git.isAncestor(source.path(), unrelatedSha, descendantSha)).rejects.toThrow(
+				"Raw Git ancestry proof exceeds the 256-commit traversal limit.",
+			);
+		} finally {
+			source.removeSync();
+		}
+	}, 60_000);
 
 	it("does not inspect legacy graft content before raw ancestry traversal", async () => {
 		const source = TempDir.createSync("@pi-contribution-graft-read-");

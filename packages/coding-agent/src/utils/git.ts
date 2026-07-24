@@ -1386,7 +1386,10 @@ async function findExecutablePrePushHook(cwd: string, signal?: AbortSignal): Pro
 	);
 	let configuredHooksDirectory: string | undefined;
 	if (configuredHooksRecord !== undefined) {
-		if (!configuredHooksRecord.endsWith("\0") || configuredHooksRecord.indexOf("\0") !== configuredHooksRecord.length - 1) {
+		if (
+			!configuredHooksRecord.endsWith("\0") ||
+			configuredHooksRecord.indexOf("\0") !== configuredHooksRecord.length - 1
+		) {
 			throw new ToolError("Git returned an invalid hooks path configuration.");
 		}
 		configuredHooksDirectory = configuredHooksRecord.slice(0, -1);
@@ -1400,12 +1403,7 @@ async function findExecutablePrePushHook(cwd: string, signal?: AbortSignal): Pro
 		await fs.promises.access(hookPath, fs.constants.X_OK);
 		return hookPath;
 	} catch (error) {
-		if (
-			isEnoent(error) ||
-			isEnotdir(error) ||
-			hasFsCode(error, "EACCES") ||
-			hasFsCode(error, "EPERM")
-		) {
+		if (isEnoent(error) || isEnotdir(error) || hasFsCode(error, "EACCES") || hasFsCode(error, "EPERM")) {
 			return null;
 		}
 		throw error;
@@ -1464,8 +1462,7 @@ export async function push(cwd: string, options: PushOptions = {}): Promise<void
 					OMP_ORIGINAL_REMOTE_NAME: options.remote,
 					OMP_VERIFIED_REMOTE_URL: options.verifiedRemoteUrl,
 					OMP_ORIGINAL_GIT_CONFIG_PARAMETERS: process.env.GIT_CONFIG_PARAMETERS ?? "",
-					OMP_ORIGINAL_GIT_CONFIG_PARAMETERS_PRESENT:
-						process.env.GIT_CONFIG_PARAMETERS === undefined ? "0" : "1",
+					OMP_ORIGINAL_GIT_CONFIG_PARAMETERS_PRESENT: process.env.GIT_CONFIG_PARAMETERS === undefined ? "0" : "1",
 				};
 			}
 			remote = verifiedRemote;

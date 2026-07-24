@@ -352,7 +352,6 @@ async function captureContributionExecutionProof(
 	};
 }
 
-
 function sameContributionExecutionProof(
 	before: ContributionExecutionProof,
 	after: ContributionExecutionProof,
