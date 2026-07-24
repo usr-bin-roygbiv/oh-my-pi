@@ -1215,6 +1215,65 @@ describe("contribution fork validation and publication", () => {
 		}
 	});
 
+	it("matches Git tree modes, parent symlink replacement, and invalid-cwd behavior without filters", async () => {
+		const source = TempDir.createSync("@pi-contribution-tree-edge-");
+		const external = TempDir.createSync("@pi-contribution-tree-external-");
+		try {
+			await $`git -C ${source.path()} init -b main`.quiet();
+			await Bun.write(`${source.path()}/mode.txt`, "mode\n");
+			await fs.promises.mkdir(`${source.path()}/nested`);
+			await Bun.write(`${source.path()}/nested/file.txt`, "tracked\n");
+			await $`git -C ${source.path()} add -A`.quiet();
+			await $`git -C ${source.path()} -c user.name=OMP -c user.email=omp@example.invalid commit -m baseline`.quiet();
+
+			fs.chmodSync(`${source.path()}/mode.txt`, 0o610);
+			await fs.promises.rm(`${source.path()}/nested`, { recursive: true });
+			await Bun.write(`${external.path()}/file.txt`, "external bytes must not be followed\n");
+			fs.symlinkSync(external.path(), `${source.path()}/nested`);
+
+			const tree = await git.writeWorktreeTree(source.path());
+			await $`git -C ${source.path()} add -A`.quiet();
+			const expectedTree = (await $`git -C ${source.path()} write-tree`.quiet()).text().trim();
+
+			expect(tree).toBe(expectedTree);
+
+			const missingCwd = `${source.path()}/missing-directory`;
+			await expect(git.writeWorktreeTree(missingCwd)).rejects.toThrow();
+		} finally {
+			source.removeSync();
+			external.removeSync();
+		}
+	});
+
+	it("records the checked-out submodule commit in a filter-free worktree tree", async () => {
+		const source = TempDir.createSync("@pi-contribution-tree-submodule-");
+		const submodule = TempDir.createSync("@pi-contribution-tree-submodule-source-");
+		try {
+			await $`git -C ${submodule.path()} init -b main`.quiet();
+			await Bun.write(`${submodule.path()}/value.txt`, "one\n");
+			await $`git -C ${submodule.path()} add value.txt`.quiet();
+			await $`git -C ${submodule.path()} -c user.name=OMP -c user.email=omp@example.invalid commit -m one`.quiet();
+			await $`git -C ${source.path()} init -b main`.quiet();
+			await $`git -C ${source.path()} -c protocol.file.allow=always submodule add ${submodule.path()} child`.quiet();
+			await $`git -C ${source.path()} -c user.name=OMP -c user.email=omp@example.invalid commit -am baseline`.quiet();
+
+			await Bun.write(`${submodule.path()}/value.txt`, "two\n");
+			await $`git -C ${submodule.path()} add value.txt`.quiet();
+			await $`git -C ${submodule.path()} -c user.name=OMP -c user.email=omp@example.invalid commit -m two`.quiet();
+			const nextSubmoduleHead = (await $`git -C ${submodule.path()} rev-parse HEAD`.quiet()).text().trim();
+			await $`git -C ${source.path()}/child -c protocol.file.allow=always fetch`.quiet();
+			await $`git -C ${source.path()}/child checkout ${nextSubmoduleHead}`.quiet();
+
+			const tree = await git.writeWorktreeTree(source.path());
+			await $`git -C ${source.path()} add child`.quiet();
+			const expectedTree = (await $`git -C ${source.path()} write-tree`.quiet()).text().trim();
+			expect(tree).toBe(expectedTree);
+		} finally {
+			source.removeSync();
+			submodule.removeSync();
+		}
+	});
+
 	it("rejects a push-effective URL rewrite away from the confirmed fork", async () => {
 		let pushCalls = 0;
 		const publicationGit = {
@@ -3530,6 +3589,43 @@ describe("process-local contribution lifecycle", () => {
 		await commandRequired(harness, "contribute").handler("status", harness.ctx);
 		expect(harness.notifications.at(-1)?.message).toBe("Contribution mode is off.");
 		expect(harness.activeTools).toEqual(["read", "bash"]);
+	});
+
+	it("turns ordinary autoresearch off when its session moves to another repository", async () => {
+		const destination = TempDir.createSync("@pi-autoresearch-move-target-");
+		try {
+			await $`git -C ${destination.path()} init -b main`.quiet();
+			const harness = createIntegrationHarness(cwd.path());
+			await commandRequired(harness, "autoresearch").handler("ordinary source goal", harness.ctx);
+			expect(harness.activeTools).toContain("run_experiment");
+			const moveHandler = handlerRequired<{
+				type: "session_move";
+				previousCwd: string;
+				cwd: string;
+			}>(harness, "session_move");
+			const movedCtx = { ...harness.ctx, cwd: destination.path() } as ExtensionContext;
+
+			await moveHandler(
+				{ type: "session_move", previousCwd: cwd.path(), cwd: destination.path() },
+				movedCtx,
+			);
+			const prompt = await handlerRequired<BeforeAgentStartEvent, { systemPrompt?: string[] }>(
+				harness,
+				"before_agent_start",
+			)(
+				{ type: "before_agent_start", prompt: "after move", systemPrompt: ["base prompt"] },
+				movedCtx,
+			);
+
+			expect(prompt).toBeUndefined();
+			expect(harness.activeTools).toEqual(["read", "bash"]);
+			expect(harness.appendEntries.at(-1)).toEqual({
+				customType: "autoresearch-control",
+				data: { mode: "off", goal: "ordinary source goal" },
+			});
+		} finally {
+			destination.removeSync();
+		}
 	});
 
 	it("drains a successful publication into its immutable handoff during off", async () => {

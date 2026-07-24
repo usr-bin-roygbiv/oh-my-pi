@@ -175,6 +175,46 @@ describe("bash shortcut command", () => {
 		}
 	});
 
+	it("restores the persistent shell cwd when session move admission cancels cd", async () => {
+		const sourceDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-bash-cd-cancel-source-"));
+		const childDir = path.join(sourceDir, "child");
+		await fs.mkdir(childDir);
+		try {
+			const { ctx, executeBash, state } = createCwdContext(sourceDir);
+			let shellCwd = sourceDir;
+			const rollbackCommand = `cd -- '${sourceDir}'`;
+			executeBash.mockImplementation(async (command: string) => {
+				if (command === "cd child") shellCwd = childDir;
+				else if (command === rollbackCommand) shellCwd = sourceDir;
+				state.executedCwds.push(shellCwd);
+				return {
+					output: command === "pwd" ? `${shellCwd}\n` : "",
+					exitCode: 0,
+					cancelled: false,
+					truncated: false,
+					totalLines: 1,
+					totalBytes: shellCwd.length,
+					outputLines: 1,
+					outputBytes: shellCwd.length,
+					workingDir: shellCwd,
+				};
+			});
+			const cancelMove = vi.fn(async () => false);
+			(ctx.session as unknown as { moveSession(cwd: string): Promise<boolean> }).moveSession = cancelMove;
+			const controller = new CommandController(ctx);
+
+			await controller.handleBashCommand("cd child");
+			await controller.handleBashCommand("pwd");
+
+			expect(state.cwd).toBe(sourceDir);
+			expect(shellCwd).toBe(sourceDir);
+			expect(cancelMove).toHaveBeenCalledWith(childDir);
+			expect(executeBash.mock.calls.map(call => call[0])).toEqual(["cd child", rollbackCommand, "pwd"]);
+		} finally {
+			await fs.rm(sourceDir, { recursive: true, force: true });
+		}
+	});
+
 	it("does not adopt cwd from a non-cd bash command", async () => {
 		const sourceDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-bash-cwd-sync-"));
 		const childDir = path.join(sourceDir, "child");

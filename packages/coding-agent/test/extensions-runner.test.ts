@@ -95,6 +95,25 @@ describe("ExtensionRunner", () => {
 		expect(runner.createContext().localProtocolOptions).toBe(localProtocolOptions);
 	});
 
+	it("derives extension context cwd from the active session after a move", async () => {
+		const result = await loadTestExtensions();
+		const sourceCwd = tempDir.path();
+		const targetCwd = path.join(sourceCwd, "moved-project");
+		fs.mkdirSync(targetCwd);
+		const movableSession = SessionManager.inMemory(sourceCwd);
+		const runner = new ExtensionRunner(
+			result.extensions,
+			result.runtime,
+			sourceCwd,
+			movableSession,
+			modelRegistry,
+		);
+
+		expect(runner.createContext().cwd).toBe(sourceCwd);
+		await movableSession.moveTo(targetCwd);
+		expect(runner.createContext().cwd).toBe(targetCwd);
+	});
+
 	describe("shortcut conflicts", () => {
 		it("warns when extension shortcut conflicts with built-in", async () => {
 			const extCode = `

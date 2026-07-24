@@ -232,6 +232,61 @@ describe("AgentSession.branchFromBtw", () => {
 		});
 	});
 
+	it("does not emit lifecycle events for a same-cwd move", async () => {
+		const emit = vi.fn(async () => undefined);
+		const extensionRunner = {
+			hasHandlers: vi.fn(() => true),
+			emit,
+		} as unknown as ExtensionRunner;
+		const activeSession = await createSession({ extensionRunner });
+		const originalCwd = activeSession.sessionManager.getCwd();
+
+		const moved: unknown = await activeSession.moveSession(originalCwd);
+
+		expect(moved).toBe(true);
+		expect(activeSession.sessionManager.getCwd()).toBe(originalCwd);
+		expect(emit).not.toHaveBeenCalled();
+	});
+
+	it("emits before, committed move, and transition-end events for a successful relocation", async () => {
+		const emitted: Array<Record<string, unknown>> = [];
+		const extensionRunner = {
+			hasHandlers: vi.fn(() => true),
+			emit: vi.fn(async (event: Record<string, unknown>) => {
+				emitted.push(event);
+				return undefined;
+			}),
+		} as unknown as ExtensionRunner;
+		const activeSession = await createSession({ extensionRunner });
+		const originalCwd = activeSession.sessionManager.getCwd();
+		const targetCwd = path.join(tempDir, "successful-move-target");
+		fs.mkdirSync(targetCwd);
+
+		const moved: unknown = await activeSession.moveSession(targetCwd);
+
+		expect(moved).toBe(true);
+		expect(activeSession.sessionManager.getCwd()).toBe(targetCwd);
+		expect(emitted).toEqual([
+			{
+				type: "session_before_move",
+				transitionId: expect.any(String),
+				targetCwd,
+			},
+			{
+				type: "session_move",
+				previousCwd: originalCwd,
+				cwd: targetCwd,
+			},
+			{
+				type: "session_transition_end",
+				transitionId: expect.any(String),
+				kind: "move",
+				committed: true,
+			},
+		]);
+		expect(emitted[2]?.transitionId).toBe(emitted[0]?.transitionId);
+	});
+
 	it("syncs promoted /btw messages into live context even when hooks skip conversation restore", async () => {
 		const extensionRunner = {
 			hasHandlers: vi.fn((eventType: string) => eventType === "session_before_branch"),
