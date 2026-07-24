@@ -2,41 +2,40 @@ import { describe, expect, it } from "bun:test";
 import { formatJavaScriptForDisplay } from "@oh-my-pi/pi-coding-agent/tools/eval-format/javascript";
 
 describe("formatJavaScriptForDisplay", () => {
-	it("expands compact control flow, objects, and arrays", () => {
+	it("expands compact control flow and keeps short objects and arrays inline", () => {
 		expect(formatJavaScriptForDisplay("if (ready){const item = { value: 1 };use(item);}else{fallback();}")).toBe(
-			[
-				"if (ready) {",
-				"    const item = {",
-				"        value: 1",
-				"    };",
-				"    use(item);",
-				"} else {",
-				"    fallback();",
-				"}",
-			].join("\n"),
+			["if (ready) {", "    const item = { value: 1 };", "    use(item);", "} else {", "    fallback();", "}"].join(
+				"\n",
+			),
 		);
 
 		expect(formatJavaScriptForDisplay("const rows = [{ value: 1 },{ value: 2 }];")).toBe(
+			"const rows = [{ value: 1 }, { value: 2 }];",
+		);
+	});
+
+	it("explodes object literals that exceed the display width", () => {
+		const source =
+			"const box={left:rect.left+offset.left,right:rect.right+offset.right,top:rect.top+offset.top,bottom:rect.bottom+offset.bottom};";
+		expect(formatJavaScriptForDisplay(source)).toBe(
 			[
-				"const rows = [{",
-				"    value: 1",
-				"}, {",
-				"    value: 2",
-				"}];",
+				"const box = {",
+				"    left: rect.left + offset.left,",
+				"    right: rect.right + offset.right,",
+				"    top: rect.top + offset.top,",
+				"    bottom: rect.bottom + offset.bottom",
+				"};",
 			].join("\n"),
 		);
 	});
 
-	it("keeps for-loop header semicolons inline", () => {
+	it("normalizes operator spacing, preserves angle brackets, and keeps for-loop header semicolons inline", () => {
 		expect(formatJavaScriptForDisplay("for(;;){tick();}for(let i=0;i<2;i++){work(i);}")).toBe(
-			[
-				"for (;;) {",
-				"    tick();",
-				"}",
-				"for (let i=0; i<2; i++) {",
-				"    work(i);",
-				"}",
-			].join("\n"),
+			["for (;;) {", "    tick();", "}", "for (let i = 0; i<2; i++) {", "    work(i);", "}"].join("\n"),
+		);
+		// Angle brackets never get binary-operator spacing: generics would mangle.
+		expect(formatJavaScriptForDisplay("const seen=new Map<string,number>();")).toBe(
+			"const seen = new Map<string, number>();",
 		);
 	});
 

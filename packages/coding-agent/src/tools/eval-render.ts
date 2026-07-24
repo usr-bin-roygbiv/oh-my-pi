@@ -14,12 +14,12 @@ import { Markdown, Text } from "@oh-my-pi/pi-tui";
 import { formatNumber } from "@oh-my-pi/pi-utils";
 import { settings } from "../config/settings";
 import type { EvalCellResult, EvalLanguage, EvalStatusEvent, EvalToolDetails } from "../eval/types";
-import { formatEvalCodeForDisplay } from "./eval-format";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { formatContextUsage } from "../modes/components/status-line/context-thresholds";
 import { truncateToVisualLines } from "../modes/components/visual-truncate";
 import { getMarkdownTheme, type Theme } from "../modes/theme/theme";
 import { markFramedBlockComponent, outputBlockContentWidth, renderCodeCell } from "../tui";
+import { formatEvalCodeForDisplay } from "./eval-format";
 import {
 	JSON_TREE_MAX_DEPTH_COLLAPSED,
 	JSON_TREE_MAX_DEPTH_EXPANDED,

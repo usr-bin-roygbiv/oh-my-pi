@@ -72,22 +72,12 @@ type PrefixToken = "none" | "dot" | "colon" | "at" | "other";
 
 function isIdentifierStart(character: string): boolean {
 	const code = character.charCodeAt(0);
-	return (
-		character === "_" ||
-		(code >= 65 && code <= 90) ||
-		(code >= 97 && code <= 122) ||
-		code >= 0x80
-	);
+	return character === "_" || (code >= 65 && code <= 90) || (code >= 97 && code <= 122) || code >= 0x80;
 }
 
 function isIdentifierContinue(character: string): boolean {
 	const code = character.charCodeAt(0);
-	return (
-		isIdentifierStart(character) ||
-		(code >= 48 && code <= 57) ||
-		character === "!" ||
-		character === "?"
-	);
+	return isIdentifierStart(character) || (code >= 48 && code <= 57) || character === "!" || character === "?";
 }
 
 function isHorizontalWhitespace(character: string): boolean {
@@ -207,10 +197,7 @@ function consumeQuotedLiteral(source: string, start: number, kind: QuoteKind): n
 
 		const character = source[index];
 		if (character === "#") {
-			index =
-				source[index + 1] === "="
-					? consumeBlockComment(source, index)
-					: consumeLineComment(source, index);
+			index = source[index + 1] === "=" ? consumeBlockComment(source, index) : consumeLineComment(source, index);
 			continue;
 		}
 		if (character === '"') {
@@ -342,9 +329,7 @@ export function formatJuliaForDisplay(source: string): string {
 		if (character === "#") {
 			beginContent(false, false);
 			const commentEnd =
-				source[index + 1] === "="
-					? consumeBlockComment(source, index)
-					: consumeLineComment(source, index);
+				source[index + 1] === "=" ? consumeBlockComment(source, index) : consumeLineComment(source, index);
 			const containsNewline = appendOpaque(index, commentEnd);
 			if (containsNewline) {
 				canEndExpression = false;

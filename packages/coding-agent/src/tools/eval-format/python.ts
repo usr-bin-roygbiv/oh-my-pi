@@ -156,9 +156,7 @@ function canOpenSuite(kind: HeaderKind, hasPayload: boolean): boolean {
 
 function matchingCloser(opener: string, closer: string): boolean {
 	return (
-		(opener === "(" && closer === ")") ||
-		(opener === "[" && closer === "]") ||
-		(opener === "{" && closer === "}")
+		(opener === "(" && closer === ")") || (opener === "[" && closer === "]") || (opener === "{" && closer === "}")
 	);
 }
 
@@ -225,7 +223,6 @@ function formatPythonPrefix(source: string): string {
 		statementSourceIndent = currentSourceIndent;
 		statementChain = null;
 	}
-
 
 	function flushHorizontal(): void {
 		if (pendingHorizontal.length === 0) return;
