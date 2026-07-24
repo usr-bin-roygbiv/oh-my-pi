@@ -126,7 +126,8 @@ runs:
            sudo apt-get update
            sudo apt-get install -y build-essential
       # audiopus_sys builds bundled libopus via CMake (Ninja generator for MSVC
-      # cross); GitHub-hosted images ship cmake/ninja, the omp-kata pods do not.
+      # cross); baked into the omp-kata image and GitHub-hosted images, so this
+      # only self-heals runners that predate the bake.
       - uses: ./.github/actions/ensure-cmake
       - name: Prepend rustup toolchain bin to PATH (GitHub-hosted)
         if: steps.detect.outputs.on_infra == 'false'
