@@ -4377,6 +4377,36 @@ describe("process-local contribution lifecycle", () => {
 		expect(storage.getPendingRun(session.id)?.id).toBe(run.id);
 		expect(harness.currentBranch()).toBe(CONTRIBUTION_BRANCH);
 	});
+
+	it("rejects a contribution keep when dirty status stages no new tested commit", async () => {
+		const harness = createIntegrationHarness(cwd.path());
+		await startContribution(harness);
+		const { run, session, storage } = await preparePendingContribution(harness, cwd.path());
+		const log = harness.tools.get("log_experiment");
+		if (!log) throw new Error("Expected contribution log tool");
+		harness.setStatusText(" M nested-repository\0");
+		const stageSpy = vi.spyOn(git.stage, "files").mockResolvedValue();
+		const stagedDiffSpy = vi.spyOn(git.diff, "has").mockResolvedValue(false);
+
+		const result = await log.execute(
+			"reject-empty-staged-commit",
+			{ status: "keep", metric: 1, description: "Dirty status did not materialize a new commit." },
+			undefined,
+			undefined,
+			harness.ctx as ExtensionContext,
+		);
+
+		expect(stageSpy).toHaveBeenCalled();
+		expect(stagedDiffSpy).toHaveBeenCalled();
+		expect(result.content).toEqual([
+			{
+				type: "text",
+				text: "Error: contribution keeps require a changed tested worktree and a newly verified one-parent commit.",
+			},
+		]);
+		expect(storage.listLoggedRuns(session.id)).toEqual([]);
+		expect(storage.getPendingRun(session.id)?.id).toBe(run.id);
+	});
 	it("runs normal commit hooks and logs only the exact one-parent passing-tree commit", async () => {
 		await initializeRealContributionRepository(cwd.path());
 		const baseHead = (await $`git -C ${cwd.path()} rev-parse HEAD`.quiet()).text().trim();
@@ -5342,6 +5372,49 @@ describe("process-local contribution lifecycle", () => {
 		expect(harness.currentBranch()).toBe("main");
 		expect(harness.activeTools).toEqual(["read", "bash"]);
 		expect(harness.sentUserMessages).toEqual([]);
+	});
+
+	it("rolls back a branch created before an aborted checkout hook returns", async () => {
+		let harness!: IntegrationHarness;
+		let checkoutSignal: AbortSignal | undefined;
+		let shutdownSnapshot: { branch: string; events: string[] } | null = null;
+		let shutdownPromise: Promise<void> | null = null;
+		harness = createIntegrationHarness(cwd.path(), {
+			onCheckoutNewAt: async (_callNumber, signal) => {
+				checkoutSignal = signal;
+				harness.setCurrentBranch(CONTRIBUTION_BRANCH);
+				shutdownPromise = Promise.resolve(
+					handlerRequired<SessionShutdownEvent>(harness, "session_shutdown")(
+						{ type: "session_shutdown" },
+						harness.ctx as ExtensionContext,
+					),
+				).finally(() => {
+					shutdownSnapshot = { branch: harness.currentBranch(), events: [...harness.gitEvents] };
+				});
+				for (let turn = 0; turn < 4; turn++) await Promise.resolve();
+				throw signal?.reason ?? new DOMException("Checkout aborted after branch creation", "AbortError");
+			},
+		});
+
+		const startResult = await commandRequired(harness, "contribute").handler("", harness.ctx);
+		const startedShutdown = shutdownPromise as Promise<void> | null;
+		if (!startedShutdown) throw new Error("Expected shutdown during checkout hook");
+		await startedShutdown;
+
+		expect(startResult).toBeUndefined();
+		expect(checkoutSignal).toBeDefined();
+		const settledSnapshot = shutdownSnapshot as { branch: string; events: string[] } | null;
+		if (!settledSnapshot) throw new Error("Expected shutdown settlement snapshot");
+		const rollbackCheckoutIndex = settledSnapshot.events.indexOf("checkout:main");
+		const rollbackDeleteIndex = settledSnapshot.events.indexOf(`delete:${CONTRIBUTION_BRANCH}`);
+		expect(settledSnapshot.branch).toBe("main");
+		expect(rollbackCheckoutIndex).toBeGreaterThanOrEqual(0);
+		expect(rollbackDeleteIndex).toBeGreaterThan(rollbackCheckoutIndex);
+		expect(checkoutSignal?.aborted).toBe(true);
+		expect(harness.currentBranch()).toBe("main");
+		expect(harness.checkoutCalls).toContain("main");
+		expect(harness.deletedBranches).toContain(CONTRIBUTION_BRANCH);
+		expect(harness.activeTools).toEqual(["read", "bash"]);
 	});
 	for (const invalidation of ["off", "session switch"] as const) {
 		it(`invalidates a confirmed start during final confirmation on ${invalidation} without mutation`, async () => {
@@ -6553,9 +6626,25 @@ describe("process-local contribution lifecycle", () => {
 		const storage = await openAutoresearchStorage(cwd.path());
 		const sessionA = storage.getActiveSessionForBranch(branchA);
 		if (!sessionA) throw new Error("Expected retained branch A session");
+		const branchB = "autoresearch/ordinary-clear-unrelated";
+		const sessionB = storage.openSession({
+			name: "unrelated active branch",
+			goal: "preserve branch B",
+			primaryMetric: "runtime_ms",
+			metricUnit: "ms",
+			direction: "lower",
+			preferredCommand: "bash autoresearch.sh",
+			branch: branchB,
+			baselineCommit: CURRENT_HEAD,
+			maxIterations: null,
+			scopePaths: [],
+			offLimits: [],
+			constraints: [],
+			secondaryMetrics: [],
+		});
 		const resetSpy = vi.spyOn(git, "reset").mockResolvedValue();
 		const cleanSpy = vi.spyOn(git, "clean").mockResolvedValue();
-		harness.setCurrentBranch("main");
+		harness.setCurrentBranch(branchB);
 
 		await commandRequired(harness, "autoresearch").handler("clear --reset-tree", harness.ctx);
 
@@ -6563,6 +6652,8 @@ describe("process-local contribution lifecycle", () => {
 		if (!closedSession) throw new Error("Expected retained session history after clear");
 		expect(closedSession.closedAt).not.toBeNull();
 		expect(storage.getActiveSessionForBranch(branchA)).toBeNull();
+		expect(storage.getActiveSessionForBranch(branchB)?.id).toBe(sessionB.id);
+		expect(storage.getSessionById(sessionB.id)?.closedAt).toBeNull();
 		expect(resetSpy).toHaveBeenCalledWith(cwd.path(), { hard: true, target: sessionA.baselineCommit });
 		expect(cleanSpy).toHaveBeenCalledWith(cwd.path());
 		expect(harness.activeTools).toEqual(["read", "bash"]);
