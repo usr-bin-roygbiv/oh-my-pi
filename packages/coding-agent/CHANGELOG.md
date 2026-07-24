@@ -9,6 +9,7 @@
 ### Added
 
 - Added `error.notify` so failed model turns can emit distinct terminal/desktop notifications without changing completion notifications ([#2691](https://github.com/can1357/oh-my-pi/issues/2691)).
+- Added `/live`, a Codex-authenticated realtime voice surface that streams microphone audio over WebRTC, routes coding work through the active agent session, and returns progress and final results to the voice model over the call's sideband channel.
 - Added auto-following light and dark themes to HTML session exports, with a `/export --themes` option to bundle the user's selected TUI themes.
 - Added owner-routed async job delivery: every session (including subagents) registers its own delivery sink, so background bash/task results are injected into the owning agent's run instead of the first top-level session; deliveries whose owner is gone are dead-lettered with the result retained on the job row.
 - Added `AsyncJobManager.registerDeliverySink` and `AsyncJobManager.waitForOwnerJobs` (with an `excludeSuppressed` filter for quiescence checks).
