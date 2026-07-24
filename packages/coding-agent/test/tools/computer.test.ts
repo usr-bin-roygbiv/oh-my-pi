@@ -431,16 +431,20 @@ describe("computer tool", () => {
 		expect(tool.parameters({ actions: [], unexpected: true }) instanceof arkType.errors).toBe(true);
 	});
 
-	it("executes function-call params.actions and defaults empty batches to a screenshot", async () => {
+	it("executes function-call params.actions and defaults omitted, undefined, null, and empty batches to a screenshot", async () => {
 		const controller = new FakeController();
 		const tool = new ComputerTool(toolSession(Settings.isolated({ "computer.enabled": true })), () => controller);
 		const result = await tool.execute("call", { actions: [{ type: "click", x: 5, y: 6, button: "left" }] });
 		expect(result.content).toEqual([{ type: "image", data: "AQ==", mimeType: "image/png", detail: "original" }]);
 		expect(result.providerMetadata).toBeUndefined();
 		await tool.execute("call", {});
+		await tool.execute("call", { actions: undefined } as unknown as ComputerParams);
+		await tool.execute("call", { actions: null } as unknown as ComputerParams);
 		await tool.execute("call", { actions: [] });
 		expect(controller.batches).toEqual([
 			[{ type: "click", x: 5, y: 6, button: "left" }],
+			[{ type: "screenshot" }],
+			[{ type: "screenshot" }],
 			[{ type: "screenshot" }],
 			[{ type: "screenshot" }],
 		]);
@@ -475,9 +479,6 @@ describe("computer tool", () => {
 		for (const actions of invalidBatches) {
 			await expect(tool.execute("call", { actions })).rejects.toThrow("Computer call contains an invalid action");
 		}
-		await expect(tool.execute("call", { actions: null } as unknown as ComputerParams)).rejects.toThrow(
-			"Computer call requires an array of actions",
-		);
 		expect(controller.batches).toHaveLength(0);
 		await tool.execute("call", {
 			actions: [{ type: "scroll", x: 0, y: 0, scroll_x: -2_147_483_648, scroll_y: 2_147_483_647 }],
@@ -566,9 +567,19 @@ describe("computer tool", () => {
 		expect(controller.closeCount).toBe(1);
 	});
 
-	it("classifies observation-only batches as read and input as exec", () => {
-		expect(computerApproval({ actions: [{ type: "screenshot" }, { type: "wait" }] })).toBe("read");
-		expect(computerApproval({ actions: [{ type: "move", x: 1, y: 2 }] })).toBe("exec");
+	it("classifies screenshot-default and observation-only calls as read while malformed and input calls require exec", () => {
+		for (const args of [
+			{},
+			{ actions: undefined },
+			{ actions: null },
+			{ actions: [] },
+			{ actions: [{ type: "screenshot" }, { type: "wait" }] },
+		]) {
+			expect(computerApproval(args)).toBe("read");
+		}
+		for (const actions of ["screenshot", { type: "screenshot" }, [{ type: "move", x: 1, y: 2 }]]) {
+			expect(computerApproval({ actions })).toBe("exec");
+		}
 	});
 
 	it("shows exact action details at approval time", () => {

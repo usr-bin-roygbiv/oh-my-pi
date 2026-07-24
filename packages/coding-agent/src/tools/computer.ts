@@ -230,7 +230,7 @@ function isComputerAction(value: unknown): value is ComputerAction {
 function parseActions(value: unknown): ComputerAction[] {
 	// Missing or empty action batches degrade to a plain screenshot so a
 	// function-calling model can observe the screen before acting.
-	if (value === undefined) return [{ type: "screenshot" }];
+	if (value == null) return [{ type: "screenshot" }];
 	if (!Array.isArray(value)) throw new ToolError("Computer call requires an array of actions");
 	if (value.length === 0) return [{ type: "screenshot" }];
 	if (!value.every(isComputerAction)) throw new ToolError("Computer call contains an invalid action");
@@ -286,6 +286,7 @@ function callMetadata(context: AgentToolContext | undefined): ComputerToolCallMe
 export function computerApproval(args: unknown): ToolApprovalDecision {
 	const actions =
 		args && typeof args === "object" && "actions" in args ? (args as { actions?: unknown }).actions : undefined;
+	if (actions == null) return "read";
 	if (!Array.isArray(actions)) return "exec";
 	return actions.every(action => {
 		if (!action || typeof action !== "object") return false;
