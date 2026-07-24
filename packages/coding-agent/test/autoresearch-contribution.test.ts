@@ -522,9 +522,9 @@ describe("read-only contribution storage preflight", () => {
 			if (!("error" in result) || !(result.error instanceof Error)) throw new Error("Expected bounded probe error");
 			expect(result.error.message).toContain("read-only probe limit");
 			expect(copyAttempts).toEqual([]);
-			expect(
-				mkdtempSpy.mock.calls.filter(([prefix]) => String(prefix).includes("omp-autoresearch-probe-")),
-			).toEqual([]);
+			expect(mkdtempSpy.mock.calls.filter(([prefix]) => String(prefix).includes("omp-autoresearch-probe-"))).toEqual(
+				[],
+			);
 			expect(probeTemps()).toEqual(tempsBefore);
 		});
 	}

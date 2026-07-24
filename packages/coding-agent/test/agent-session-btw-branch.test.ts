@@ -352,7 +352,9 @@ describe("AgentSession.branchFromBtw", () => {
 		expect(emitted.filter(event => event.type === "session_before_move")).toHaveLength(1);
 		expect(emitted.filter(event => event.type === "session_move")).toHaveLength(1);
 		expect(emitted.filter(event => event.type === "session_transition_end")).toHaveLength(1);
-		expect(emitted.filter(event => event.type === "session_transition_end" && event.committed === true)).toHaveLength(1);
+		expect(emitted.filter(event => event.type === "session_transition_end" && event.committed === true)).toHaveLength(
+			1,
+		);
 	});
 
 	it("syncs promoted /btw messages into live context even when hooks skip conversation restore", async () => {
