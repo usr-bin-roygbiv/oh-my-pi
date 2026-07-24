@@ -1442,12 +1442,48 @@ const WORKTREE_TREE_INDEX_BATCH_BYTES = 1024 * 1024;
 const WORKTREE_TREE_FILE_LIMIT_BYTES = 32 * 1024 * 1024;
 const WORKTREE_TREE_TOTAL_LIMIT_BYTES = 256 * 1024 * 1024;
 const WORKTREE_TREE_COPY_BUFFER_BYTES = 64 * 1024;
+const WORKTREE_TREE_LISTING_LIMIT_BYTES = 32 * 1024 * 1024;
+const WORKTREE_TREE_LISTING_RECORD_LIMIT = 100_000;
+
+async function writeGitOutputToFile(
+	stream: ReadableStream<Uint8Array>,
+	output: fs.promises.FileHandle,
+	reserveOutputChunk: (chunk: Uint8Array) => void,
+): Promise<void> {
+	const reader = stream.getReader();
+	let completed = false;
+	try {
+		while (true) {
+			const { value, done } = await reader.read();
+			if (done) break;
+			reserveOutputChunk(value);
+			let written = 0;
+			while (written < value.byteLength) {
+				const result = await output.write(value, written, value.byteLength - written, null);
+				if (result.bytesWritten === 0) throw new Error("Failed to materialize Git worktree metadata.");
+				written += result.bytesWritten;
+			}
+		}
+		completed = true;
+	} finally {
+		if (!completed) {
+			try {
+				await reader.cancel();
+			} catch {
+				// The subprocess may already have closed the pipe after cancellation.
+			}
+		}
+		reader.releaseLock();
+	}
+}
 
 async function runGitToFile(
 	cwd: string,
 	args: readonly string[],
 	outputPath: string,
-	options: Pick<CommandOptions, "env" | "signal">,
+	options: Pick<CommandOptions, "env" | "signal"> & {
+		reserveOutputChunk: (chunk: Uint8Array) => void;
+	},
 ): Promise<void> {
 	ensureAvailable();
 	const commandArgs = withShortLivedGitConfig(withNoOptionalLocks(args));
@@ -1458,26 +1494,39 @@ async function runGitToFile(
 			env: buildGitEnv(options.env),
 			signal: options.signal,
 			stdin: "ignore",
-			stdout: output.fd,
+			stdout: "pipe",
 			stderr: "pipe",
 			windowsHide: true,
 		});
+		const stdoutStream = child.stdout;
 		const stderrStream = child.stderr;
-		if (!(stderrStream instanceof ReadableStream)) throw new Error("Failed to capture git command stderr.");
-		const stderrPromise = readCappedText(stderrStream, GIT_COMMAND_OUTPUT_LIMIT_BYTES);
-		const exit = await waitForExitWithTimeout(child, formatCommandLabel("git", commandArgs), GIT_COMMAND_TIMEOUT_MS);
-		if (exit.timedOut) {
-			void stderrPromise.catch(() => undefined);
-			await cancelOutput(stderrStream);
-			throw new GitCommandError(args, {
-				exitCode: GIT_COMMAND_TIMEOUT_EXIT_CODE,
-				stdout: "",
-				stderr: exit.stderr,
-			});
+		if (!(stdoutStream instanceof ReadableStream) || !(stderrStream instanceof ReadableStream)) {
+			await terminateTimedOutChild(child);
+			throw new Error("Failed to capture git command output.");
 		}
-		const stderr = await stderrPromise;
-		if (exit.exitCode !== 0) {
-			throw new GitCommandError(args, { exitCode: exit.exitCode ?? 0, stdout: "", stderr });
+		const stdoutPromise = writeGitOutputToFile(stdoutStream, output, options.reserveOutputChunk);
+		const stderrPromise = readCappedText(stderrStream, GIT_COMMAND_OUTPUT_LIMIT_BYTES);
+		const exitPromise = waitForExitWithTimeout(child, formatCommandLabel("git", commandArgs), GIT_COMMAND_TIMEOUT_MS);
+		try {
+			await stdoutPromise;
+			const exit = await exitPromise;
+			if (exit.timedOut) {
+				void stderrPromise.catch(() => undefined);
+				await cancelOutput(stderrStream);
+				throw new GitCommandError(args, {
+					exitCode: GIT_COMMAND_TIMEOUT_EXIT_CODE,
+					stdout: "",
+					stderr: exit.stderr,
+				});
+			}
+			const stderr = await stderrPromise;
+			if (exit.exitCode !== 0) {
+				throw new GitCommandError(args, { exitCode: exit.exitCode ?? 0, stdout: "", stderr });
+			}
+		} catch (error) {
+			await terminateTimedOutChild(child);
+			await Promise.allSettled([stdoutPromise, stderrPromise, exitPromise]);
+			throw error;
 		}
 	} finally {
 		await output.close();
@@ -1676,16 +1725,40 @@ export async function writeWorktreeTree(cwd: string, signal?: AbortSignal): Prom
 	};
 	try {
 		await fs.promises.mkdir(temporaryObjectDirectory);
+		let listingBytes = 0;
+		const createListingReservation = (): ((chunk: Uint8Array) => void) => {
+			let records = 0;
+			return chunk => {
+				if (chunk.byteLength > WORKTREE_TREE_LISTING_LIMIT_BYTES - listingBytes) {
+					throw new Error("Worktree proof exceeds the 32 MiB worktree metadata listing limit.");
+				}
+				for (let offset = 0; ; ) {
+					const separator = chunk.indexOf(0, offset);
+					if (separator < 0) break;
+					records++;
+					if (records > WORKTREE_TREE_LISTING_RECORD_LIMIT) {
+						throw new Error("Worktree proof exceeds the 100000-entry worktree metadata limit.");
+					}
+					offset = separator + 1;
+				}
+				listingBytes += chunk.byteLength;
+			};
+		};
 		await runEffect(repository.repoRoot, ["--no-replace-objects", "read-tree", "HEAD"], { env, signal });
 		await runGitToFile(repository.repoRoot, ["ls-files", "--stage", "--full-name", "-z"], stagedListing, {
 			env,
 			signal,
+			reserveOutputChunk: createListingReservation(),
 		});
 		await runGitToFile(
 			repository.repoRoot,
 			["ls-files", "--cached", "--others", "--exclude-standard", "--full-name", "-z"],
 			candidateListing,
-			{ env, signal },
+			{
+				env,
+				signal,
+				reserveOutputChunk: createListingReservation(),
+			},
 		);
 
 		const stagedRecords = readNulRecords(stagedListing)[Symbol.asyncIterator]();

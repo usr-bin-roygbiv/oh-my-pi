@@ -291,6 +291,7 @@ function hasExecutableContributionTddProof(
 		const redHarness = run.parsedAsi?.[CONTRIBUTION_HARNESS_SHA256_ASI_KEY];
 		const redInvocation = run.parsedAsi?.[CONTRIBUTION_INVOCATION_SHA256_ASI_KEY];
 		const redTree = run.parsedAsi?.[CONTRIBUTION_WORKTREE_TREE_ASI_KEY];
+		const redHead = run.parsedAsi?.[CONTRIBUTION_HEAD_SHA_ASI_KEY];
 		return (
 			run.id < candidate.id &&
 			run.sessionId === session.id &&
@@ -302,6 +303,9 @@ function hasExecutableContributionTddProof(
 			(run.timedOut || (run.exitCode !== null && run.exitCode !== 0)) &&
 			redHarness === candidateHarness &&
 			redInvocation === candidateInvocation &&
+			typeof redHead === "string" &&
+			/^[0-9a-f]{40}$/.test(redHead) &&
+			redHead === candidateHead &&
 			redTree !== candidateTree &&
 			typeof redTree === "string" &&
 			/^[0-9a-f]{40}$/.test(redTree)
@@ -2108,7 +2112,7 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 			}
 			runtime.autoResumeArmed = false;
 			runtime.lastAutoResumePendingRunNumber = pendingRun?.runNumber ?? null;
-			if (!lifecycleIdentityIsCurrent(ctx, identity)) return;
+			if (!lifecycleIdentityIsCurrent(ctx, identity) || !ctx.isIdle()) return;
 			api.sendMessage(
 				{
 					customType: "autoresearch-resume",
