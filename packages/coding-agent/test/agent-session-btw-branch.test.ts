@@ -500,8 +500,8 @@ describe("AgentSession.branchFromBtw", () => {
 		activeSession.sessionManager.appendMessage({ role: "user", content: "seed", timestamp: Date.now() });
 		await activeSession.sessionManager.flush();
 		const abortController = new AbortController();
-		const execution = Promise.withResolvers<void>().promise;
-		activeSession.trackEvalExecution(execution, abortController).catch(() => undefined);
+		const execution = Promise.withResolvers<void>();
+		const trackedExecution = activeSession.trackEvalExecution(execution.promise, abortController);
 		expect(activeSession.isEvalRunning).toBe(true);
 
 		await expect(activeSession.branchFromBtw("question", createBtwAssistant())).rejects.toThrow(
@@ -509,6 +509,39 @@ describe("AgentSession.branchFromBtw", () => {
 		);
 
 		abortController.abort();
+		execution.resolve();
+		await trackedExecution;
+		expect(activeSession.isEvalRunning).toBe(false);
+	});
+
+	it("keeps seeded new-session setup inside the transition settlement boundary", async () => {
+		const timeline: string[] = [];
+		const extensionRunner = {
+			hasHandlers: vi.fn((eventType: string) => eventType === "session_transition_end"),
+			emit: vi.fn(async (event: { type: string }) => {
+				if (event.type === "session_transition_end") timeline.push("transition_end");
+			}),
+		} as unknown as ExtensionRunner;
+		const activeSession = await createSession({ extensionRunner });
+		activeSession.sessionManager.appendMessage({ role: "user", content: "seed", timestamp: Date.now() });
+		await activeSession.sessionManager.flush();
+		type SeededNewSessionOptions = NonNullable<Parameters<AgentSession["newSession"]>[0]> & {
+			setup: (sessionManager: SessionManager) => Promise<void>;
+		};
+		const options: SeededNewSessionOptions = {
+			setup: async sessionManager => {
+				timeline.push("setup");
+				sessionManager.appendMessage({ role: "user", content: "seeded", timestamp: Date.now() });
+			},
+		};
+
+		const result = await activeSession.newSession(options);
+
+		expect(result).toBe(true);
+		expect(timeline).toEqual(["setup", "transition_end"]);
+		expect(activeSession.sessionManager.getBranch()).toContainEqual(
+			expect.objectContaining({ type: "message", message: expect.objectContaining({ role: "user" }) }),
+		);
 	});
 
 	it("refuses to branch /btw while context maintenance is running", async () => {

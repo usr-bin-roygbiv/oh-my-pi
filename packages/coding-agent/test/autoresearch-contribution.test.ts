@@ -1765,6 +1765,52 @@ describe("contribution fork validation and publication", () => {
 		}
 	});
 
+	it("attests exact executable harness bytes and changes identity with the materialized tree", async () => {
+		const source = TempDir.createSync("@pi-contribution-tree-attestation-");
+		const tempsBefore = snapshotWorktreeTreeTemps();
+		try {
+			await $`git -C ${source.path()} init -b main`.quiet();
+			const firstBytes = Buffer.from("#!/usr/bin/env bash\necho METRIC runtime_ms=1\n");
+			const harnessPath = `${source.path()}/autoresearch.sh`;
+			await Bun.write(harnessPath, firstBytes);
+			fs.chmodSync(harnessPath, 0o755);
+			await $`git -C ${source.path()} add autoresearch.sh`.quiet();
+			await $`git -C ${source.path()} -c user.name=OMP -c user.email=omp@example.invalid commit -m harness`.quiet();
+
+			const first = await git.writeWorktreeTreeWithAttestation(
+				source.path(),
+				"autoresearch.sh",
+				CONTRIBUTION_HARNESS_MAX_BYTES,
+			);
+			const firstGitBlob = new Bun.CryptoHasher("sha1")
+				.update(Buffer.concat([Buffer.from(`blob ${firstBytes.byteLength}\0`), firstBytes]))
+				.digest("hex");
+			expect(first.attestation).toEqual({
+				relativePath: "autoresearch.sh",
+				blobSha: firstGitBlob,
+				sha256: new Bun.SHA256().update(firstBytes).digest("hex"),
+				byteLength: firstBytes.byteLength,
+				mode: "100755",
+			});
+
+			const secondBytes = Buffer.from("#!/usr/bin/env bash\necho METRIC runtime_ms=2\n");
+			await Bun.write(harnessPath, secondBytes);
+			fs.chmodSync(harnessPath, 0o755);
+			const second = await git.writeWorktreeTreeWithAttestation(
+				source.path(),
+				"autoresearch.sh",
+				CONTRIBUTION_HARNESS_MAX_BYTES,
+			);
+			expect(second.attestation.sha256).toBe(new Bun.SHA256().update(secondBytes).digest("hex"));
+			expect(second.attestation.sha256).not.toBe(first.attestation.sha256);
+			expect(second.attestation.blobSha).not.toBe(first.attestation.blobSha);
+			expect(second.treeSha).not.toBe(first.treeSha);
+			expect(snapshotWorktreeTreeTemps()).toEqual(tempsBefore);
+		} finally {
+			source.removeSync();
+		}
+	});
+
 	it("rejects worktree proof files above the 256 MiB aggregate materialization limit", async () => {
 		const source = TempDir.createSync("@pi-contribution-tree-total-limit-");
 		const tempsBefore = snapshotWorktreeTreeTemps();
@@ -2490,7 +2536,7 @@ interface IntegrationHarnessOptions {
 	onGoalRefRequest?(signal?: AbortSignal): void | Promise<void>;
 	onConfirm?(callNumber: number, title: string, signal?: AbortSignal): void | Promise<void>;
 	onSetModel?(callNumber: number): void | Promise<void>;
-	onCheckoutNewAt?(callNumber: number): void | Promise<void>;
+	onCheckoutNewAt?(callNumber: number, signal?: AbortSignal): void | Promise<void>;
 	onSetActiveTools?(callNumber: number, names: readonly string[]): void | Promise<void>;
 	onSetWidget?(value: unknown): void;
 	onForkMetadataRequest?(callNumber: number, signal?: AbortSignal): void | Promise<void>;
@@ -2717,10 +2763,10 @@ function createIntegrationHarness(cwd: string, options: IntegrationHarnessOption
 		if (options.checkoutFailure) throw options.checkoutFailure;
 		currentBranch = branch;
 	});
-	vi.spyOn(git.branch, "checkoutNewAt").mockImplementation(async (_workDir, branch, startPoint) => {
+	vi.spyOn(git.branch, "checkoutNewAt").mockImplementation(async (_workDir, branch, startPoint, signal) => {
 		checkoutNewCalls.push(branch);
 		gitEvents.push(`checkoutNewAt:${branch}:${startPoint}`);
-		await options.onCheckoutNewAt?.(checkoutNewCalls.length);
+		await options.onCheckoutNewAt?.(checkoutNewCalls.length, signal);
 		if (options.checkoutFailure) throw options.checkoutFailure;
 		currentBranch = branch;
 	});
@@ -4306,6 +4352,31 @@ describe("process-local contribution lifecycle", () => {
 		}
 	});
 
+	it("rejects a no-change contribution keep instead of blessing the pre-run HEAD", async () => {
+		const harness = createIntegrationHarness(cwd.path());
+		await startContribution(harness);
+		const { run, session, storage } = await preparePendingContribution(harness, cwd.path());
+		const log = harness.tools.get("log_experiment");
+		if (!log) throw new Error("Expected contribution log tool");
+
+		const result = await log.execute(
+			"reject-no-change-keep",
+			{ status: "keep", metric: 1, description: "No implementation changed the tested tree." },
+			undefined,
+			undefined,
+			harness.ctx as ExtensionContext,
+		);
+
+		expect(result.content).toEqual([
+			{
+				type: "text",
+				text: "Error: contribution keeps require a changed tested worktree and a newly verified one-parent commit.",
+			},
+		]);
+		expect(storage.listLoggedRuns(session.id)).toEqual([]);
+		expect(storage.getPendingRun(session.id)?.id).toBe(run.id);
+		expect(harness.currentBranch()).toBe(CONTRIBUTION_BRANCH);
+	});
 	it("runs normal commit hooks and logs only the exact one-parent passing-tree commit", async () => {
 		await initializeRealContributionRepository(cwd.path());
 		const baseHead = (await $`git -C ${cwd.path()} rev-parse HEAD`.quiet()).text().trim();
@@ -5171,12 +5242,106 @@ describe("process-local contribution lifecycle", () => {
 		expect(finalMessage).toMatch(/api charges?/i);
 		expect(finalMessage).toMatch(/no estimate/i);
 		expect(finalMessage).toMatch(/no cap/i);
+		expect(finalMessage).toMatch(/CPU\/GPU/i);
+		expect(finalMessage).toMatch(/memory/i);
+		expect(finalMessage).toMatch(/disk/i);
+		expect(finalMessage).toMatch(/network/i);
+		expect(finalMessage).toMatch(/electricity/i);
+		expect(finalMessage).toMatch(/terminal availability/i);
+		expect(finalMessage).toMatch(/artifact/i);
 		expect(harness.setModelCalls).toEqual([]);
 		expect(harness.checkoutNewCalls).toEqual([]);
 		expect(harness.activeTools).toEqual(initialTools);
 		expect(harness.appendEntries).toEqual([]);
 		expect(harness.sentUserMessages).toEqual([]);
 		expect(snapshotStorageArtifacts(dbDir.path())).toEqual([]);
+	});
+
+	it("rejects contribution start while an existing turn is active without preflight mutation", async () => {
+		const harness = createIntegrationHarness(cwd.path());
+		harness.setIdle(false);
+
+		await commandRequired(harness, "contribute").handler("", harness.ctx);
+
+		expect(harness.confirmCalls).toEqual([]);
+		expect(harness.githubEndpoints).toEqual([]);
+		expect(harness.setModelCalls).toEqual([]);
+		expect(harness.checkoutNewCalls).toEqual([]);
+		expect(harness.notifications.at(-1)).toEqual({
+			type: "error",
+			message: "Wait for the active turn and tools to finish before starting contribution mode.",
+		});
+	});
+
+	it("rejects contribution review while a turn is active without confirmation or push", async () => {
+		const harness = createIntegrationHarness(cwd.path(), { confirmAnswers: [true, true, true] });
+		await startContribution(harness);
+		await prepareKeptContribution(harness, cwd.path());
+		const confirmationsBeforeReview = harness.confirmCalls.length;
+		harness.setIdle(false);
+
+		await commandRequired(harness, "contribute").handler("review", harness.ctx);
+
+		expect(harness.confirmCalls).toHaveLength(confirmationsBeforeReview);
+		expect(harness.pushes).toEqual([]);
+		expect(harness.notifications.at(-1)).toEqual({
+			type: "error",
+			message: "Wait for the active turn and tools to finish before preparing contribution review.",
+		});
+	});
+
+	it("shows the exact PR title together with the body before publication approval", async () => {
+		const harness = createIntegrationHarness(cwd.path(), { confirmAnswers: [true, true, true] });
+		await startContribution(harness);
+		await prepareKeptContribution(harness, cwd.path());
+
+		await commandRequired(harness, "contribute").handler("review", harness.ctx);
+
+		const reviewConfirmation = harness.confirmCalls.at(-1);
+		expect(reviewConfirmation?.title).toBe("Approve exact contribution PR draft and push?");
+		expect(reviewConfirmation?.message).toStartWith("Title: Autoresearch: Faster contributor loop\n\n");
+		expect(reviewConfirmation?.message).toContain(CONTRIBUTION_HUMAN_SUMMARY_PLACEHOLDER);
+	});
+
+	it("aborts contribution activation immediately when shutdown begins", async () => {
+		const checkoutEntered = Promise.withResolvers<void>();
+		const releaseCheckout = Promise.withResolvers<void>();
+		let checkoutSignal: AbortSignal | undefined;
+		const harness = createIntegrationHarness(cwd.path(), {
+			onCheckoutNewAt: async (_callNumber, signal) => {
+				checkoutSignal = signal;
+				checkoutEntered.resolve();
+				await releaseCheckout.promise;
+				if (signal?.aborted) throw signal.reason ?? new DOMException("Contribution shutdown", "AbortError");
+			},
+		});
+		const startPromise = commandRequired(harness, "contribute").handler("", harness.ctx);
+		await checkoutEntered.promise;
+		let shutdownSettled = false;
+		const shutdownPromise = Promise.resolve(
+			handlerRequired<SessionShutdownEvent>(harness, "session_shutdown")(
+				{ type: "session_shutdown" },
+				harness.ctx as ExtensionContext,
+			),
+		).finally(() => {
+			shutdownSettled = true;
+		});
+		for (let turn = 0; turn < 4; turn++) await Promise.resolve();
+		const signalWasDefined = checkoutSignal !== undefined;
+		const signalWasAborted = checkoutSignal?.aborted;
+		const shutdownSettledBeforeRelease = shutdownSettled;
+
+		releaseCheckout.resolve();
+		const [startResult, shutdownResult] = await Promise.allSettled([startPromise, shutdownPromise]);
+
+		expect(signalWasDefined).toBe(true);
+		expect(signalWasAborted).toBe(true);
+		expect(shutdownSettledBeforeRelease).toBe(false);
+		expect(startResult.status).toBe("fulfilled");
+		expect(shutdownResult.status).toBe("fulfilled");
+		expect(harness.currentBranch()).toBe("main");
+		expect(harness.activeTools).toEqual(["read", "bash"]);
+		expect(harness.sentUserMessages).toEqual([]);
 	});
 	for (const invalidation of ["off", "session switch"] as const) {
 		it(`invalidates a confirmed start during final confirmation on ${invalidation} without mutation`, async () => {
@@ -5769,7 +5934,7 @@ describe("process-local contribution lifecycle", () => {
 		const spoofTree = "8".repeat(40);
 		const spoofInvocation = "9".repeat(64);
 		let execution = 0;
-		vi.spyOn(bashExecutor, "executeBash").mockImplementation(async () => {
+		vi.spyOn(bashExecutor, "executeBash").mockImplementation(async (_command, options) => {
 			execution++;
 			const passed = execution === 2;
 			const output = [
@@ -5778,6 +5943,7 @@ describe("process-local contribution lifecycle", () => {
 				`ASI ${CONTRIBUTION_INVOCATION_SHA256_ASI_KEY}=${spoofInvocation}`,
 				...(passed ? ["METRIC runtime_ms=1"] : []),
 			].join("\n");
+			options?.onChunk?.(`${output}\n`);
 			return {
 				output,
 				exitCode: passed ? 0 : 1,
@@ -6367,6 +6533,39 @@ describe("process-local contribution lifecycle", () => {
 			harness.ctx as ExtensionContext,
 		);
 		expect(harness.sentMessages).toEqual([]);
+	});
+
+	it("clears the exact retained ordinary owner from another branch with --reset-tree", async () => {
+		const harness = createIntegrationHarness(cwd.path());
+		const branchA = "autoresearch/ordinary-clear-owner";
+		harness.setCurrentBranch(branchA);
+		await commandRequired(harness, "autoresearch").handler("retained owner goal", harness.ctx);
+		await Bun.write(`${cwd.path()}/autoresearch.sh`, "#!/usr/bin/env bash\necho METRIC runtime_ms=1\n");
+		const init = harness.tools.get("init_experiment");
+		if (!init) throw new Error("Expected init_experiment tool");
+		await init.execute(
+			"retained-owner-session",
+			{ name: "retained owner", primary_metric: "runtime_ms" },
+			undefined,
+			undefined,
+			harness.ctx as ExtensionContext,
+		);
+		const storage = await openAutoresearchStorage(cwd.path());
+		const sessionA = storage.getActiveSessionForBranch(branchA);
+		if (!sessionA) throw new Error("Expected retained branch A session");
+		vi.spyOn(git, "reset").mockResolvedValue();
+		vi.spyOn(git, "clean").mockResolvedValue();
+		harness.setCurrentBranch("main");
+
+		await commandRequired(harness, "autoresearch").handler("clear --reset-tree", harness.ctx);
+
+		expect(storage.getSessionById(sessionA.id)?.closedAt).not.toBeNull();
+		expect(storage.getActiveSessionForBranch(branchA)).toBeNull();
+		expect(harness.activeTools).toEqual(["read", "bash"]);
+		expect(harness.appendEntries.at(-1)).toEqual({
+			customType: "autoresearch-control",
+			data: { mode: "clear" },
+		});
 	});
 
 	it("starts fresh ordinary autoresearch on branch B while branch A retains an active session", async () => {
