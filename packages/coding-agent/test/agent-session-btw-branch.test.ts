@@ -516,10 +516,16 @@ describe("AgentSession.branchFromBtw", () => {
 
 	it("keeps seeded new-session setup inside the transition settlement boundary", async () => {
 		const timeline: string[] = [];
+		const setupEntered = Promise.withResolvers<void>();
+		const releaseSetup = Promise.withResolvers<void>();
+		const transitionEnded = Promise.withResolvers<void>();
 		const extensionRunner = {
 			hasHandlers: vi.fn((eventType: string) => eventType === "session_transition_end"),
 			emit: vi.fn(async (event: { type: string }) => {
-				if (event.type === "session_transition_end") timeline.push("transition_end");
+				if (event.type === "session_transition_end") {
+					timeline.push("transition_end");
+					transitionEnded.resolve();
+				}
 			}),
 		} as unknown as ExtensionRunner;
 		const activeSession = await createSession({ extensionRunner });
@@ -530,13 +536,27 @@ describe("AgentSession.branchFromBtw", () => {
 		};
 		const options: SeededNewSessionOptions = {
 			setup: async sessionManager => {
+				setupEntered.resolve();
+				await releaseSetup.promise;
 				timeline.push("setup");
 				sessionManager.appendMessage({ role: "user", content: "seeded", timestamp: Date.now() });
 			},
 		};
+		let newSessionSettled = false;
+		const newSessionPromise = activeSession.newSession(options).finally(() => {
+			newSessionSettled = true;
+		});
+		const firstBoundary = await Promise.race([
+			setupEntered.promise.then(() => "setup" as const),
+			transitionEnded.promise.then(() => "transition_end" as const),
+		]);
+		for (let turn = 0; turn < 4; turn++) await Promise.resolve();
+		const settledBeforeRelease = newSessionSettled;
+		releaseSetup.resolve();
+		const result = await newSessionPromise;
 
-		const result = await activeSession.newSession(options);
-
+		expect(firstBoundary).toBe("setup");
+		expect(settledBeforeRelease).toBe(false);
 		expect(result).toBe(true);
 		expect(timeline).toEqual(["setup", "transition_end"]);
 		expect(activeSession.sessionManager.getBranch()).toContainEqual(

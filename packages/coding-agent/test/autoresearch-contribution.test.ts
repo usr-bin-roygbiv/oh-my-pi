@@ -1769,7 +1769,7 @@ describe("contribution fork validation and publication", () => {
 		const source = TempDir.createSync("@pi-contribution-tree-attestation-");
 		const tempsBefore = snapshotWorktreeTreeTemps();
 		try {
-			await $`git -C ${source.path()} init -b main`.quiet();
+			await $`git -C ${source.path()} init --object-format=sha1 -b main`.quiet();
 			const firstBytes = Buffer.from("#!/usr/bin/env bash\necho METRIC runtime_ms=1\n");
 			const harnessPath = `${source.path()}/autoresearch.sh`;
 			await Bun.write(harnessPath, firstBytes);
@@ -6553,14 +6553,18 @@ describe("process-local contribution lifecycle", () => {
 		const storage = await openAutoresearchStorage(cwd.path());
 		const sessionA = storage.getActiveSessionForBranch(branchA);
 		if (!sessionA) throw new Error("Expected retained branch A session");
-		vi.spyOn(git, "reset").mockResolvedValue();
-		vi.spyOn(git, "clean").mockResolvedValue();
+		const resetSpy = vi.spyOn(git, "reset").mockResolvedValue();
+		const cleanSpy = vi.spyOn(git, "clean").mockResolvedValue();
 		harness.setCurrentBranch("main");
 
 		await commandRequired(harness, "autoresearch").handler("clear --reset-tree", harness.ctx);
 
-		expect(storage.getSessionById(sessionA.id)?.closedAt).not.toBeNull();
+		const closedSession = storage.getSessionById(sessionA.id);
+		if (!closedSession) throw new Error("Expected retained session history after clear");
+		expect(closedSession.closedAt).not.toBeNull();
 		expect(storage.getActiveSessionForBranch(branchA)).toBeNull();
+		expect(resetSpy).toHaveBeenCalledWith(cwd.path(), { hard: true, target: sessionA.baselineCommit });
+		expect(cleanSpy).toHaveBeenCalledWith(cwd.path());
 		expect(harness.activeTools).toEqual(["read", "bash"]);
 		expect(harness.appendEntries.at(-1)).toEqual({
 			customType: "autoresearch-control",
