@@ -1449,9 +1449,81 @@ export async function writeWorktreeTree(cwd: string, signal?: AbortSignal): Prom
 	};
 	try {
 		await fs.promises.mkdir(temporaryObjectDirectory);
-		await runEffect(cwd, ["--no-replace-objects", "read-tree", "HEAD"], { env, signal });
-		await runEffect(cwd, ["add", "-A", "--"], { env, signal });
-		const treeSha = (await runText(cwd, ["write-tree"], { env, signal })).trim();
+		await runEffect(repository.repoRoot, ["--no-replace-objects", "read-tree", "HEAD"], { env, signal });
+		const stagedOutput = await runText(repository.repoRoot, ["ls-files", "--stage", "--full-name", "-z"], {
+			env,
+			readOnly: true,
+			signal,
+		});
+		const candidateOutput = await runText(
+			repository.repoRoot,
+			["ls-files", "--cached", "--others", "--exclude-standard", "--full-name", "-z"],
+			{ env, readOnly: true, signal },
+		);
+		const trackedEntries = new Map<string, { mode: string; objectId: string }>();
+		for (const record of stagedOutput.split("\0")) {
+			if (!record) continue;
+			const separator = record.indexOf("\t");
+			if (separator < 0) throw new Error("Git returned an invalid index entry.");
+			const [mode, objectId, stage] = record.slice(0, separator).split(" ");
+			if (!mode || !objectId || stage !== "0" || !/^[0-9a-f]{40,64}$/.test(objectId)) {
+				throw new Error("Git returned an invalid index entry.");
+			}
+			trackedEntries.set(record.slice(separator + 1), { mode, objectId });
+		}
+
+		const indexEntries: string[] = [];
+		for (const relativePath of candidateOutput.split("\0")) {
+			if (!relativePath) continue;
+			throwIfAborted(signal);
+			const absolutePath = path.join(repository.repoRoot, relativePath);
+			let entryStat: fs.Stats;
+			try {
+				entryStat = await fs.promises.lstat(absolutePath);
+			} catch (err) {
+				if (isEnoent(err) || isEnotdir(err)) continue;
+				throw err;
+			}
+
+			const trackedEntry = trackedEntries.get(relativePath);
+			if (entryStat.isDirectory()) {
+				if (trackedEntry?.mode === "160000") {
+					indexEntries.push(`160000 ${trackedEntry.objectId}\t${relativePath}\0`);
+				}
+				continue;
+			}
+
+			let mode: "100644" | "100755" | "120000";
+			let contents: Uint8Array;
+			if (entryStat.isSymbolicLink()) {
+				mode = "120000";
+				contents = await fs.promises.readlink(absolutePath, { encoding: "buffer" });
+			} else if (entryStat.isFile()) {
+				mode = (entryStat.mode & 0o111) === 0 ? "100644" : "100755";
+				contents = await fs.promises.readFile(absolutePath);
+			} else {
+				throw new Error(`Cannot snapshot unsupported filesystem entry: ${relativePath}`);
+			}
+			const objectId = (
+				await runText(repository.repoRoot, ["hash-object", "-w", "--no-filters", "--stdin"], {
+					env,
+					signal,
+					stdin: contents,
+				})
+			).trim();
+			if (!/^[0-9a-f]{40,64}$/.test(objectId)) throw new Error("Git returned an invalid blob object id.");
+			indexEntries.push(`${mode} ${objectId}\t${relativePath}\0`);
+		}
+
+		await runEffect(repository.repoRoot, ["read-tree", "--empty"], { env, signal });
+		if (indexEntries.length > 0) {
+			await runEffect(repository.repoRoot, ["update-index", "--add", "-z", "--index-info"], {
+				env,
+				signal,
+				stdin: indexEntries.join(""),
+			});
+		}
+		const treeSha = (await runText(repository.repoRoot, ["write-tree"], { env, signal })).trim();
 		if (!/^[0-9a-f]{40,64}$/.test(treeSha)) throw new Error("Git returned an invalid worktree tree object id.");
 		return treeSha;
 	} finally {

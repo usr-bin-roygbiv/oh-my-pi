@@ -78,6 +78,8 @@ import type {
 	SessionBeforeBranchResult,
 	SessionBeforeCompactEvent,
 	SessionBeforeCompactResult,
+	SessionBeforeMoveEvent,
+	SessionBeforeMoveResult,
 	SessionBeforeSwitchEvent,
 	SessionBeforeSwitchResult,
 	SessionBeforeTreeEvent,
@@ -93,6 +95,7 @@ import type {
 	SessionStopEventResult,
 	SessionSwitchEvent,
 	SessionTransitionEndEvent,
+	SessionMoveEvent,
 	SessionTreeEvent,
 	TodoReminderEvent,
 	ToolCallEventResult,
@@ -606,6 +609,7 @@ export interface ResourcesDiscoverResult {
 export type {
 	SessionBeforeBranchEvent,
 	SessionBeforeCompactEvent,
+	SessionBeforeMoveEvent,
 	SessionBeforeSwitchEvent,
 	SessionBeforeTreeEvent,
 	SessionBranchEvent,
@@ -615,6 +619,7 @@ export type {
 	SessionShutdownEvent,
 	SessionStartEvent,
 	SessionSwitchEvent,
+	SessionMoveEvent,
 	SessionTransitionEndEvent,
 	SessionTransitionKind,
 	SessionTreeEvent,
@@ -1000,6 +1005,7 @@ export interface BeforeAgentStartEventResult {
 export type {
 	SessionBeforeBranchResult,
 	SessionBeforeCompactResult,
+	SessionBeforeMoveResult,
 	SessionBeforeSwitchResult,
 	SessionBeforeTreeResult,
 	SessionCompactingResult,
@@ -1093,6 +1099,8 @@ export interface ExtensionAPI {
 		handler: ExtensionHandler<SessionBeforeSwitchEvent, SessionBeforeSwitchResult>,
 	): void;
 	on(event: "session_switch", handler: ExtensionHandler<SessionSwitchEvent>): void;
+	on(event: "session_before_move", handler: ExtensionHandler<SessionBeforeMoveEvent, SessionBeforeMoveResult>): void;
+	on(event: "session_move", handler: ExtensionHandler<SessionMoveEvent>): void;
 	on(
 		event: "session_before_branch",
 		handler: ExtensionHandler<SessionBeforeBranchEvent, SessionBeforeBranchResult>,

@@ -23,6 +23,8 @@ import type {
 	SessionBeforeBranchResult,
 	SessionBeforeCompactEvent,
 	SessionBeforeCompactResult,
+	SessionBeforeMoveEvent,
+	SessionBeforeMoveResult,
 	SessionBeforeSwitchEvent,
 	SessionBeforeSwitchResult,
 	SessionBeforeTreeEvent,
@@ -35,6 +37,7 @@ import type {
 	SessionShutdownEvent,
 	SessionStartEvent,
 	SessionSwitchEvent,
+	SessionMoveEvent,
 	SessionTransitionEndEvent,
 	SessionTreeEvent,
 	TodoReminderEvent,
@@ -261,6 +264,7 @@ export type {
 	ContextEvent,
 	SessionBeforeBranchEvent,
 	SessionBeforeCompactEvent,
+	SessionBeforeMoveEvent,
 	SessionBeforeSwitchEvent,
 	SessionBeforeTreeEvent,
 	SessionBranchEvent,
@@ -270,6 +274,7 @@ export type {
 	SessionShutdownEvent,
 	SessionStartEvent,
 	SessionSwitchEvent,
+	SessionMoveEvent,
 	SessionTransitionEndEvent,
 	SessionTransitionKind,
 	SessionTreeEvent,
@@ -434,6 +439,7 @@ export interface BeforeAgentStartEventResult {
 export type {
 	SessionBeforeBranchResult,
 	SessionBeforeCompactResult,
+	SessionBeforeMoveResult,
 	SessionBeforeSwitchResult,
 	SessionBeforeTreeResult,
 	SessionCompactingResult,
@@ -487,6 +493,8 @@ export interface HookAPI {
 	on(event: "session_start", handler: HookHandler<SessionStartEvent>): void;
 	on(event: "session_before_switch", handler: HookHandler<SessionBeforeSwitchEvent, SessionBeforeSwitchResult>): void;
 	on(event: "session_switch", handler: HookHandler<SessionSwitchEvent>): void;
+	on(event: "session_before_move", handler: HookHandler<SessionBeforeMoveEvent, SessionBeforeMoveResult>): void;
+	on(event: "session_move", handler: HookHandler<SessionMoveEvent>): void;
 	on(event: "session_before_branch", handler: HookHandler<SessionBeforeBranchEvent, SessionBeforeBranchResult>): void;
 	on(event: "session_branch", handler: HookHandler<SessionBranchEvent>): void;
 	on(

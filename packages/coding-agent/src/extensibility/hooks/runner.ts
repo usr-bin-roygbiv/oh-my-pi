@@ -27,6 +27,7 @@ import type {
 	HookUIContext,
 	RegisteredCommand,
 	SessionBeforeCompactResult,
+	SessionBeforeMoveResult,
 	SessionBeforeTreeResult,
 	SessionCompactingResult,
 	ToolCallEvent,
@@ -254,9 +255,15 @@ export class HookRunner {
 	 */
 	#isSessionBeforeEvent(
 		type: string,
-	): type is "session_before_switch" | "session_before_branch" | "session_before_compact" | "session_before_tree" {
+	): type is
+		| "session_before_switch"
+		| "session_before_move"
+		| "session_before_branch"
+		| "session_before_compact"
+		| "session_before_tree" {
 		return (
 			type === "session_before_switch" ||
+			type === "session_before_move" ||
 			type === "session_before_branch" ||
 			type === "session_before_compact" ||
 			type === "session_before_tree"
@@ -270,12 +277,18 @@ export class HookRunner {
 	async emit(
 		event: HookEvent,
 	): Promise<
-		SessionBeforeCompactResult | SessionBeforeTreeResult | SessionCompactingResult | ToolResultEventResult | undefined
+		| SessionBeforeCompactResult
+		| SessionBeforeMoveResult
+		| SessionBeforeTreeResult
+		| SessionCompactingResult
+		| ToolResultEventResult
+		| undefined
 	> {
 		const ctx = this.#createContext();
 		let result:
 			| SessionBeforeCompactResult
 			| SessionBeforeTreeResult
+			| SessionBeforeMoveResult
 			| SessionCompactingResult
 			| ToolResultEventResult
 			| undefined;
@@ -290,7 +303,10 @@ export class HookRunner {
 
 					// For session before_* events, capture the result (for cancellation)
 					if (this.#isSessionBeforeEvent(event.type) && handlerResult) {
-						result = handlerResult as SessionBeforeCompactResult | SessionBeforeTreeResult;
+						result = handlerResult as
+							| SessionBeforeCompactResult
+							| SessionBeforeMoveResult
+							| SessionBeforeTreeResult;
 						// If cancelled, stop processing further hooks
 						if (result.cancel) {
 							return result;

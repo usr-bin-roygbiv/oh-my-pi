@@ -1873,7 +1873,8 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 				return usage(`Failed to save pending settings: ${errorMessage(err)}`, runtime);
 			}
 			try {
-				await runtime.session.moveSession(resolvedPath);
+				const moved = await runtime.session.moveSession(resolvedPath);
+				if (!moved) return commandConsumed();
 			} catch (err) {
 				return usage(`Move failed: ${errorMessage(err)}`, runtime);
 			}

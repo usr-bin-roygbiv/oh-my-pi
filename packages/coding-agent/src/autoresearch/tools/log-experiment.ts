@@ -32,6 +32,7 @@ import {
 	findBestKeptMetric,
 } from "../state";
 import { openAutoresearchStorageIfExists, type SessionRow } from "../storage";
+import { CONTRIBUTION_HEAD_SHA_ASI_KEY } from "../types";
 import type {
 	ASIData,
 	AutoresearchToolFactoryOptions,
@@ -64,6 +65,7 @@ interface ContributionRunProof {
 	readonly harnessSha256: string;
 	readonly invocationSha256: string;
 	readonly worktreeTreeSha: string;
+	readonly headSha: string;
 }
 
 export function createLogExperimentTool(
@@ -76,6 +78,7 @@ export function createLogExperimentTool(
 			"Log the result of the latest run_experiment. Records the metric, optional ASI metadata, modified paths, and scope deviations. On `keep`, modified files are committed; on `discard`/`crash`/`checks_failed`, the worktree is reverted. Pass `flag_runs` to mark earlier runs as suspect; flagged runs are excluded from baseline and best-metric math.",
 		parameters: logExperimentSchema,
 		defaultInactive: true,
+		concurrency: () => "exclusive",
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			const mutation = beginAutoresearchMutation(options, ctx, signal);
 			try {
@@ -149,11 +152,23 @@ export function createLogExperimentTool(
 								],
 							};
 						}
+						if (headSha !== contributionProof.headSha) {
+							return {
+								content: [{ type: "text", text: "Error: HEAD changed after the harness execution." }],
+							};
+						}
 						const currentTree = await git.writeWorktreeTree(ctx.cwd, mutation.signal);
 						await mutation.authorizeMutation();
 						if (currentTree !== contributionProof.worktreeTreeSha) {
 							return {
 								content: [{ type: "text", text: "Error: files changed after the harness execution." }],
+							};
+						}
+						const confirmedHeadSha = await tryReadHeadSha(ctx.cwd, mutation.signal);
+						await mutation.authorizeMutation();
+						if (confirmedHeadSha !== contributionProof.headSha) {
+							return {
+								content: [{ type: "text", text: "Error: HEAD changed after the harness execution." }],
 							};
 						}
 						expectedContributionTree = contributionProof.worktreeTreeSha;
@@ -518,22 +533,26 @@ function readContributionRunProof(asi: ASIData | null): ContributionRunProof | n
 	const harnessSha256 = asi?.[CONTRIBUTION_HARNESS_SHA256_ASI_KEY];
 	const invocationSha256 = asi?.[CONTRIBUTION_INVOCATION_SHA256_ASI_KEY];
 	const worktreeTreeSha = asi?.[CONTRIBUTION_WORKTREE_TREE_ASI_KEY];
+	const headSha = asi?.[CONTRIBUTION_HEAD_SHA_ASI_KEY];
 	if (
 		typeof harnessSha256 !== "string" ||
 		!/^[0-9a-f]{64}$/.test(harnessSha256) ||
 		typeof invocationSha256 !== "string" ||
 		!/^[0-9a-f]{64}$/.test(invocationSha256) ||
 		typeof worktreeTreeSha !== "string" ||
-		!/^[0-9a-f]{40,64}$/.test(worktreeTreeSha)
+		!/^[0-9a-f]{40,64}$/.test(worktreeTreeSha) ||
+		typeof headSha !== "string" ||
+		!/^[0-9a-f]{40}$/.test(headSha)
 	) {
 		return null;
 	}
-	return { harnessSha256, invocationSha256, worktreeTreeSha };
+	return { harnessSha256, invocationSha256, worktreeTreeSha, headSha };
 }
 
 function overrideContributionProofAsi(merged: ASIData | undefined, computed: ASIData | null): ASIData {
 	const overridden: ASIData = { ...(merged ?? {}) };
 	for (const key of CONTRIBUTION_RESERVED_ASI_KEYS) overridden[key] = computed?.[key] ?? "";
+	overridden[CONTRIBUTION_HEAD_SHA_ASI_KEY] = computed?.[CONTRIBUTION_HEAD_SHA_ASI_KEY] ?? "";
 	return overridden;
 }
 

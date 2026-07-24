@@ -49,6 +49,24 @@ export interface SessionSwitchEvent {
 	previousSessionFile: string | undefined;
 }
 
+/** Fired before moving a session to another working directory (can be cancelled). */
+export interface SessionBeforeMoveEvent {
+	type: "session_before_move";
+	/** Unique ID shared with the matching session_transition_end event. */
+	transitionId: string;
+	/** Working directory the session will move to. */
+	targetCwd: string;
+}
+
+/** Fired after moving a session to another working directory. */
+export interface SessionMoveEvent {
+	type: "session_move";
+	/** Working directory the session moved from. */
+	previousCwd: string;
+	/** Working directory the session moved to. */
+	cwd: string;
+}
+
 /** Fired before branching a session (can be cancelled) */
 export interface SessionBeforeBranchEvent {
 	type: "session_before_branch";
@@ -146,7 +164,7 @@ export interface SessionTreeEvent {
 	fromExtension?: boolean;
 }
 
-export type SessionTransitionKind = "switch" | "branch" | "tree";
+export type SessionTransitionKind = "switch" | "branch" | "tree" | "move";
 
 /** Fired exactly once when an attempted session transition settles. */
 export interface SessionTransitionEndEvent {
@@ -170,6 +188,8 @@ export type SessionEvent =
 	| SessionStartEvent
 	| SessionBeforeSwitchEvent
 	| SessionSwitchEvent
+	| SessionBeforeMoveEvent
+	| SessionMoveEvent
 	| SessionBeforeBranchEvent
 	| SessionBranchEvent
 	| SessionBeforeCompactEvent
@@ -332,6 +352,12 @@ export interface ToolResultEventResult {
 /** Return type for `session_before_switch` handlers */
 export interface SessionBeforeSwitchResult {
 	/** If true, cancel the switch */
+	cancel?: boolean;
+}
+
+/** Return type for `session_before_move` handlers. */
+export interface SessionBeforeMoveResult {
+	/** If true, cancel the move. */
 	cancel?: boolean;
 }
 

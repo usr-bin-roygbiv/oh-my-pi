@@ -57,6 +57,7 @@ import { createInitExperimentTool } from "./tools/init-experiment";
 import { createLogExperimentTool } from "./tools/log-experiment";
 import { createRunExperimentTool } from "./tools/run-experiment";
 import { createUpdateNotesTool } from "./tools/update-notes";
+import { CONTRIBUTION_HEAD_SHA_ASI_KEY } from "./types";
 import type {
 	AutoresearchMutationAuthorization,
 	AutoresearchRuntime,
@@ -103,6 +104,7 @@ interface AsyncLifecycleIdentity {
 	readonly state: AutoresearchRuntime["state"];
 	readonly autoresearchMode: boolean;
 	readonly ordinarySessionOwner: AutoresearchRuntime["ordinarySessionOwner"];
+	readonly ordinaryOwnerlessBranch: AutoresearchRuntime["ordinaryOwnerlessBranch"];
 }
 
 interface TransitionAdmissionHold {
@@ -261,6 +263,7 @@ function hasExecutableContributionTddProof(
 	const candidateHarness = candidate?.parsedAsi?.[CONTRIBUTION_HARNESS_SHA256_ASI_KEY];
 	const candidateInvocation = candidate?.parsedAsi?.[CONTRIBUTION_INVOCATION_SHA256_ASI_KEY];
 	const candidateTree = candidate?.parsedAsi?.[CONTRIBUTION_WORKTREE_TREE_ASI_KEY];
+	const candidateHead = candidate?.parsedAsi?.[CONTRIBUTION_HEAD_SHA_ASI_KEY];
 	if (
 		!candidate ||
 		command.length === 0 ||
@@ -277,13 +280,16 @@ function hasExecutableContributionTddProof(
 		typeof candidateInvocation !== "string" ||
 		!/^[0-9a-f]{64}$/.test(candidateInvocation) ||
 		typeof candidateTree !== "string" ||
-		!/^[0-9a-f]{40}$/.test(candidateTree)
+		!/^[0-9a-f]{40}$/.test(candidateTree) ||
+		typeof candidateHead !== "string" ||
+		!/^[0-9a-f]{40}$/.test(candidateHead)
 	) {
 		return false;
 	}
 	return loggedRuns.some(run => {
 		const redHarness = run.parsedAsi?.[CONTRIBUTION_HARNESS_SHA256_ASI_KEY];
 		const redInvocation = run.parsedAsi?.[CONTRIBUTION_INVOCATION_SHA256_ASI_KEY];
+		const redTree = run.parsedAsi?.[CONTRIBUTION_WORKTREE_TREE_ASI_KEY];
 		return (
 			run.id < candidate.id &&
 			run.sessionId === session.id &&
@@ -294,7 +300,10 @@ function hasExecutableContributionTddProof(
 			run.completedAt !== null &&
 			(run.timedOut || (run.exitCode !== null && run.exitCode !== 0)) &&
 			redHarness === candidateHarness &&
-			redInvocation === candidateInvocation
+			redInvocation === candidateInvocation &&
+			redTree !== candidateTree &&
+			typeof redTree === "string" &&
+			/^[0-9a-f]{40}$/.test(redTree)
 		);
 	});
 }
@@ -422,7 +431,7 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 		const startTransaction = contributionStartTransactions.get(sessionKey);
 		if (startTransaction) {
 			startTransaction.token = null;
-			if (startTransaction.phase === "activating") settlements.push(startTransaction.settlement.promise);
+			settlements.push(startTransaction.settlement.promise);
 		}
 		const publication = contributionPublicationOperations.get(sessionKey);
 		if (publication) {
@@ -461,6 +470,7 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 			state: runtime.state,
 			autoresearchMode: runtime.autoresearchMode,
 			ordinarySessionOwner: runtime.ordinarySessionOwner,
+			ordinaryOwnerlessBranch: runtime.ordinaryOwnerlessBranch,
 		};
 	};
 	const lifecycleIdentityIsCurrent = (ctx: ExtensionContext, identity: AsyncLifecycleIdentity): boolean =>
@@ -470,6 +480,7 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 		identity.runtime.contribution === identity.contribution &&
 		identity.runtime.state === identity.state &&
 		identity.runtime.ordinarySessionOwner === identity.ordinarySessionOwner &&
+		identity.runtime.ordinaryOwnerlessBranch === identity.ordinaryOwnerlessBranch &&
 		identity.runtime.autoresearchMode === identity.autoresearchMode &&
 		!mutationAdmissionClosed(identity.sessionKey);
 	const showPersistedPublicationStatus = async (ctx: ExtensionContext): Promise<boolean> => {
@@ -567,10 +578,18 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 	const loadActiveSession = async (
 		ctx: ExtensionContext,
 		owner: AutoresearchSessionOwner | null,
+		ownerlessBranch: string | null | undefined,
 	): Promise<{ session: SessionRow | null; currentBranch: string | null; onActiveBranch: boolean }> => {
 		const currentBranch = await tryReadBranch(ctx.cwd);
 		const storage = await openAutoresearchStorageIfExists(ctx.cwd);
-		if (!storage) return { session: null, currentBranch, onActiveBranch: owner === null };
+		const confirmedBranch = await tryReadBranch(ctx.cwd);
+		if (confirmedBranch !== currentBranch) {
+			return { session: null, currentBranch: confirmedBranch, onActiveBranch: false };
+		}
+		if (!storage) {
+			const onActiveBranch = owner === null && (ownerlessBranch === undefined || ownerlessBranch === currentBranch);
+			return { session: null, currentBranch, onActiveBranch };
+		}
 		if (owner) {
 			const ownedSession = storage.getSessionById(owner.sessionId);
 			const activeOwnedSession =
@@ -578,6 +597,14 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 			const onActiveBranch = activeOwnedSession !== null && activeOwnedSession.branch === currentBranch;
 			return {
 				session: onActiveBranch ? activeOwnedSession : null,
+				currentBranch,
+				onActiveBranch,
+			};
+		}
+		if (ownerlessBranch !== undefined) {
+			const onActiveBranch = ownerlessBranch === currentBranch;
+			return {
+				session: onActiveBranch ? storage.getActiveSessionForBranch(currentBranch) : null,
 				currentBranch,
 				onActiveBranch,
 			};
@@ -614,7 +641,7 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 			const everActivated = control.lastMode !== null || contributionRunning;
 			const expectedOwner = sessionOwnerForRuntime(runtime);
 			const { session, currentBranch, onActiveBranch } = everActivated
-				? await loadActiveSession(ctx, expectedOwner)
+				? await loadActiveSession(ctx, expectedOwner, runtime.ordinaryOwnerlessBranch)
 				: { session: null, currentBranch: null, onActiveBranch: true };
 
 			// Mode is effective only when the exact retained session owner matches the
@@ -631,6 +658,7 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 			if (session && onActiveBranch) {
 				if (!contributionRunning) {
 					runtime.ordinarySessionOwner = { sessionId: session.id, branch: session.branch };
+					runtime.ordinaryOwnerlessBranch = undefined;
 				}
 				const storage = await openAutoresearchStorageIfExists(ctx.cwd);
 				if (storage) {
@@ -714,6 +742,7 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 			await Promise.allSettled(
 				contributionSettlement ? [mutationSettlement, contributionSettlement] : [mutationSettlement],
 			);
+			if (getSessionKey(ctx) !== sessionKey || getRuntime(ctx) !== runtime) return [];
 			if (
 				initialContribution.status === "running" &&
 				runtime.contribution.status === "review" &&
@@ -817,8 +846,9 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 		const capturedRuntime = getRuntime(ctx);
 		const captured = capturedRuntime.contribution;
 		const capturedOrdinarySessionOwner = capturedRuntime.ordinarySessionOwner;
+		const capturedOrdinaryOwnerlessBranch = capturedRuntime.ordinaryOwnerlessBranch;
 		const capturedSessionOwner = sessionOwnerForRuntime(capturedRuntime);
-		let capturedOwnerlessOrdinaryBranch: string | null | undefined;
+		let capturedOwnerlessOrdinaryBranch = capturedOrdinaryOwnerlessBranch;
 		if (captured.status === "review") {
 			throw new Error("Contribution review state does not authorize autoresearch mutation.");
 		}
@@ -846,7 +876,10 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 				if (current.status !== "off") {
 					throw new Error("Contribution startup overtook autoresearch mutation before mutation.");
 				}
-				if (currentRuntime.ordinarySessionOwner !== capturedOrdinarySessionOwner) {
+				if (
+					currentRuntime.ordinarySessionOwner !== capturedOrdinarySessionOwner ||
+					currentRuntime.ordinaryOwnerlessBranch !== capturedOrdinaryOwnerlessBranch
+				) {
 					throw new Error("Autoresearch session ownership changed before mutation.");
 				}
 				return;
@@ -929,6 +962,7 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 				}
 				if (state.sessionId !== null) {
 					runtime.ordinarySessionOwner = { sessionId: state.sessionId, branch: state.branch };
+					runtime.ordinaryOwnerlessBranch = undefined;
 				}
 			},
 			async prepareNewSegment(ctx, signal) {
@@ -1036,6 +1070,7 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 				if (trimmed === "" && runtime.autoresearchMode) {
 					await drainAutoresearchMutationOperations(sessionKey);
 					if (!operationIsCurrent()) return;
+					runtime.ordinaryOwnerlessBranch = undefined;
 					setMode(ctx, false, runtime.goal, "off");
 					dashboard.updateWidget(ctx, runtime);
 					const experimentTools = new Set(EXPERIMENT_TOOL_NAMES);
@@ -1049,6 +1084,7 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 				if (trimmed === "off") {
 					await drainAutoresearchMutationOperations(sessionKey);
 					if (!operationIsCurrent()) return;
+					runtime.ordinaryOwnerlessBranch = undefined;
 					setMode(ctx, false, runtime.goal, "off");
 					dashboard.updateWidget(ctx, runtime);
 					const experimentTools = new Set(EXPERIMENT_TOOL_NAMES);
@@ -1085,7 +1121,12 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 				// — `/autoresearch` on a fresh branch starts a fresh session. Only open the
 				// DB if it already exists; the empty-state path must not create one.
 				const existingStorage = await openAutoresearchStorageIfExists(ctx.cwd);
+				const confirmedBranch = await tryReadBranch(ctx.cwd);
 				if (!operationIsCurrent()) return;
+				if (confirmedBranch !== branchResult.branchName) {
+					ctx.ui.notify("Autoresearch branch changed while session state was loading.", "error");
+					return;
+				}
 				const existingSession = existingStorage?.getActiveSessionForBranch(branchResult.branchName) ?? null;
 				const resumeContext = trimmed;
 				const branchStatusLine = branchResult.branchName
@@ -1103,6 +1144,7 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 					const refreshed = existingStorage.getSessionById(existingSession.id) ?? existingSession;
 					runtime.state = buildExperimentState(refreshed, existingStorage.listLoggedRuns(refreshed.id));
 					runtime.ordinarySessionOwner = { sessionId: refreshed.id, branch: refreshed.branch };
+					runtime.ordinaryOwnerlessBranch = undefined;
 					runtime.goal = refreshed.goal ?? goalArg;
 					setMode(ctx, true, runtime.goal, "on");
 					dashboard.updateWidget(ctx, runtime);
@@ -1121,6 +1163,7 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 
 				if (!operationIsCurrent()) return;
 				runtime.ordinarySessionOwner = null;
+				runtime.ordinaryOwnerlessBranch = branchResult.branchName;
 				setMode(ctx, true, goalArg, "on");
 				dashboard.updateWidget(ctx, runtime);
 				if (!operationIsCurrent()) return;
@@ -1432,7 +1475,13 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 							renderPublicationHandoff("Contribution publication plan (push outcome pending):", intent),
 							"info",
 						);
-						publicationOperation.phase = "pushing";
+					};
+					const publicationGit: ContributionPublicationGit = {
+						...contributionPublicationGit,
+						push(cwd, options) {
+							publicationOperation.phase = "pushing";
+							return contributionPublicationGit.push(cwd, options);
+						},
 					};
 
 					try {
@@ -1454,7 +1503,7 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 								approvedDraft,
 								signal: publicationOperation.controller.signal,
 								authorizePush,
-								git: contributionPublicationGit,
+								git: publicationGit,
 							});
 						} catch (error) {
 							ctx.ui.notify(`Contribution review failed: ${describeContributionError(error)}`, "error");
@@ -1893,6 +1942,7 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 
 	api.on("session_start", (_event, ctx) => rehydrate(ctx));
 	api.on("session_before_switch", (event, ctx) => beginSessionTransition(event, ctx));
+	api.on("session_before_move", (event, ctx) => beginSessionTransition(event, ctx));
 	api.on("session_before_branch", (event, ctx) => beginSessionTransition(event, ctx));
 	api.on("session_before_tree", (event, ctx) => beginSessionTransition(event, ctx));
 	api.on("session_switch", (_event, ctx) => rehydrate(ctx));
@@ -1902,9 +1952,12 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 	api.on("session_shutdown", (_event, ctx) => {
 		const sessionKey = getSessionKey(ctx);
 		const runtime = getRuntime(ctx);
+		const publicationPhase = contributionPublicationOperations.get(sessionKey)?.phase;
+		const transportStarted = publicationPhase === "pushing" || publicationPhase === "committed";
 		dashboard.clear(ctx);
-		void stopContributionRuntime(ctx, runtime)
+		const settlement = stopContributionRuntime(ctx, runtime)
 			.then(async () => {
+				if (getSessionKey(ctx) !== sessionKey || getRuntime(ctx) !== runtime) return;
 				const experimentTools = new Set(EXPERIMENT_TOOL_NAMES);
 				await api.setActiveTools(api.getActiveTools().filter(name => !experimentTools.has(name)));
 			})
@@ -1915,9 +1968,15 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 				});
 			})
 			.finally(() => {
+				if (getSessionKey(ctx) !== sessionKey || getRuntime(ctx) !== runtime) return;
 				dashboard.clear(ctx);
 				runtimeStore.clear(sessionKey);
 			});
+		if (transportStarted) {
+			void settlement;
+			return;
+		}
+		return settlement;
 	});
 	api.on("agent_end", async (event, ctx) => {
 		let identity = captureLifecycleIdentity(ctx);
@@ -1939,7 +1998,11 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 			return;
 		}
 
-		const { session, onActiveBranch } = await loadActiveSession(ctx, sessionOwnerForRuntime(runtime));
+		const { session, onActiveBranch } = await loadActiveSession(
+			ctx,
+			sessionOwnerForRuntime(runtime),
+			runtime.ordinaryOwnerlessBranch,
+		);
 		if (!lifecycleIdentityIsCurrent(ctx, identity)) return;
 		if (!contributionRunning && !onActiveBranch) {
 			runtime.autoResumeArmed = false;
@@ -2021,7 +2084,11 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 		const runtime = identity.runtime;
 		if (mutationAdmissionClosed(identity.sessionKey)) return;
 		if (!runtime.autoresearchMode) {
-			if (runtime.contribution.status !== "off" || runtime.ordinarySessionOwner === null) return;
+			if (
+				runtime.contribution.status !== "off" ||
+				(runtime.ordinarySessionOwner === null && runtime.ordinaryOwnerlessBranch === undefined)
+			)
+				return;
 			const control = reconstructControlState(ctx.sessionManager.getBranch());
 			if (!control.autoresearchMode) return;
 			await rehydrate(ctx);
@@ -2033,12 +2100,17 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 		// from this turn — the widget hides, the experiment tools detach, and we do
 		// not inject the autoresearch system prompt.
 		const expectedOwner = sessionOwnerForRuntime(runtime);
-		const { session, currentBranch, onActiveBranch } = await loadActiveSession(ctx, expectedOwner);
+		const { session, currentBranch, onActiveBranch } = await loadActiveSession(
+			ctx,
+			expectedOwner,
+			runtime.ordinaryOwnerlessBranch,
+		);
 		if (!lifecycleIdentityIsCurrent(ctx, identity)) return;
 		if (session && runtime.contribution.status === "off") {
 			const owner = runtime.ordinarySessionOwner;
 			if (owner?.sessionId !== session.id || owner.branch !== session.branch) {
 				runtime.ordinarySessionOwner = { sessionId: session.id, branch: session.branch };
+				runtime.ordinaryOwnerlessBranch = undefined;
 				identity = captureLifecycleIdentity(ctx);
 			}
 		}
@@ -2220,6 +2292,7 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 		runtime.lastRunArtifactDir = null;
 		runtime.lastRunNumber = null;
 		runtime.lastRunSummary = null;
+		runtime.ordinaryOwnerlessBranch = undefined;
 		setMode(ctx, false, null, "clear");
 		dashboard.updateWidget(ctx, runtime);
 		const experimentTools = new Set(EXPERIMENT_TOOL_NAMES);

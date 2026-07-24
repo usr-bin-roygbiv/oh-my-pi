@@ -46,6 +46,7 @@ import type {
 	ResourcesDiscoverResult,
 	SessionBeforeBranchResult,
 	SessionBeforeCompactResult,
+	SessionBeforeMoveResult,
 	SessionBeforeSwitchResult,
 	SessionBeforeTreeResult,
 	SessionCompactingResult,
@@ -151,18 +152,28 @@ type RunnerEmitEvent = Exclude<
 
 type SessionBeforeEvent = Extract<
 	RunnerEmitEvent,
-	{ type: "session_before_switch" | "session_before_branch" | "session_before_compact" | "session_before_tree" }
+	{
+		type:
+			| "session_before_switch"
+			| "session_before_move"
+			| "session_before_branch"
+			| "session_before_compact"
+			| "session_before_tree";
+	},
 >;
 
 type SessionBeforeEventResult =
 	| SessionBeforeSwitchResult
 	| SessionBeforeBranchResult
+	| SessionBeforeMoveResult
 	| SessionBeforeCompactResult
 	| SessionBeforeTreeResult;
 
 type RunnerEmitResult<TEvent extends RunnerEmitEvent> = TEvent extends { type: "session_before_switch" }
 	? SessionBeforeSwitchResult | undefined
-	: TEvent extends { type: "session_before_branch" }
+	: TEvent extends { type: "session_before_move" }
+		? SessionBeforeMoveResult | undefined
+		: TEvent extends { type: "session_before_branch" }
 		? SessionBeforeBranchResult | undefined
 		: TEvent extends { type: "session_before_compact" }
 			? SessionBeforeCompactResult | undefined
@@ -607,6 +618,7 @@ export class ExtensionRunner {
 	#isSessionBeforeEvent(event: RunnerEmitEvent): event is SessionBeforeEvent {
 		return (
 			event.type === "session_before_switch" ||
+			event.type === "session_before_move" ||
 			event.type === "session_before_branch" ||
 			event.type === "session_before_compact" ||
 			event.type === "session_before_tree"

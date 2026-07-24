@@ -28,6 +28,7 @@ export function createUpdateNotesTool(
 			"Persist the durable autoresearch playbook (goal, scope notes, hypotheses, ideas backlog) on the active session. Pass `body` to replace the entire notes blob, or `append_idea` to append a single bullet under an `## Ideas` section.",
 		parameters: updateNotesSchema,
 		defaultInactive: true,
+		concurrency: () => "exclusive",
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			const mutation = beginAutoresearchMutation(options, ctx, signal);
 			try {

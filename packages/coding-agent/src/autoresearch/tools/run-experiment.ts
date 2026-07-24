@@ -29,6 +29,7 @@ import {
 } from "../helpers";
 import { buildExperimentState } from "../state";
 import { openAutoresearchStorageIfExists } from "../storage";
+import { CONTRIBUTION_HEAD_SHA_ASI_KEY } from "../types";
 import type { AutoresearchToolFactoryOptions, RunDetails, RunExperimentProgressDetails } from "../types";
 import { DEFAULT_HARNESS_COMMAND, HARNESS_FILENAME } from "./init-experiment";
 import { beginAutoresearchMutation } from "./mutation-authorization";
@@ -69,6 +70,7 @@ export function createRunExperimentTool(
 			"Run any benchmark command. Output is captured automatically; `METRIC name=value` and `ASI key=value` lines printed by the command are parsed.",
 		parameters: runExperimentSchema,
 		defaultInactive: true,
+		concurrency: () => "exclusive",
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const mutation = beginAutoresearchMutation(options, ctx, signal);
 			const operationSignal = mutation.signal;
@@ -212,6 +214,7 @@ export function createRunExperimentTool(
 								[CONTRIBUTION_HARNESS_SHA256_ASI_KEY]: contributionProof.harnessSha256,
 								[CONTRIBUTION_WORKTREE_TREE_ASI_KEY]: contributionProof.worktreeTreeSha,
 								[CONTRIBUTION_INVOCATION_SHA256_ASI_KEY]: contributionProof.invocationSha256,
+								[CONTRIBUTION_HEAD_SHA_ASI_KEY]: contributionProof.headSha,
 							};
 				runtime.lastRunAsi = storedParsedAsi;
 

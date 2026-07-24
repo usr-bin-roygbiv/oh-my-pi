@@ -1073,7 +1073,8 @@ export class CommandController {
 		}
 
 		try {
-			await this.ctx.session.moveSession(resolvedPath);
+			const moved = await this.ctx.session.moveSession(resolvedPath);
+			if (!moved) return;
 		} catch (err) {
 			this.ctx.showError(`Move failed: ${err instanceof Error ? err.message : String(err)}`);
 			return;
@@ -1160,7 +1161,8 @@ export class CommandController {
 	}
 
 	async #moveInteractiveCwd(resolvedPath: string): Promise<void> {
-		await this.ctx.sessionManager.moveTo(resolvedPath);
+		const moved = await this.ctx.session.moveSession(resolvedPath);
+		if (!moved) return;
 		await this.ctx.applyCwdChange(resolvedPath);
 		this.ctx.updateEditorBorderColor();
 		await this.ctx.reloadTodos();

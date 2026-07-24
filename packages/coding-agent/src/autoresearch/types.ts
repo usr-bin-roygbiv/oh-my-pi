@@ -6,6 +6,7 @@ import type { ContributionBaseProof, ContributionGoal, PublishedContributionCand
 
 export type MetricDirection = "lower" | "higher";
 export type ExperimentStatus = "keep" | "discard" | "crash" | "checks_failed";
+export const CONTRIBUTION_HEAD_SHA_ASI_KEY = "_omp_contribution_head_sha" as const;
 
 export type ASIValue = string | number | boolean | null | ASIValue[] | { [key: string]: ASIValue };
 
@@ -175,6 +176,7 @@ export interface AutoresearchRuntime {
 	state: ExperimentState;
 	goal: string | null;
 	ordinarySessionOwner: AutoresearchSessionOwner | null;
+	ordinaryOwnerlessBranch?: string | null;
 	contribution: ContributionState;
 }
 

@@ -117,6 +117,7 @@ import type {
 	MessageStartEvent,
 	MessageUpdateEvent,
 	SessionBeforeBranchResult,
+	SessionBeforeMoveResult,
 	SessionBeforeSwitchResult,
 	SessionBeforeTreeResult,
 	SessionStopEventResult,
@@ -507,6 +508,8 @@ export class AgentSession {
 	#allowAcpAgentInitiatedTurns = false;
 	/** Session file created by this session's `/move`; removed on dispose if it stayed empty. */
 	#movedFromEmptySessionFile?: string;
+	/** Per-session admission tail preventing lifecycle mutations from interleaving. */
+	#sessionTransitionAdmission: Promise<void> = Promise.resolve();
 
 	readonly #maintenance: SessionMaintenance;
 
@@ -6097,10 +6100,39 @@ export class AgentSession {
 		return true;
 	}
 
-	/** Move the active session and artifacts after enforcing mode transition invariants. */
-	async moveSession(newCwd: string, targetSessionDir?: string): Promise<void> {
+	/** Move the active session and artifacts through the cancellable transition lifecycle. */
+	async moveSession(newCwd: string, targetSessionDir?: string): Promise<boolean> {
 		this.#assertVibeSessionTransitionAllowed("move the session");
+		return this.#runSessionTransition("move", transition =>
+			this.#moveSession(newCwd, targetSessionDir, transition),
+		);
+	}
+
+	async #moveSession(
+		newCwd: string,
+		targetSessionDir: string | undefined,
+		transition: SessionTransitionState,
+	): Promise<boolean> {
+		if (this.#extensionRunner?.hasHandlers("session_before_move")) {
+			const result = (await this.#extensionRunner.emit({
+				type: "session_before_move",
+				transitionId: transition.transitionId,
+				targetCwd: newCwd,
+			})) as SessionBeforeMoveResult | undefined;
+			if (result?.cancel) return false;
+		}
+
+		const previousCwd = this.sessionManager.getCwd();
 		await this.sessionManager.moveTo(newCwd, targetSessionDir);
+		transition.committed = true;
+		if (this.#extensionRunner) {
+			await this.#extensionRunner.emit({
+				type: "session_move",
+				previousCwd,
+				cwd: this.sessionManager.getCwd(),
+			});
+		}
+		return true;
 	}
 
 	// =========================================================================
@@ -6899,6 +6931,11 @@ export class AgentSession {
 		kind: SessionTransitionKind,
 		operation: (transition: SessionTransitionState) => Promise<T>,
 	): Promise<T> {
+		const previousAdmission = this.#sessionTransitionAdmission;
+		const admission = Promise.withResolvers<void>();
+		this.#sessionTransitionAdmission = previousAdmission.then(() => admission.promise);
+		await previousAdmission;
+
 		const transition: SessionTransitionState = {
 			transitionId: crypto.randomUUID(),
 			committed: false,
@@ -6906,7 +6943,11 @@ export class AgentSession {
 		try {
 			return await operation(transition);
 		} finally {
-			await this.#finishSessionTransition(kind, transition);
+			try {
+				await this.#finishSessionTransition(kind, transition);
+			} finally {
+				admission.resolve();
+			}
 		}
 	}
 
