@@ -4,6 +4,7 @@ import { type ApiKey, type FetchImpl, getEnvApiKey, type Model, withAuth } from 
 import { ProviderHttpError } from "@oh-my-pi/pi-ai/error";
 import {
 	CODEX_BASE_URL,
+	CODEX_CLIENT_VERSION,
 	getCodexAccountId,
 	OPENAI_HEADER_VALUES,
 	OPENAI_HEADERS,
@@ -38,6 +39,9 @@ const IMAGE_TIMEOUT = 3 * 60 * 1000; // 3 minutes
 const MAX_IMAGE_SIZE = 35 * 1024 * 1024;
 const DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1";
 const OPENAI_IMAGE_OUTPUT_FORMAT = "webp";
+const CODEX_IMAGE_MODEL = "gpt-image-2";
+const CODEX_IMAGE_GENERATIONS_PATH = "/codex/images/generations";
+const CODEX_IMAGE_EDITS_PATH = "/codex/images/edits";
 const OPENAI_IMAGE_MIME_TYPE = "image/webp";
 
 const DEFAULT_ANTIGRAVITY_ENDPOINT_PROD = "https://daily-cloudcode-pa.googleapis.com";
@@ -230,6 +234,28 @@ interface OpenAIHostedImageResponse {
 	output?: OpenAIResponseOutput[];
 	usage?: OpenAIResponsesUsage;
 	error?: { code?: string; message?: string };
+}
+
+interface CodexImageRequestBase {
+	prompt: string;
+	background: "auto";
+	model: typeof CODEX_IMAGE_MODEL;
+	quality: "auto";
+	size: string;
+}
+
+interface CodexImageGenerationRequest extends CodexImageRequestBase {
+	images?: never;
+}
+
+interface CodexImageEditRequest extends CodexImageRequestBase {
+	images: Array<{ image_url: string }>;
+}
+
+type CodexImageRequest = CodexImageGenerationRequest | CodexImageEditRequest;
+
+interface CodexImageResponse {
+	data?: Array<{ b64_json?: string }>;
 }
 
 interface OpenAISseEvent {
@@ -764,6 +790,11 @@ function getOpenAIHostedImageProvider(model: Model): ImageProvider {
 	return model.api === "openai-codex-responses" || model.provider === "openai-codex" ? "openai-codex" : "openai";
 }
 
+function isOfficialCodexSubscriptionImageRequest(model: Model, apiKey: string): boolean {
+	if (model.api !== "openai-codex-responses" && model.provider !== "openai-codex") return false;
+	return getOpenAIBaseUrl(model) === CODEX_BASE_URL && getCodexAccountId(apiKey) !== undefined;
+}
+
 function resolveOpenAIImageSize(aspectRatio: string | undefined, imageSize: string | undefined): string | undefined {
 	if (imageSize) return imageSize;
 	switch (aspectRatio) {
@@ -778,6 +809,33 @@ function resolveOpenAIImageSize(aspectRatio: string | undefined, imageSize: stri
 		default:
 			return undefined;
 	}
+}
+
+function buildCodexImageRequest(
+	promptText: string,
+	params: ImageGenParams,
+	inputImages: InlineImageData[],
+): CodexImageRequest {
+	const base: CodexImageRequestBase = {
+		prompt: promptText,
+		background: "auto",
+		model: CODEX_IMAGE_MODEL,
+		quality: "auto",
+		size: resolveOpenAIImageSize(params.aspect_ratio, params.image_size) ?? "auto",
+	};
+	if (inputImages.length === 0) return base;
+	return {
+		...base,
+		images: inputImages.map(image => ({ image_url: toDataUrl(image) })),
+	};
+}
+
+function collectCodexImageResult(response: CodexImageResponse): OpenAIHostedImageResult {
+	const images: InlineImageData[] = [];
+	for (const item of response.data ?? []) {
+		if (item.b64_json) images.push(createOpenAIInlineImage(item.b64_json));
+	}
+	return { images };
 }
 
 function buildOpenAIHostedImageRequest(
@@ -907,6 +965,28 @@ function buildOpenAIImageHeaders(model: Model, apiKey: string, sessionId: string
 	return headers;
 }
 
+function buildCodexImageHeaders(model: Model, apiKey: string): Headers {
+	const headers = new Headers(model.headers ?? {});
+	headers.set("Content-Type", "application/json");
+	headers.set("Authorization", `Bearer ${apiKey}`);
+	headers.delete("x-api-key");
+	headers.delete(OPENAI_HEADERS.ACCOUNT_ID);
+	headers.delete(OPENAI_HEADERS.BETA);
+	headers.delete(OPENAI_HEADERS.CONVERSATION_ID);
+	headers.delete(OPENAI_HEADERS.SESSION_ID);
+	headers.delete(OPENAI_HEADERS.SCOPED_SESSION_ID);
+	headers.delete(OPENAI_HEADERS.THREAD_ID);
+	headers.delete(OPENAI_HEADERS.TURN_METADATA);
+	headers.delete(OPENAI_HEADERS.PARENT_THREAD_ID);
+	headers.delete(OPENAI_HEADERS.RESPONSES_LITE);
+	const accountId = getCodexAccountId(apiKey);
+	if (accountId) headers.set(OPENAI_HEADERS.ACCOUNT_ID, accountId);
+	headers.set(OPENAI_HEADERS.ORIGINATOR, OPENAI_HEADER_VALUES.ORIGINATOR_CODEX);
+	headers.set(OPENAI_HEADERS.VERSION, CODEX_CLIENT_VERSION);
+	headers.set("User-Agent", `pi/${packageJson.version} (${os.platform()} ${os.release()}; ${os.arch()})`);
+	return headers;
+}
+
 async function parseOpenAIHostedImageSse(response: Response, signal?: AbortSignal): Promise<OpenAIHostedImageResult> {
 	if (!response.body) {
 		throw new Error("No response body");
@@ -974,6 +1054,35 @@ async function generateOpenAIHostedImage(
 
 	const data = (await response.json()) as OpenAIHostedImageResponse;
 	return collectOpenAIHostedImageResult(data);
+}
+
+async function generateCodexImage(
+	apiKey: string,
+	model: Model,
+	params: ImageGenParams,
+	inputImages: InlineImageData[],
+	fetchImpl: FetchImpl,
+	signal: AbortSignal | undefined,
+): Promise<OpenAIHostedImageResult> {
+	const requestBody = buildCodexImageRequest(assemblePrompt(params), params, inputImages);
+	const path = inputImages.length > 0 ? CODEX_IMAGE_EDITS_PATH : CODEX_IMAGE_GENERATIONS_PATH;
+	const response = await fetchImpl(`${getOpenAIBaseUrl(model)}${path}`, {
+		method: "POST",
+		headers: buildCodexImageHeaders(model, apiKey),
+		body: JSON.stringify(requestBody),
+		signal,
+	});
+
+	if (!response.ok) {
+		const errorText = await response.text();
+		throw new ProviderHttpError(
+			`Codex image request failed (${response.status}): ${getOpenAIResponseErrorMessage(errorText)}`,
+			response.status,
+			{ headers: response.headers },
+		);
+	}
+
+	return collectCodexImageResult((await response.json()) as CodexImageResponse);
 }
 
 function combineParts(response: GeminiGenerateContentResponse): GeminiPart[] {
@@ -1152,19 +1261,30 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 
 						const hostedModel = apiKey.model;
 						const hostedKey: ApiKey = ctx.modelRegistry.resolver(hostedModel, sessionId);
-
-						const parsed = await withAuth(
+						const { parsed, resultModel } = await withAuth(
 							hostedKey,
-							key =>
-								generateOpenAIHostedImage(
-									key,
-									hostedModel,
-									params,
-									resolvedImages,
-									fetchImpl,
-									requestSignal,
-									sessionId,
-								),
+							async key => {
+								const useCodexImagesApi = isOfficialCodexSubscriptionImageRequest(hostedModel, key);
+								const parsed = useCodexImagesApi
+									? await generateCodexImage(
+											key,
+											hostedModel,
+											params,
+											resolvedImages,
+											fetchImpl,
+											requestSignal,
+										)
+									: await generateOpenAIHostedImage(
+											key,
+											hostedModel,
+											params,
+											resolvedImages,
+											fetchImpl,
+											requestSignal,
+											sessionId,
+										);
+								return { parsed, resultModel: useCodexImagesApi ? CODEX_IMAGE_MODEL : model };
+							},
 							{ signal: requestSignal },
 						);
 
@@ -1174,7 +1294,7 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 								content: [{ type: "text", text: `No image data returned.${messageText}` }],
 								details: {
 									provider,
-									model,
+									model: resultModel,
 									imageCount: 0,
 									imagePaths: [],
 									images: [],
@@ -1189,11 +1309,14 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 
 						return {
 							content: [
-								{ type: "text", text: buildResponseSummary(provider, model, imagePaths, parsed.responseText) },
+								{
+									type: "text",
+									text: buildResponseSummary(provider, resultModel, imagePaths, parsed.responseText),
+								},
 							],
 							details: {
 								provider,
-								model,
+								model: resultModel,
 								imageCount: parsed.images.length,
 								imagePaths,
 								images: parsed.images,

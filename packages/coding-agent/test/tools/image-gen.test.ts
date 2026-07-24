@@ -235,39 +235,27 @@ describe("imageGenTool", () => {
 		expect(result.details?.imageCount).toBe(1);
 	});
 
-	it("routes image generation through a connected Codex (ChatGPT) subscription when the active model is not OpenAI", async () => {
+	it("uses the Codex Images API for official-JWT text generation", async () => {
 		setImageProviderOrder(["openai-codex"]);
 		let requestUrl: string | undefined;
-		let accountHeader: string | null | undefined;
+		let requestMethod: string | undefined;
+		let requestHeaders: Headers | undefined;
 		let requestBody: Record<string, unknown> | undefined;
 
-		// A fake Codex JWT (header.payload.signature) so getCodexAccountId can read
-		// chatgpt_account_id from the base64 payload claim.
 		const payload = Buffer.from(
 			JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "acct-codex-1" } }),
 		).toString("base64");
 		const codexToken = `header.${payload}.signature`;
 
-		const sse = `data: ${JSON.stringify({
-			type: "response.completed",
-			response: {
-				output: [
-					{
-						type: "image_generation_call",
-						result: Buffer.from("codex-webp").toString("base64"),
-						revised_prompt: "A neon skyline.",
-						status: "completed",
-					},
-				],
-				usage: { input_tokens: 3, output_tokens: 4, total_tokens: 7 },
-			},
-		})}\n\n`;
-
 		const fetchMock: typeof fetch = (async (input: string | URL | Request, init?: RequestInit) => {
 			requestUrl = input.toString();
-			accountHeader = new Headers(init?.headers).get("chatgpt-account-id");
+			requestMethod = init?.method;
+			requestHeaders = new Headers(init?.headers);
 			requestBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
-			return new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } });
+			return new Response(
+				JSON.stringify({ data: [{ b64_json: Buffer.from("codex-image-2").toString("base64") }] }),
+				{ status: 200, headers: { "content-type": "application/json" } },
+			);
 		}) as unknown as typeof fetch;
 
 		const codexModel = {
@@ -277,7 +265,6 @@ describe("imageGenTool", () => {
 			name: "GPT-5.5",
 			baseUrl: "https://chatgpt.com/backend-api",
 		} as Model;
-		// Active model is Claude — proves the codex subscription path is independent of it.
 		const activeModel = {
 			api: "anthropic-messages",
 			provider: "anthropic",
@@ -307,26 +294,113 @@ describe("imageGenTool", () => {
 		};
 
 		const result = await imageGenTool.execute(
-			"call-codex",
-			{ subject: "a neon skyline", aspect_ratio: "1:1" },
+			"call-codex-generate",
+			{ subject: "a neon skyline", aspect_ratio: "16:9" },
 			undefined,
 			ctx,
 		);
 		generatedImagePaths.push(...(result.details?.imagePaths ?? []));
 
-		expect(requestUrl).toBe("https://chatgpt.com/backend-api/codex/responses");
-		expect(accountHeader).toBe("acct-codex-1");
-		expect(requestBody).toMatchObject({
-			model: "gpt-5.5",
-			tools: [{ type: "image_generation", output_format: "webp", size: "1024x1024", action: "generate" }],
-			stream: true,
+		expect(requestUrl).toBe("https://chatgpt.com/backend-api/codex/images/generations");
+		expect(requestMethod).toBe("POST");
+		expect(requestHeaders?.get("authorization")).toBe(`Bearer ${codexToken}`);
+		expect(requestHeaders?.get("chatgpt-account-id")).toBe("acct-codex-1");
+		expect(requestHeaders?.get("originator")).toBe("pi");
+		expect(requestHeaders?.get("version")).toBe("0.144.1");
+		expect(requestHeaders?.get("content-type")).toBe("application/json");
+		expect(requestBody).toEqual({
+			prompt: "a neon skyline.",
+			background: "auto",
+			model: "gpt-image-2",
+			quality: "auto",
+			size: "1536x1024",
 		});
 		expect(result.details?.provider).toBe("openai-codex");
-		expect(result.details?.model).toBe("gpt-5.5");
+		expect(result.details?.model).toBe("gpt-image-2");
 		expect(result.details?.imageCount).toBe(1);
+		expect(result.details?.images[0]?.data).toBe(Buffer.from("codex-image-2").toString("base64"));
 		const savedPath = result.details?.imagePaths[0];
 		if (!savedPath) throw new Error("Expected generated image path");
-		expect(await Bun.file(savedPath).bytes()).toEqual(Buffer.from("codex-webp"));
+		expect(await Bun.file(savedPath).bytes()).toEqual(Buffer.from("codex-image-2"));
+	});
+
+	it("uses the Codex Images API for official-JWT image edits", async () => {
+		let requestUrl: string | undefined;
+		let requestMethod: string | undefined;
+		let requestHeaders: Headers | undefined;
+		let requestBody: Record<string, unknown> | undefined;
+		const payload = Buffer.from(
+			JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "acct-codex-edit" } }),
+		).toString("base64");
+		const codexToken = `header.${payload}.signature`;
+		const sourceImage = Buffer.from("source-image").toString("base64");
+
+		const fetchMock: typeof fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+			requestUrl = input.toString();
+			requestMethod = init?.method;
+			requestHeaders = new Headers(init?.headers);
+			requestBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+			return new Response(
+				JSON.stringify({ data: [{ b64_json: Buffer.from("codex-edited-image").toString("base64") }] }),
+				{ status: 200, headers: { "content-type": "application/json" } },
+			);
+		}) as unknown as typeof fetch;
+
+		const model = {
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			id: "gpt-5.5",
+			name: "GPT-5.5",
+			baseUrl: "https://chatgpt.com/backend-api",
+		} as Model;
+		const ctx: CustomToolContext = {
+			fetch: fetchMock,
+			sessionManager: {
+				getCwd: () => "/tmp",
+				getSessionId: () => "test-edit-session",
+			} as unknown as ReadonlySessionManager,
+			modelRegistry: {
+				getApiKey: async () => codexToken,
+				getApiKeyForProvider: async () => undefined,
+				authStorage: { rotateSessionCredential: async () => false },
+				resolver: () => async () => codexToken,
+			} as unknown as ModelRegistry,
+			model,
+			isIdle: () => true,
+			hasQueuedMessages: () => false,
+			abort: () => {},
+		};
+
+		const result = await imageGenTool.execute(
+			"call-codex-edit",
+			{
+				subject: "a cat",
+				changes: ["make the reference noir"],
+				input: [{ data: sourceImage, mime_type: "image/png" }],
+			},
+			undefined,
+			ctx,
+		);
+		generatedImagePaths.push(...(result.details?.imagePaths ?? []));
+
+		expect(requestUrl).toBe("https://chatgpt.com/backend-api/codex/images/edits");
+		expect(requestMethod).toBe("POST");
+		expect(requestHeaders?.get("authorization")).toBe(`Bearer ${codexToken}`);
+		expect(requestHeaders?.get("chatgpt-account-id")).toBe("acct-codex-edit");
+		expect(requestHeaders?.get("originator")).toBe("pi");
+		expect(requestHeaders?.get("version")).toBe("0.144.1");
+		expect(requestBody).toEqual({
+			prompt: "a cat.\n\nChanges:\n- make the reference noir",
+			background: "auto",
+			model: "gpt-image-2",
+			quality: "auto",
+			size: "auto",
+			images: [{ image_url: `data:image/png;base64,${sourceImage}` }],
+		});
+		expect(result.details?.provider).toBe("openai-codex");
+		expect(result.details?.model).toBe("gpt-image-2");
+		expect(result.details?.imageCount).toBe(1);
+		expect(result.details?.images[0]?.data).toBe(Buffer.from("codex-edited-image").toString("base64"));
 	});
 
 	it("falls back when an openai-codex API key lacks a subscription account claim", async () => {

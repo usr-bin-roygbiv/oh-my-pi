@@ -7,6 +7,10 @@
 - Model-facing prompt: `packages/coding-agent/src/prompts/tools/image-gen.md`
 - Session injection: `packages/coding-agent/src/sdk.ts` (`getImageGenTools()`)
 
+## Enablement and Invocation
+- Image generation is opt-in. `generate_image.enabled` is disabled by default and is the sole persistent enablement setting; normal CLI tool disabling and explicit tool whitelists still apply.
+- For an explicit image-generation or image-edit request, invoke `generate_image` directly without asking for redundant confirmation.
+
 ## Inputs
 
 | Field | Type | Required | Description |
@@ -31,17 +35,20 @@
 - Provider responses with no image data return `imageCount: 0`, empty `imagePaths` / `images`, and any provider text/feedback available.
 
 ## Flow
-1. The SDK injects `generate_image` as a custom tool via `getImageGenTools()`.
-2. `execute(...)` resolves credentials and provider from the active model registry / session credentials.
+1. When `generate_image.enabled` is enabled, the SDK injects `generate_image` via `getImageGenTools()`.
+2. `execute(...)` resolves credentials and the requested provider from the active model registry / session credentials, retaining provider auto-detection and fallback behavior.
 3. Input images are resolved from `path` relative to the session cwd or from inline `data` + `mime_type`.
 4. The tool validates provider-specific `aspect_ratio` support.
 5. Provider dispatch:
-   - OpenAI / OpenAI Codex: hosted Responses image-generation path with WebP output.
+   - Official ChatGPT/Codex subscription auth: the native Codex Images generation or edit API with `gpt-image-2`.
+   - Custom Codex proxies and opaque Codex credentials: the compatible hosted Responses route.
+   - OpenAI API keys: the existing OpenAI-hosted image route.
    - Antigravity: Google Antigravity SSE endpoint.
    - OpenRouter: OpenRouter image-capable chat completion path.
    - xAI: Grok image endpoint.
    - Gemini: Gemini `generateContent` with `responseModalities: ["IMAGE"]`.
-6. Inline images from the provider response are saved to temporary files; paths and inline image metadata are returned.
+6. If a selected provider fails, dispatch continues through the existing compatible provider fallbacks.
+7. Inline images from the provider response are saved to temporary files; paths and inline image metadata are returned.
 
 ## Modes / Variants
 - Text-to-image: provide `subject` and optional style/composition fields, no `input`.
@@ -57,7 +64,7 @@
 ## Limits & Caps
 - Local input images are capped at `35 * 1024 * 1024` bytes (`MAX_IMAGE_SIZE`).
 - Provider timeout is `3 * 60 * 1000` ms.
-- OpenAI output format is WebP.
+- Responses-based OpenAI and custom Codex proxy routes request WebP output.
 - Common aspect ratios are `1:1`, `3:4`, `4:3`, `9:16`, and `16:9`; xAI also accepts `3:2` and `2:3`.
 - `image_size` schema accepts `1024x1024`, `1536x1024`, and `1024x1536`.
 
