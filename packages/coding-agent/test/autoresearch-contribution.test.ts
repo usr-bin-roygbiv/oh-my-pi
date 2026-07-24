@@ -4026,6 +4026,74 @@ describe("process-local contribution lifecycle", () => {
 		]);
 	});
 
+	it("binds an ownerless ordinary init to its first authorized branch before mutation", async () => {
+		const harness = createIntegrationHarness(cwd.path());
+		const branchA = "autoresearch/ownerless-a";
+		const branchB = "autoresearch/ownerless-b";
+		harness.setCurrentBranch(branchA);
+		harness.setSessionBranch([
+			{
+				type: "custom",
+				customType: "autoresearch-control",
+				id: "ownerless-branch-control",
+				parentId: null,
+				timestamp: new Date(0).toISOString(),
+				data: { mode: "on", goal: "ownerless branch binding" },
+			},
+		]);
+		const sessionStart = handlerRequired<SessionStartEvent>(harness, "session_start");
+		await sessionStart({ type: "session_start" } as SessionStartEvent, harness.ctx as ExtensionContext);
+		expect(harness.currentBranch()).toBe(branchA);
+		expect(snapshotStorageArtifacts(dbDir.path())).toEqual([]);
+		await expect(hasActiveAutoresearchSession(cwd.path())).resolves.toBe(false);
+		expect(harness.activeTools).toEqual([
+			"read",
+			"bash",
+			"init_experiment",
+			"run_experiment",
+			"log_experiment",
+			"update_notes",
+		]);
+		await Bun.write(`${cwd.path()}/autoresearch.sh`, "#!/usr/bin/env bash\necho METRIC runtime_ms=1\n");
+		harness.setStatusText(" M autoresearch.sh\0");
+		let switchCount = 0;
+		harness.setNextStatusRequest(() => {
+			switchCount++;
+			expect(harness.currentBranch()).toBe(branchA);
+			harness.setCurrentBranch(branchB);
+		});
+		const stageSpy = vi.spyOn(git.stage, "files").mockResolvedValue();
+		const commitSpy = vi.spyOn(git, "commit").mockResolvedValue();
+		const initialHead = await git.head.sha(cwd.path());
+		const init = harness.tools.get("init_experiment");
+		if (!init) throw new Error("Expected init_experiment tool");
+
+		const [initResult] = await Promise.allSettled([
+			init.execute(
+				"ownerless-branch-switch",
+				{ name: "ownerless branch", primary_metric: "runtime_ms" },
+				undefined,
+				undefined,
+				harness.ctx as ExtensionContext,
+			),
+		]);
+
+		expect(initResult).toMatchObject({
+			status: "rejected",
+			reason: {
+				name: "ToolAbortError",
+				message: "Autoresearch ownerless initialization changed branches before mutation.",
+			},
+		});
+		expect(switchCount).toBe(1);
+		expect(harness.currentBranch()).toBe(branchB);
+		expect(stageSpy).not.toHaveBeenCalled();
+		expect(commitSpy).not.toHaveBeenCalled();
+		expect(await git.head.sha(cwd.path())).toBe(initialHead);
+		expect(snapshotStorageArtifacts(dbDir.path())).toEqual([]);
+		await expect(hasActiveAutoresearchSession(cwd.path())).resolves.toBe(false);
+	});
+
 	it("fails closed when contribution is stopped during initial init preparation", async () => {
 		const harness = createIntegrationHarness(cwd.path());
 		await startContribution(harness);
@@ -4902,6 +4970,86 @@ describe("process-local contribution lifecycle", () => {
 		]);
 		expect(restoredMutation.status).toBe("fulfilled");
 		expect(storage.getSessionById(sessionA.id)?.notes).toBe("branch A restored notes");
+	});
+
+	it("restores its retained ordinary owner after A to B to A manual checkout without a session event", async () => {
+		const harness = createIntegrationHarness(cwd.path());
+		const branchA = "autoresearch/prompt-owner-a";
+		const branchB = "autoresearch/prompt-owner-b";
+		const goal = "prompt-bound ordinary goal";
+		harness.setCurrentBranch(branchA);
+		await commandRequired(harness, "autoresearch").handler(goal, harness.ctx);
+		await Bun.write(`${cwd.path()}/autoresearch.sh`, "#!/usr/bin/env bash\necho METRIC runtime_ms=1\n");
+		const init = harness.tools.get("init_experiment");
+		if (!init) throw new Error("Expected init_experiment tool");
+		await init.execute(
+			"prompt-owner-session",
+			{ name: "prompt owner", primary_metric: "runtime_ms" },
+			undefined,
+			undefined,
+			harness.ctx as ExtensionContext,
+		);
+		const storage = await openAutoresearchStorage(cwd.path());
+		const sessionA = storage.getActiveSessionForBranch(branchA);
+		if (!sessionA) throw new Error("Expected initialized branch A session");
+		storage.updateSession(sessionA.id, { notes: "retained prompt owner notes" });
+		expect(storage.getActiveSessionForBranch(branchA)?.id).toBe(sessionA.id);
+		expect(storage.getSessionById(sessionA.id)?.notes).toBe("retained prompt owner notes");
+		expect(storage.getActiveSessionForBranch(branchB)).toBeNull();
+		expect(harness.activeTools).toEqual([
+			"read",
+			"bash",
+			"init_experiment",
+			"run_experiment",
+			"log_experiment",
+			"update_notes",
+		]);
+		harness.setSessionBranch([
+			{
+				type: "custom",
+				customType: "autoresearch-control",
+				id: "prompt-owner-control",
+				parentId: null,
+				timestamp: new Date(0).toISOString(),
+				data: { mode: "on", goal },
+			},
+		]);
+		expect(harness.ctx.sessionManager.getBranch()).toContainEqual(
+			expect.objectContaining({ customType: "autoresearch-control", data: { mode: "on", goal } }),
+		);
+		const beforeAgentStart = handlerRequired<BeforeAgentStartEvent, { systemPrompt?: string[] }>(
+			harness,
+			"before_agent_start",
+		);
+
+		harness.setCurrentBranch(branchB);
+		const promptOnB = await beforeAgentStart(
+			{ type: "before_agent_start", prompt: "manual checkout B", systemPrompt: ["base prompt"] },
+			harness.ctx as ExtensionContext,
+		);
+		expect(promptOnB).toBeUndefined();
+		expect(harness.activeTools).toEqual(["read", "bash"]);
+		expect(storage.getActiveSessionForBranch(branchA)?.id).toBe(sessionA.id);
+		expect(storage.getSessionById(sessionA.id)?.notes).toBe("retained prompt owner notes");
+		expect(storage.getActiveSessionForBranch(branchB)).toBeNull();
+
+		harness.setCurrentBranch(branchA);
+		const restoredPrompt = await beforeAgentStart(
+			{ type: "before_agent_start", prompt: "manual checkout A", systemPrompt: ["base prompt"] },
+			harness.ctx as ExtensionContext,
+		);
+		expect(storage.getActiveSessionForBranch(branchA)?.id).toBe(sessionA.id);
+		expect(storage.getActiveSessionForBranch(branchB)).toBeNull();
+		expect(restoredPrompt?.systemPrompt?.[0]).toContain(goal);
+		expect(restoredPrompt?.systemPrompt?.[0]).toContain("retained prompt owner notes");
+		expect(harness.activeTools).toEqual([
+			"read",
+			"bash",
+			"init_experiment",
+			"run_experiment",
+			"log_experiment",
+			"update_notes",
+		]);
 	});
 
 	it("does not abort an ordinary mutation when contribution mode is already off", async () => {
