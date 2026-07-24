@@ -1097,8 +1097,8 @@ describe("contribution fork validation and publication", () => {
 		}
 	});
 
-	it("rejects a graft installed after the preliminary graft read but before raw ancestry runs", async () => {
-		const source = TempDir.createSync("@pi-contribution-graft-race-");
+	it("does not inspect legacy graft content before raw ancestry traversal", async () => {
+		const source = TempDir.createSync("@pi-contribution-graft-read-");
 		try {
 			await $`git -C ${source.path()} init -b main`.quiet();
 			await Bun.write(`${source.path()}/base.txt`, "base\n");
@@ -1113,29 +1113,12 @@ describe("contribution fork validation and publication", () => {
 			const unrelatedSha = (await $`git -C ${source.path()} rev-parse HEAD`.quiet()).text().trim();
 			const graftPath = `${source.path()}/.git/info/grafts`;
 			const callBunFile = Bun.file as unknown as (input: unknown) => unknown;
-			let graftRead = false;
-			let graftInstalled = false;
 			vi.spyOn(Bun, "file").mockImplementation(((input: unknown) => {
 				if (String(input) !== graftPath) return callBunFile(input) as never;
-				return {
-					text: () =>
-						new Promise<string>(resolve => {
-							graftRead = true;
-							resolve("");
-							fs.mkdirSync(`${source.path()}/.git/info`, { recursive: true });
-							fs.writeFileSync(graftPath, `${unrelatedSha} ${baseSha}\n`);
-							graftInstalled = true;
-						}),
-				} as never;
+				throw new Error("Legacy graft content was inspected before raw ancestry traversal.");
 			}) as typeof Bun.file);
 
-			const isRawAncestor = await git.isAncestor(source.path(), baseSha, unrelatedSha);
-
-			expect({ graftRead, graftInstalled, isRawAncestor }).toEqual({
-				graftRead: true,
-				graftInstalled: true,
-				isRawAncestor: false,
-			});
+			await expect(git.isAncestor(source.path(), baseSha, unrelatedSha)).resolves.toBe(false);
 		} finally {
 			source.removeSync();
 		}
