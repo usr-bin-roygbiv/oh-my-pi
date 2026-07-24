@@ -247,9 +247,11 @@ this push:
 The destination is the verified push-effective URL for the previously confirmed
 fork. A unique command-scoped remote uses an explicit `pushurl` through a random,
 exact-match URL alias. This bypasses configured `pushurl`, `pushInsteadOf`, and
-ordinary `insteadOf` redirection while retaining the verified destination. The
-push also disables local push hooks and recursive submodule publication so the
-confirmed exact refspec is its only repository publication effect.
+ordinary `insteadOf` redirection while retaining the verified destination.
+The push runs normal local pre-push hooks; hook rejection leaves the candidate ref
+absent, while hook-local `HEAD` or worktree drift cannot retarget the literal
+candidate SHA. Recursive submodule publication remains disabled, so the confirmed
+exact refspec is its only repository publication effect.
 A force-with-lease expecting an absent remote branch prevents overwriting an
 existing ref. Nothing is pushed to the official repository. The command never
 creates, approves, or merges a pull request.
@@ -259,9 +261,11 @@ destination ref, review URLs, and exact draft as a durable “push outcome pendi
 intent. Once that immutable push begins, lifecycle commands drain it rather than
 canceling an ambiguously completed transport. A successful push always retains the
 review URLs and draft handoff before the transition completes. If the process exits
-before recording success, `/contribute status` in the reopened session checks the
-exact fork ref and reports recovered success, a different SHA, or an unknown
-outcome; it never retries the push.
+before recording success, resume or select that exact original transcript (for
+example with `omp --resume`) and run `/contribute status`; it checks the exact fork
+ref and reports recovered success, a different SHA, or an unknown outcome without
+retrying the push. A fresh plain `omp` session reports contribution mode off. The
+process-local authorization and continuation loop never resume.
 
 After the push, OMP stops the research loop and prints:
 
