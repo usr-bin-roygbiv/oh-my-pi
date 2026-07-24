@@ -326,6 +326,42 @@ describe("AgentSession.branchFromBtw", () => {
 		expect(activeSession.sessionManager.getCwd()).toBe(originalCwd);
 	});
 
+	it("rejects a queued session transition when disposal starts before admission", async () => {
+		const activeSession = await createSession();
+		const originalCwd = activeSession.sessionManager.getCwd();
+		const targetCwd = path.join(tempDir, "dispose-queued-move-target");
+		fs.mkdirSync(targetCwd);
+		const firstMoveEntered = Promise.withResolvers<void>();
+		const releaseFirstMove = Promise.withResolvers<void>();
+		const realMoveTo = activeSession.sessionManager.moveTo.bind(activeSession.sessionManager);
+		let moveCallCount = 0;
+		vi.spyOn(activeSession.sessionManager, "moveTo").mockImplementation(async (newCwd, targetSessionDir) => {
+			moveCallCount++;
+			if (moveCallCount === 1) {
+				firstMoveEntered.resolve();
+				await releaseFirstMove.promise;
+			}
+			await realMoveTo(newCwd, targetSessionDir);
+		});
+
+		const moveAway = activeSession.moveSession(targetCwd);
+		await firstMoveEntered.promise;
+		const moveBack = activeSession.moveSession(originalCwd);
+		activeSession.beginDispose();
+		releaseFirstMove.resolve();
+		const results = await Promise.allSettled([moveAway, moveBack]);
+
+		expect(results).toEqual([
+			{ status: "fulfilled", value: true },
+			{
+				status: "rejected",
+				reason: expect.objectContaining({ message: "Cannot start a session transition after disposal." }),
+			},
+		]);
+		expect(moveCallCount).toBe(1);
+		expect(activeSession.sessionManager.getCwd()).toBe(targetCwd);
+	});
+
 	it("coalesces a queued duplicate move after the first reaches its target", async () => {
 		const emitted: Array<Record<string, unknown>> = [];
 		const extensionRunner = {
