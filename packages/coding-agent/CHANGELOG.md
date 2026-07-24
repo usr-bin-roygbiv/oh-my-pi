@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [17.1.1] - 2026-07-24
+
 ### Added
 
 - Added the `/session pin` subcommand and account picker to pin provider OAuth accounts for the current session
@@ -9,6 +11,10 @@
 - Added the `/computer` slash command (`on`/`off`/`status`/toggle) to enable or disable the computer tool for the current session without persisting settings.
 - Exposed `computer` to models without native OpenAI computer-use support as a regular function tool with a typed GA action schema; the same native desktop backend and approval policy apply on both paths.
 - Hardened computer action ingress: action-specific fields, modifier/key arrays, coordinates, drag points, and scroll deltas fail closed before native input; numeric fields must be signed 32-bit integers and coordinates must be non-negative.
+
+### Changed
+
+- Replaced Chromium-backed `/live` media and external speech recorder/player subprocesses with the cross-platform native microphone, speaker, Opus, and WebRTC stack from `@oh-my-pi/pi-natives`.
 
 ### Fixed
 
@@ -47,7 +53,6 @@
 
 ### Changed
 
-- Replaced Chromium-backed `/live` media and external speech recorder/player subprocesses with the cross-platform native microphone, speaker, Opus, and WebRTC stack from `@oh-my-pi/pi-natives`.
 - Updated subagent behavior to inherit `async.enabled` and `bash.autoBackground.enabled` from parent sessions, and refined subagent run completion to wait for background jobs to settle.
 - Added ordered `bash.patterns` command approval rules to allow, prompt, or deny bash commands by pattern.
 - Updated Markdown file handling so all Markdown flavors (`.markdown`, `.mdx`, `.mdc`, etc.) respect the `read.summarize.prose` setting.

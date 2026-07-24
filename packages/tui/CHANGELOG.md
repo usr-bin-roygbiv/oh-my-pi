@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [17.1.1] - 2026-07-24
+
 ### Fixed
 
 - Fixed WarpTerminal wrapping streamed Compatibility Jamo at the platform-default width instead of its rendered one-cell width ([#6461](https://github.com/can1357/oh-my-pi/issues/6461)).

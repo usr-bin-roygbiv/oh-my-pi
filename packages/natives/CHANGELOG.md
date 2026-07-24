@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [17.1.1] - 2026-07-24
+
 ### Added
 
 - Added native `AudioCapture`, `AudioPlayback`, and `LiveWebRtcPeer` classes for low-latency microphone capture, gapless speaker playback, and WebRTC offer/answer sessions with Opus media and `oai-events` data-channel delivery.
