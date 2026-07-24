@@ -4644,6 +4644,43 @@ describe("process-local contribution lifecycle", () => {
 		expect(snapshotStorageArtifacts(dbDir.path())).toEqual([]);
 	});
 
+	it("rejects contribution startup while an admitted session move remains unsettled", async () => {
+		const harness = createIntegrationHarness(cwd.path(), { confirmAnswers: [true, true] });
+		const initialTools = [...harness.activeTools];
+		const transitionId = "admitted-move-before-contribution-start";
+		const beforeMoveResult = await handlerRequired<
+			{ type: "session_before_move"; transitionId: string; targetCwd: string },
+			{ cancel?: boolean }
+		>(harness, "session_before_move")(
+			{ type: "session_before_move", transitionId, targetCwd: "/tmp/admitted-contribution-move-target" },
+			harness.ctx as ExtensionContext,
+		);
+
+		const startResult = await Promise.allSettled([startContribution(harness)]);
+		await handlerRequired<{
+			type: "session_transition_end";
+			transitionId: string;
+			kind: "move";
+			committed: boolean;
+		}>(harness, "session_transition_end")(
+			{ type: "session_transition_end", transitionId, kind: "move", committed: true },
+			harness.ctx as ExtensionContext,
+		);
+		await commandRequired(harness, "contribute").handler("status", harness.ctx);
+
+		expect(beforeMoveResult).toBeUndefined();
+		expect(startResult).toEqual([{ status: "fulfilled", value: undefined }]);
+		expect(harness.confirmCalls).toEqual([]);
+		expect(harness.notifications.at(-1)?.message).toBe("Contribution mode is off.");
+		expect(harness.githubEndpoints).toEqual([]);
+		expect(harness.setModelCalls).toEqual([]);
+		expect(harness.checkoutNewCalls).toEqual([]);
+		expect(harness.activeTools).toEqual(initialTools);
+		expect(harness.appendEntries).toEqual([]);
+		expect(harness.sentUserMessages).toEqual([]);
+		expect(snapshotStorageArtifacts(dbDir.path())).toEqual([]);
+	});
+
 	it("rejects contribution mode when the transcript is not persistent", async () => {
 		const harness = createIntegrationHarness(cwd.path(), {
 			confirmAnswers: [true, true],
