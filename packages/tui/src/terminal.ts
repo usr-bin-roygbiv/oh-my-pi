@@ -12,6 +12,7 @@ import {
 import { setKittyProtocolActive } from "./keys";
 import { StdinBuffer } from "./stdin-buffer";
 import {
+	detectTerminalId,
 	isInsideTerminalMultiplexer,
 	NotifyProtocol,
 	setCellDimensions,
@@ -25,23 +26,23 @@ const TERMINAL_PROGRESS_KEEPALIVE_MS = 1000;
 const TERMINAL_PROGRESS_ACTIVE_SEQUENCE = "\x1b]9;4;3\x07";
 const TERMINAL_PROGRESS_CLEAR_SEQUENCE = "\x1b]9;4;0;\x07";
 const WINDOWS_TERMINAL_OSC11_POLL_MS = 30_000;
-// Hangul Compatibility Jamo (U+3131..=U+318E) render width is terminal-dependent:
-// Ghostty follows UAX#11 (2 cells); Terminal.app and iTerm2 render narrow (1),
-// matching the macOS platform default. Override only for terminals known to
-// disagree — the rest keep the platform default (macOS narrow, otherwise UAX#11),
-// so this is a no-op everywhere except Ghostty. A runtime DSR/CPR probe that
-// auto-detects the width on unknown terminals is tracked separately.
+/**
+ * Resolves terminal-specific Compatibility Jamo widths while preserving the platform default for unknown terminals.
+ *
+ * Ghostty follows UAX#11 (2 cells), while Warp paints each code point at 1 cell.
+ * Terminal.app and iTerm2 also render narrow, matching the macOS platform default.
+ */
 export function resolveHangulCompatibilityJamoWidthFromTerminalIdentity(
 	env: NodeJS.ProcessEnv = Bun.env,
 ): HangulCompatibilityJamoWidth {
-	if (
-		env.GHOSTTY_RESOURCES_DIR ||
-		env.TERM_PROGRAM?.toLowerCase() === "ghostty" ||
-		env.TERM?.toLowerCase().includes("ghostty")
-	) {
-		return 2;
+	switch (detectTerminalId(env)) {
+		case "ghostty":
+			return 2;
+		case "warp":
+			return 1;
+		default:
+			return "platform";
 	}
-	return "platform";
 }
 
 function shouldEnableModifyOtherKeysFallback(env: NodeJS.ProcessEnv = Bun.env): boolean {
