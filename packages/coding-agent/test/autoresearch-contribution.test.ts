@@ -1689,6 +1689,7 @@ interface IntegrationHarnessOptions {
 	onSetModel?(callNumber: number): void | Promise<void>;
 	onCheckoutNewAt?(callNumber: number): void | Promise<void>;
 	onSetActiveTools?(callNumber: number, names: readonly string[]): void | Promise<void>;
+	onSetWidget?(value: unknown): void;
 	onForkMetadataRequest?(callNumber: number, signal?: AbortSignal): void | Promise<void>;
 	onAncestryRequest?(callNumber: number, signal?: AbortSignal): void | Promise<void>;
 	statusText?: string;
@@ -1838,12 +1839,22 @@ function createIntegrationHarness(cwd: string, options: IntegrationHarnessOption
 
 	const realWriteWorktreeTree = git.writeWorktreeTree;
 	const realWriteTree = git.writeTree;
+	const realRawCommit = git.rawCommit;
+	const realCommit = git.commit;
+	const realHeadSha = git.head.sha;
 	vi.spyOn(git, "writeWorktreeTree").mockImplementation(async (workDir, signal) =>
 		fs.existsSync(`${workDir}/.git`) ? realWriteWorktreeTree(workDir, signal) : CANDIDATE_TREE_SHA,
 	);
 	vi.spyOn(git, "writeTree").mockImplementation(async (workDir, writeOptions) =>
 		fs.existsSync(`${workDir}/.git`) ? realWriteTree(workDir, writeOptions) : CANDIDATE_TREE_SHA,
 	);
+	vi.spyOn(git, "rawCommit").mockImplementation(async (workDir, commit, signal) => {
+		if (commit !== COMMIT_SHA && commit !== CURRENT_HEAD) return realRawCommit(workDir, commit, signal);
+		const treeSha = fs.existsSync(`${workDir}/.git`)
+			? await realWriteWorktreeTree(workDir, signal)
+			: CANDIDATE_TREE_SHA;
+		return { treeSha, parentShas: [COMMIT_SHA] };
+	});
 	vi.spyOn(git.repo, "root").mockResolvedValue(cwd);
 	vi.spyOn(git.show, "prefix").mockResolvedValue("");
 	const statusMock = Object.assign(
@@ -1861,6 +1872,11 @@ function createIntegrationHarness(cwd: string, options: IntegrationHarnessOption
 	vi.spyOn(git.head, "sha").mockImplementation(async () => {
 		gitEvents.push(`head:${headSha}`);
 		return headSha;
+	});
+	vi.spyOn(git, "commit").mockImplementation(async (workDir, message, commitOptions) => {
+		const result = await realCommit(workDir, message, commitOptions);
+		if (fs.existsSync(`${workDir}/.git`)) headSha = (await realHeadSha(workDir, commitOptions?.signal)) ?? headSha;
+		return result;
 	});
 	vi.spyOn(git.branch, "current").mockImplementation(async () => currentBranch);
 	vi.spyOn(git, "isAncestor").mockImplementation(async (_workDir, ancestor, descendant, signal) => {
@@ -2088,6 +2104,7 @@ function createIntegrationHarness(cwd: string, options: IntegrationHarnessOption
 			setWidget(_id: string, value: unknown): void {
 				widgetUpdates++;
 				widgetValues.push(value);
+				options.onSetWidget?.(value);
 			},
 			setWorkingMessage(): void {},
 		},
@@ -2358,6 +2375,7 @@ async function preparePendingContribution(harness: IntegrationHarness, cwd: stri
 		parsedAsi: {
 			[CONTRIBUTION_HARNESS_SHA256_ASI_KEY]: HARNESS_SHA256,
 			[CONTRIBUTION_WORKTREE_TREE_ASI_KEY]: CANDIDATE_TREE_SHA,
+			[CONTRIBUTION_INVOCATION_SHA256_ASI_KEY]: INVOCATION_SHA256,
 		},
 	});
 	return { run, session, storage };
@@ -2394,6 +2412,7 @@ describe("process-local contribution lifecycle", () => {
 		it(`returns cancel immediately for ${transition} and renders off only after its named async stop settles`, async () => {
 			const stopEntered = Promise.withResolvers<void>();
 			const releaseStop = Promise.withResolvers<void>();
+			const widgetCleared = Promise.withResolvers<void>();
 			let contributionStarted = false;
 			const harness = createIntegrationHarness(cwd.path(), {
 				sessionId: `transition-${transition}`,
@@ -2401,6 +2420,9 @@ describe("process-local contribution lifecycle", () => {
 					if (!contributionStarted || names.includes("init_experiment")) return;
 					stopEntered.resolve();
 					return releaseStop.promise;
+				},
+				onSetWidget(value) {
+					if (contributionStarted && value === undefined) widgetCleared.resolve();
 				},
 			});
 			await startContribution(harness);
@@ -2450,8 +2472,8 @@ describe("process-local contribution lifecycle", () => {
 			await stopEntered.promise;
 			expect(harness.widgetValues.at(-1)).not.toBeUndefined();
 			releaseStop.resolve();
-			while (harness.activeTools.includes("init_experiment")) await Promise.resolve();
-			await Promise.resolve();
+			await widgetCleared.promise;
+			expect(harness.activeTools).not.toContain("init_experiment");
 			expect(harness.widgetValues.at(-1)).toBeUndefined();
 			await commandRequired(harness, "contribute").handler("status", harness.ctx);
 			expect(harness.notifications.at(-1)?.message).toBe("Contribution mode is off.");
@@ -3072,6 +3094,7 @@ describe("process-local contribution lifecycle", () => {
 		const harness = createIntegrationHarness(cwd.path());
 		await startContribution(harness);
 		const { session, storage } = await prepareInitializedContribution(harness, cwd.path());
+		harness.setHeadSha(baseHead);
 		await Bun.write(`${cwd.path()}/source.ts`, "export const value = 'candidate';\n");
 		harness.setStatusText(" M source.ts\0");
 		vi.spyOn(bashExecutor, "executeBash").mockResolvedValue({
@@ -3103,6 +3126,7 @@ describe("process-local contribution lifecycle", () => {
 		const previousTracePath = process.env.GIT_TRACE2_EVENT;
 		process.env.GIT_TRACE2_EVENT = tracePath;
 		try {
+			harness.setNextStatusRequest(() => harness.setStatusText(""));
 			await log.execute(
 				"keep-with-normal-hooks",
 				{ status: "keep", metric: 1, description: "candidate whose tested bytes must be committed" },
@@ -3162,6 +3186,7 @@ describe("process-local contribution lifecycle", () => {
 		const harness = createIntegrationHarness(cwd.path());
 		await startContribution(harness);
 		const { session, storage } = await prepareInitializedContribution(harness, cwd.path());
+		harness.setHeadSha(baseHead);
 		await Bun.write(`${cwd.path()}/source.ts`, "export const value = 'passing candidate';\n");
 		harness.setStatusText(" M source.ts\0");
 		vi.spyOn(bashExecutor, "executeBash").mockResolvedValue({
@@ -3189,7 +3214,8 @@ describe("process-local contribution lifecycle", () => {
 		);
 		fs.chmodSync(preCommitHook, 0o755);
 
-		await log.execute(
+		harness.setNextStatusRequest(() => harness.setStatusText(""));
+		const logResult = await log.execute(
 			"keep-with-mutating-hook",
 			{ status: "keep", metric: 1, description: "must reject commit-hook drift" },
 			undefined,
@@ -3201,6 +3227,14 @@ describe("process-local contribution lifecycle", () => {
 		const indexTree = (await $`git -C ${cwd.path()} write-tree`.quiet()).text().trim();
 		const porcelain = (await $`git -C ${cwd.path()} status --porcelain=v1 -z`.quiet()).arrayBuffer();
 
+		expect(logResult).toMatchObject({
+			content: [
+				{
+					type: "text",
+					text: "Error: commit hooks changed the exact tested tree, parent, or clean worktree",
+				},
+			],
+		});
 		expect({
 			hook: await Bun.file(hookMarker).text(),
 			headChanged: committedHead !== baseHead,
@@ -3940,74 +3974,42 @@ describe("process-local contribution lifecycle", () => {
 		expect(session?.goal).toBe(GOAL_CONTENT);
 	});
 
-	it("aborts and drains an ordinary init before contribution startup activation", async () => {
-		const activationEntered = Promise.withResolvers<void>();
-		let initSignal: AbortSignal | undefined;
-		let initAbortedAtFinalConfirmation: boolean | undefined;
-		const harness = createIntegrationHarness(cwd.path(), {
-			onConfirm(callNumber) {
-				if (callNumber === 2) initAbortedAtFinalConfirmation = initSignal?.aborted;
-			},
-			onSetModel() {
-				activationEntered.resolve();
-			},
-		});
+	it("rejects an inactive ordinary init before contribution startup activation", async () => {
+		const harness = createIntegrationHarness(cwd.path());
 		harness.setCurrentBranch("autoresearch/ordinary");
-		harness.setSessionBranch([
-			{
-				type: "custom",
-				customType: "autoresearch-control",
-				id: "ordinary-init-race-control",
-				parentId: null,
-				timestamp: new Date(0).toISOString(),
-				data: { mode: "on", goal: "ordinary init activation race" },
-			},
-		]);
-		const sessionStart = handlerRequired<SessionStartEvent>(harness, "session_start");
-		await sessionStart({ type: "session_start" } as SessionStartEvent, harness.ctx as ExtensionContext);
 		await Bun.write(`${cwd.path()}/autoresearch.sh`, "#!/usr/bin/env bash\necho METRIC runtime_ms=1\n");
 		const init = harness.tools.get("init_experiment");
 		if (!init) throw new Error("Expected init_experiment tool");
+		let statusRequests = 0;
 		harness.setStatusText(" M autoresearch.sh\0");
-		const statusEntered = Promise.withResolvers<AbortSignal | undefined>();
-		const statusAbortObserved = Promise.withResolvers<void>();
-		const releaseStatus = Promise.withResolvers<void>();
-		harness.setNextStatusRequest(async signal => {
-			statusEntered.resolve(signal);
-			harness.setCurrentBranch("main");
-			harness.setStatusText("");
-			if (signal?.aborted) {
-				statusAbortObserved.resolve();
-			} else {
-				signal?.addEventListener("abort", () => statusAbortObserved.resolve(), { once: true });
-			}
-			await Promise.race([releaseStatus.promise, statusAbortObserved.promise]);
-			if (signal?.aborted) {
-				throw signal.reason ?? new DOMException("Init invalidated by contribution start", "AbortError");
-			}
+		harness.setNextStatusRequest(() => {
+			statusRequests++;
 		});
-		const initialHead = await git.head.sha(cwd.path());
-		const initPromise = init.execute(
-			"ordinary-before-contribution",
-			{ name: "ordinary", primary_metric: "runtime_ms" },
-			undefined,
-			undefined,
-			harness.ctx as ExtensionContext,
-		);
-		initSignal = await statusEntered.promise;
-		const startPromise = startContribution(harness);
-		const firstLifecycleEvent = await Promise.race([
-			statusAbortObserved.promise.then(() => "aborted" as const),
-			activationEntered.promise.then(() => "activated" as const),
-		]);
-		releaseStatus.resolve();
-		const [initResult, startResult] = await Promise.allSettled([initPromise, startPromise]);
 
-		expect(firstLifecycleEvent).toBe("aborted");
-		expect(initSignal).toBeDefined();
-		expect(initSignal?.aborted).toBe(true);
-		expect(initAbortedAtFinalConfirmation).toBe(false);
-		expect(initResult.status).toBe("rejected");
+		const [initResult] = await Promise.allSettled([
+			init.execute(
+				"inactive-ordinary-before-contribution",
+				{ name: "ordinary", primary_metric: "runtime_ms" },
+				undefined,
+				undefined,
+				harness.ctx as ExtensionContext,
+			),
+		]);
+		const statusRequestsBeforeStart = statusRequests;
+		harness.setNextStatusRequest(() => {});
+		const initialHead = await git.head.sha(cwd.path());
+		harness.setCurrentBranch("main");
+		harness.setStatusText("");
+		const [startResult] = await Promise.allSettled([startContribution(harness)]);
+
+		expect(initResult).toMatchObject({
+			status: "rejected",
+			reason: {
+				name: "ToolAbortError",
+				message: "Autoresearch mode is not active on the current branch.",
+			},
+		});
+		expect(statusRequestsBeforeStart).toBe(0);
 		expect(startResult.status).toBe("fulfilled");
 		expect(await git.head.sha(cwd.path())).toBe(initialHead);
 		expect(snapshotStorageArtifacts(dbDir.path())).toEqual([]);
@@ -4759,7 +4761,7 @@ describe("process-local contribution lifecycle", () => {
 				expect(await Bun.file(`${cwd.path()}/source.ts`).text()).toBe("export const value = 'baseline';\n");
 				expect(harness.appendEntries.at(-1)).toEqual({
 					customType: "autoresearch-control",
-					data: { mode: "clear", goal: null },
+					data: { mode: "clear" },
 				});
 			} else {
 				expect(storage.getSessionById(sessionA.id)?.closedAt).toBeNull();
@@ -4767,7 +4769,7 @@ describe("process-local contribution lifecycle", () => {
 				expect(await Bun.file(`${cwd.path()}/source.ts`).text()).toBe("export const value = 'candidate';\n");
 				expect(harness.appendEntries.at(-1)).toEqual({
 					customType: "autoresearch-control",
-					data: { mode: "off", goal: "branch A lifecycle goal" },
+					data: { mode: "off" },
 				});
 			}
 
