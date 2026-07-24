@@ -567,7 +567,10 @@ describe("read-only contribution storage preflight", () => {
 			if (String(source) !== dbPath || checkpointedAfterDatabaseCopy) return;
 			databaseCopies++;
 			checkpointer.current = new Database(dbPath);
-			checkpointer.current.exec("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA user_version = 1;");
+			checkpointer.current.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+			checkpointer.current.exec(
+				"INSERT INTO runs (session_id, segment, command, started_at, pre_run_dirty_paths_json, log_path) VALUES (1, 0, 'probe', 0, '[]', '')",
+			);
 			checkpointedAfterDatabaseCopy = true;
 		});
 
