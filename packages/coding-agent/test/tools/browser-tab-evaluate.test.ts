@@ -11,7 +11,7 @@ function makeSession(): ToolSession {
 		hasUI: false,
 		getSessionFile: () => null,
 		getSessionSpawns: () => "*",
-		settings: Settings.isolated({ "browser.headless": true }),
+		settings: Settings.isolated({ "browser.cmux": false, "browser.headless": true }),
 	};
 }
 

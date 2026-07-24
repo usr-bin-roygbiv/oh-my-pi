@@ -10,6 +10,7 @@ import { resolveToCwd } from "../../path-utils";
 import { formatScreenshot } from "../../render-utils";
 import { ToolAbortError, ToolError, throwIfAborted } from "../../tool-errors";
 import { type AriaSnapshotOptions, assertSelectorString, buildAriaSnapshotScript } from "../aria/aria-snapshot";
+import { attachCodexBrowserToAgent } from "../codex-facade";
 import { DEFAULT_VIEWPORT } from "../launch";
 import { extractReadableFromHtml, type ReadableFormat } from "../readable";
 import {
@@ -20,6 +21,7 @@ import {
 } from "../run-cancellation";
 import { cloneSafe, RunOutput } from "../run-output";
 import type { Observation, ReadyInfo, RunResultOk, ScreenshotResult, SessionSnapshot } from "../tab-protocol";
+import { CmuxCodexBrowserAdapter } from "./codex-adapter";
 import {
 	type CmuxEvalResult,
 	type CmuxGeometry,
@@ -134,6 +136,11 @@ const findElement = spec => {
 	if (spec.kind === "pierce") return pierceQuery(document, spec.value);
 	if (spec.kind === "aria-ref") {
 		const wanted = spec.value;
+		const bindings = globalThis.__ompCodexDomRefs;
+		if (bindings) {
+			const bound = bindings[wanted];
+			return bound && bound.isConnected !== false && bound._ariaRef?.ref === wanted ? bound : null;
+		}
 		const scan = root => {
 			for (const el of Array.from(root.querySelectorAll("*"))) {
 				if (el._ariaRef && el._ariaRef.ref === wanted) return el;
@@ -176,16 +183,47 @@ const inputEvent = target => {
 	event(target, "input");
 	event(target, "change");
 };
-const setValue = (target, value, append = false) => {
-	if ("value" in target) {
-		target.value = append ? String(target.value || "") + value : value;
-		inputEvent(target);
-		return;
+const isEditable = target => {
+	if (target.disabled || target.readOnly) return false;
+	const tag = String(target.tagName || "").toLowerCase();
+	if (tag === "textarea") return true;
+	if (tag === "input") {
+		const type = String(target.type || target.getAttribute("type") || "text").toLowerCase();
+		return !["button", "checkbox", "file", "hidden", "image", "radio", "reset", "submit"].includes(type);
 	}
-	if (target.isContentEditable) {
-		target.textContent = append ? String(target.textContent || "") + value : value;
-		inputEvent(target);
+	return target.isContentEditable === true;
+};
+const assertReceivesPointerAtCenter = target => {
+	for (let current = target; current; current = current.parentElement) {
+		if (current.hidden || current.inert === true || current.hasAttribute?.("inert") || current.getAttribute?.("aria-hidden") === "true") throw new Error("Element is not actionable");
 	}
+	if (target.disabled || target.getAttribute?.("aria-disabled") === "true" || target.isConnected === false) throw new Error("Element is not actionable");
+	const rect = target.getBoundingClientRect();
+	if (rect.width <= 0 || rect.height <= 0) throw new Error("Element is not actionable");
+	const ownerDocument = target.ownerDocument || document;
+	const hit = ownerDocument.elementFromPoint?.((rect.left ?? rect.x) + rect.width / 2, (rect.top ?? rect.y) + rect.height / 2);
+	for (let current = hit; current; current = current.parentElement) {
+		if (current === target) return;
+	}
+	throw new Error("Element does not receive pointer events at its center");
+};
+const editableValue = (target, label) => {
+	if (!isEditable(target)) throw new Error(label + " requires an editable element");
+	const tag = String(target.tagName || "").toLowerCase();
+	return tag === "input" || tag === "textarea" ? String(target.value ?? "") : String(target.textContent ?? "");
+};
+const setValue = (target, value, append, label) => {
+	const prior = editableValue(target, label);
+	const next = append ? prior + value : value;
+	const tag = String(target.tagName || "").toLowerCase();
+	if (tag === "input" || tag === "textarea") {
+		target.value = next;
+		if (String(target.value) !== next) throw new Error(label + " could not update the editable value");
+	} else {
+		target.textContent = next;
+		if (String(target.textContent ?? "") !== next) throw new Error(label + " could not update contenteditable text");
+	}
+	inputEvent(target);
 };
 `;
 
@@ -271,6 +309,7 @@ export class CmuxTab {
 	readonly #elementRefs = new Map<number, CachedElementRef>();
 	#pageFacade: CmuxPageFacade | undefined;
 	#browserFacade: CmuxBrowserFacade | undefined;
+	#codexAdapter: CmuxCodexBrowserAdapter | undefined;
 	constructor(opts: { client: CmuxSocketClient; surfaceId: string; url?: string; title?: string }) {
 		this.#client = opts.client;
 		this.#surfaceId = opts.surfaceId;
@@ -290,6 +329,11 @@ export class CmuxTab {
 	get browser(): CmuxBrowserFacade {
 		this.#browserFacade ??= new CmuxBrowserFacade(this);
 		return this.#browserFacade;
+	}
+
+	codexAdapter(): CmuxCodexBrowserAdapter {
+		this.#codexAdapter ??= new CmuxCodexBrowserAdapter(this);
+		return this.#codexAdapter;
 	}
 
 	viewport(): ReadyInfo["viewport"] {
@@ -342,14 +386,17 @@ export class CmuxTab {
 
 	async goto(url: string, opts?: { waitUntil?: WaitUntil; timeoutMs?: number }): Promise<void> {
 		const timeoutMs = opts?.timeoutMs ?? this.#runContext?.timeoutMs ?? 30_000;
+		const deadline = Date.now() + timeoutMs;
 		const result = await this.#request("browser.navigate", { url }, timeoutMs);
 		const navigatedUrl = result.url;
 		this.#lastUrl = typeof navigatedUrl === "string" && navigatedUrl.length > 0 ? navigatedUrl : url;
 		if (opts?.waitUntil) {
+			const remainingMs = Math.ceil(deadline - Date.now());
+			if (remainingMs <= 0) throw new ToolError(`tab.goto timed out after ${timeoutMs}ms`);
 			await this.#request(
 				"browser.wait",
-				{ load_state: mapWaitUntil(opts.waitUntil), timeout_ms: timeoutMs },
-				timeoutMs,
+				{ load_state: mapWaitUntil(opts.waitUntil), timeout_ms: remainingMs },
+				remainingMs,
 			);
 		}
 	}
@@ -374,38 +421,51 @@ export class CmuxTab {
 		return observation;
 	}
 
-	async ariaSnapshot(selector?: string, opts?: AriaSnapshotOptions): Promise<string> {
-		const timeoutMs = Math.min(this.#runContext?.timeoutMs ?? 30_000, 30_000);
-		const result = (await this.#request(
-			"browser.eval",
-			{ script: buildAriaSnapshotScript(selector, opts) },
-			timeoutMs,
-		)) as CmuxEvalResult;
+	async ariaSnapshot(
+		selector?: string,
+		opts?: AriaSnapshotOptions & { preserveRefs?: boolean },
+		timeoutMs?: number,
+	): Promise<string> {
+		const requestTimeoutMs = Math.min(timeoutMs ?? this.#runContext?.timeoutMs ?? 30_000, 30_000);
+		const snapshotScript = buildAriaSnapshotScript(selector, opts);
+		const script = opts?.preserveRefs
+			? `(() => {
+				const priorRefs = [];
+				for (const element of document.querySelectorAll("*")) {
+					if (Object.prototype.hasOwnProperty.call(element, "_ariaRef")) priorRefs.push([element, element._ariaRef]);
+				}
+				try { return (${snapshotScript}); }
+				finally {
+					for (const element of document.querySelectorAll("*")) delete element._ariaRef;
+					for (const [element, ref] of priorRefs) element._ariaRef = ref;
+				}
+			})()`
+			: snapshotScript;
+		const result = (await this.#request("browser.eval", { script }, requestTimeoutMs)) as CmuxEvalResult;
 		return result.value as string;
 	}
 
-	async ref(id: string): Promise<CmuxElementHandle> {
+	async ref(id: string, timeoutMs?: number): Promise<CmuxElementHandle> {
 		const refId = /^e\d+$/.test(id.trim()) ? id.trim() : id.trim().replace(/^(?:aria-ref=|aria-ref\/|ariaref\/)/, "");
 		const selector = `aria-ref=${refId}`;
-		const timeoutMs = this.#runContext?.timeoutMs ?? 30_000;
-		await this.#waitForSelector(selector, timeoutMs);
+		await this.#waitForSelector(selector, timeoutMs ?? this.#runContext?.timeoutMs ?? 30_000);
 		return new CmuxElementHandle(this, selector);
 	}
 
-	async click(selector: string): Promise<void> {
-		await this.#selectorAction(selector, "click");
+	async click(selector: string, timeoutMs?: number): Promise<void> {
+		await this.#selectorAction(selector, "click", {}, timeoutMs);
 	}
 
-	async dblclick(selector: string): Promise<void> {
-		await this.#selectorAction(selector, "dblclick");
+	async dblclick(selector: string, timeoutMs?: number): Promise<void> {
+		await this.#selectorAction(selector, "dblclick", {}, timeoutMs);
 	}
 
 	async hover(selector: string): Promise<void> {
 		await this.#selectorAction(selector, "hover");
 	}
 
-	async focus(selector: string): Promise<void> {
-		await this.#selectorAction(selector, "focus");
+	async focus(selector: string, timeoutMs?: number): Promise<void> {
+		await this.#selectorAction(selector, "focus", {}, timeoutMs);
 	}
 
 	async check(selector: string): Promise<void> {
@@ -416,23 +476,23 @@ export class CmuxTab {
 		await this.#selectorAction(selector, "uncheck");
 	}
 
-	async type(selector: string, text: string): Promise<void> {
-		await this.#selectorAction(selector, "type", { text });
+	async type(selector: string, text: string, timeoutMs?: number): Promise<void> {
+		await this.#selectorAction(selector, "type", { text }, timeoutMs);
 	}
 
 	async fill(selector: string, value: string): Promise<void> {
 		await this.#selectorAction(selector, "fill", { value });
 	}
 
-	async press(key: string, opts?: { selector?: string }): Promise<void> {
+	async press(key: string, opts?: { selector?: string; timeoutMs?: number }): Promise<void> {
 		if (opts?.selector) {
-			await this.focus(opts.selector);
+			await this.focus(opts.selector, opts.timeoutMs);
 		}
-		await this.#request("browser.press", { key });
+		await this.#request("browser.press", { key }, opts?.timeoutMs);
 	}
 
-	async scroll(dx: number, dy: number): Promise<void> {
-		await this.#request("browser.scroll", { dx, dy });
+	async scroll(dx: number, dy: number, timeoutMs?: number): Promise<void> {
+		await this.#request("browser.scroll", { dx, dy }, timeoutMs);
 	}
 
 	async waitFor(selector: string, opts?: { timeout?: number }): Promise<CmuxElementHandle> {
@@ -459,6 +519,114 @@ export class CmuxTab {
 		const script = serializeEvalWithEnvelope(fn as string | ((...args: unknown[]) => unknown), args);
 		const result = (await this.#request("browser.eval", { script })) as CmuxEvalResult;
 		return unwrapEvalEnvelope<TResult>(result.value, "tab.evaluate()");
+	}
+
+	async codexEvaluate<TResult>(source: string, args: readonly unknown[], timeoutMs: number): Promise<TResult> {
+		const encodedArgs = args.map(argument => JSON.stringify(argument) ?? "null");
+		const invocation = `(${source})(${encodedArgs.join(",")})`;
+		const script = serializeEvalWithEnvelope(invocation, []);
+		const result = (await this.#request("browser.eval", { script }, timeoutMs)) as CmuxEvalResult;
+		return unwrapEvalEnvelope<TResult>(result.value, "agent.browser");
+	}
+
+	async codexEvaluateCleanup<TResult>(source: string, args: readonly unknown[], timeoutMs: number): Promise<TResult> {
+		const encodedArgs = args.map(argument => JSON.stringify(argument) ?? "null");
+		const invocation = `(${source})(${encodedArgs.join(",")})`;
+		const script = serializeEvalWithEnvelope(invocation, []);
+		const result = (await this.#client.request(
+			"browser.eval",
+			{ surface_id: this.#surfaceId, script },
+			{ timeoutMs },
+		)) as CmuxEvalResult;
+		return unwrapEvalEnvelope<TResult>(result.value, "agent.browser cleanup");
+	}
+
+	async codexRequest(
+		method: string,
+		params: Readonly<Record<string, unknown>>,
+		timeoutMs: number,
+	): Promise<Record<string, unknown>> {
+		return await this.#request(method, { ...params }, timeoutMs);
+	}
+
+	async codexCleanupRequest(
+		method: string,
+		params: Readonly<Record<string, unknown>>,
+		timeoutMs: number,
+	): Promise<Record<string, unknown>> {
+		return await this.#client.request(method, { surface_id: this.#surfaceId, ...params }, { timeoutMs });
+	}
+
+	codexCwd(): string {
+		return this.#runContext?.session.cwd ?? process.cwd();
+	}
+
+	async codexPersistFile(destination: string, data: Uint8Array, timeoutMs: number, operation: string): Promise<void> {
+		const deadline = Date.now() + timeoutMs;
+		const signal = this.#runContext?.signal;
+		throwIfAborted(signal);
+		if (Date.now() >= deadline) throw new ToolError(`${operation} timed out`);
+
+		const temporary = path.join(
+			path.dirname(destination),
+			`.${path.basename(destination)}.${crypto.randomUUID()}.tmp`,
+		);
+		const timeoutController = new AbortController();
+		const timer = setTimeout(
+			() => timeoutController.abort(new ToolError(`${operation} timed out`)),
+			Math.max(1, Math.ceil(deadline - Date.now())),
+		);
+		const writeSignal = signal ? AbortSignal.any([signal, timeoutController.signal]) : timeoutController.signal;
+		let published = false;
+		try {
+			await fs.promises.writeFile(temporary, data, { signal: writeSignal });
+			throwIfAborted(signal);
+			if (timeoutController.signal.aborted || Date.now() >= deadline) {
+				throw new ToolError(`${operation} timed out`);
+			}
+			fs.renameSync(temporary, destination);
+			published = true;
+		} catch (error) {
+			throwIfAborted(signal);
+			if (timeoutController.signal.aborted) throw new ToolError(`${operation} timed out`, { cause: error });
+			throw error;
+		} finally {
+			clearTimeout(timer);
+			if (!published) await fs.promises.rm(temporary, { force: true }).catch(() => undefined);
+		}
+	}
+
+	async codexUrl(timeoutMs: number, signal?: AbortSignal): Promise<string> {
+		const result = (await this.#request("browser.url.get", {}, timeoutMs, signal)) as CmuxUrlGetResult;
+		if (typeof result.url === "string" && result.url.length > 0) this.#lastUrl = result.url;
+		return this.#lastUrl;
+	}
+
+	async codexWaitForLoadState(
+		waitUntil: WaitUntil | undefined,
+		timeoutMs: number,
+		signal?: AbortSignal,
+	): Promise<void> {
+		await this.#request(
+			"browser.wait",
+			{ load_state: mapWaitUntil(waitUntil), timeout_ms: timeoutMs },
+			timeoutMs,
+			signal,
+		);
+	}
+
+	async codexWait(timeoutMs: number, signal?: AbortSignal): Promise<void> {
+		const runSignal = this.#runContext?.signal;
+		const waitSignal = signal && runSignal ? AbortSignal.any([signal, runSignal]) : (signal ?? runSignal);
+		await untilAborted(waitSignal, () => Bun.sleep(timeoutMs));
+	}
+
+	async codexScreenshot(timeoutMs: number): Promise<string> {
+		return (await this.#captureScreenshotPng(timeoutMs)).png_base64;
+	}
+
+	async codexClose(timeoutMs: number): Promise<void> {
+		await this.#request("surface.close", {}, timeoutMs);
 	}
 
 	async scrollIntoView(selector: string): Promise<void> {
@@ -580,6 +748,7 @@ export class CmuxTab {
 			)) as CmuxUrlGetResult;
 			if (typeof result.url === "string" && result.url.length > 0) {
 				this.#lastUrl = result.url;
+				pattern.lastIndex = 0;
 				if (pattern.test(result.url)) return result.url;
 			}
 			await untilAborted(signal, () => Bun.sleep(200));
@@ -587,47 +756,88 @@ export class CmuxTab {
 		throw new ToolError(`tab.waitForUrl() timed out after ${timeoutMs}ms`);
 	}
 
-	async waitForNavigation(opts?: { waitUntil?: WaitUntil; timeout?: number }): Promise<null> {
+	async waitForNavigation(opts?: { waitUntil?: WaitUntil; timeout?: number; signal?: AbortSignal }): Promise<null> {
 		const timeoutMs = opts?.timeout ?? this.#runContext?.timeoutMs ?? 30_000;
-		const signal = this.#runContext?.signal;
-		// Cmux has no native "next navigation" wait — snapshot the current URL via a fresh
-		// `browser.url.get` (never the possibly-stale `#lastUrl`), then poll for a change
-		// from it (mirroring headless `page.waitForNavigation` intent) and optionally settle
-		// on the requested load state. Start it BEFORE the click/submit that navigates; after
-		// a completed nav it times out like puppeteer does.
-		const baseline = (await this.#request(
-			"browser.url.get",
-			{},
-			Math.min(timeoutMs, 5_000),
-			signal,
-		)) as CmuxUrlGetResult;
-		const startUrl = typeof baseline.url === "string" && baseline.url.length > 0 ? baseline.url : this.#lastUrl;
-		if (typeof baseline.url === "string" && baseline.url.length > 0) this.#lastUrl = baseline.url;
+		const runSignal = this.#runContext?.signal;
+		const signal =
+			opts?.signal && runSignal ? AbortSignal.any([opts.signal, runSignal]) : (opts?.signal ?? runSignal);
 		const deadline = Date.now() + timeoutMs;
-		while (Date.now() <= deadline) {
-			const result = (await this.#request(
-				"browser.url.get",
-				{},
-				Math.min(timeoutMs, 5_000),
+		const remainingMs = (): number => {
+			const remaining = Math.ceil(deadline - Date.now());
+			if (remaining <= 0) throw new ToolError(`tab.waitForNavigation() timed out after ${timeoutMs}ms`);
+			return remaining;
+		};
+		const marker = `__ompNavigationWait_${crypto.randomUUID().replaceAll("-", "")}`;
+		const markerLiteral = JSON.stringify(marker);
+		let markerInstalled = false;
+		try {
+			markerInstalled = true;
+			const baselineResult = (await this.#request(
+				"browser.eval",
+				{
+					script: `(() => { const key = ${markerLiteral}; globalThis[key] = true; setTimeout(() => { delete globalThis[key]; }, ${timeoutMs + 1_000}); return { url: String(location.href || "") }; })()`,
+				},
+				remainingMs(),
 				signal,
-			)) as CmuxUrlGetResult;
-			if (typeof result.url === "string" && result.url.length > 0) {
-				this.#lastUrl = result.url;
-				if (result.url !== startUrl) {
-					if (opts?.waitUntil) {
-						await this.#request(
-							"browser.wait",
-							{ load_state: mapWaitUntil(opts.waitUntil), timeout_ms: timeoutMs },
-							timeoutMs,
-							signal,
-						);
+			)) as CmuxEvalResult;
+			const baseline =
+				baselineResult.value && typeof baselineResult.value === "object"
+					? (baselineResult.value as Record<string, unknown>)
+					: {};
+			const startUrl = typeof baseline.url === "string" && baseline.url.length > 0 ? baseline.url : this.#lastUrl;
+			if (typeof baseline.url === "string" && baseline.url.length > 0) this.#lastUrl = baseline.url;
+			while (true) {
+				const result = (await this.#request(
+					"browser.url.get",
+					{},
+					Math.min(remainingMs(), 5_000),
+					signal,
+				)) as CmuxUrlGetResult;
+				if (typeof result.url === "string" && result.url.length > 0) {
+					this.#lastUrl = result.url;
+					let markerPresent = true;
+					if (result.url === startUrl) {
+						try {
+							const markerResult = (await this.#request(
+								"browser.eval",
+								{ script: `Boolean(globalThis[${markerLiteral}])` },
+								remainingMs(),
+								signal,
+							)) as CmuxEvalResult;
+							markerPresent = markerResult.value === true;
+						} catch {
+							const waitMs = Math.min(50, remainingMs());
+							await untilAborted(signal, () => Bun.sleep(waitMs));
+							continue;
+						}
 					}
-					return null;
+					if (result.url !== startUrl || !markerPresent) {
+						if (opts?.waitUntil) {
+							const loadTimeoutMs = remainingMs();
+							await this.#request(
+								"browser.wait",
+								{ load_state: mapWaitUntil(opts.waitUntil), timeout_ms: loadTimeoutMs },
+								loadTimeoutMs,
+								signal,
+							);
+						}
+						return null;
+					}
 				}
+				const waitMs = Math.min(200, remainingMs());
+				await untilAborted(signal, () => Bun.sleep(waitMs));
 			}
-			await untilAborted(signal, () => Bun.sleep(200));
+		} finally {
+			if (markerInstalled) {
+				void this.#client
+					.request(
+						"browser.eval",
+						{ surface_id: this.#surfaceId, script: `delete globalThis[${markerLiteral}]` },
+						{ timeoutMs: 250 },
+					)
+					.catch(() => undefined);
+			}
 		}
-		throw new ToolError(`tab.waitForNavigation() timed out after ${timeoutMs}ms`);
 	}
 
 	async drag(from: DragTarget, to: DragTarget): Promise<void> {
@@ -655,15 +865,11 @@ export class CmuxTab {
 	}
 
 	async uploadFile(selector: string, ...filePaths: string[]): Promise<void> {
-		if (!filePaths.length) throw new ToolError("tab.uploadFile() requires at least one file path");
-		const files: FilePayload[] = [];
-		for (const filePath of filePaths) {
-			const absolute = resolveToCwd(filePath, this.#requireRunContext("tab.uploadFile()").session.cwd);
-			const file = Bun.file(absolute);
-			const data = Buffer.from(await file.arrayBuffer()).toString("base64");
-			files.push({ name: path.basename(absolute), type: file.type || "application/octet-stream", data });
-		}
-		await this.#selectorAction(selector, "uploadFile", { files });
+		await this.#uploadFiles(selector, filePaths);
+	}
+
+	async codexUploadFile(selector: string, filePaths: readonly string[], timeoutMs: number): Promise<void> {
+		await this.#uploadFiles(selector, filePaths, timeoutMs);
 	}
 
 	async waitForResponse(
@@ -706,6 +912,32 @@ export class CmuxTab {
 		return this.#runtime;
 	}
 
+	async #uploadFiles(selector: string, filePaths: readonly string[], timeoutMs?: number): Promise<void> {
+		if (!filePaths.length) throw new ToolError("tab.uploadFile() requires at least one file path");
+		const runContext = this.#requireRunContext("tab.uploadFile()");
+		const deadline = Date.now() + (timeoutMs ?? runContext.timeoutMs);
+		const timeoutController = new AbortController();
+		const timer = setTimeout(() => timeoutController.abort(), Math.max(1, Math.ceil(deadline - Date.now())));
+		const signal = AbortSignal.any([runContext.signal, timeoutController.signal]);
+		try {
+			const files: FilePayload[] = [];
+			for (const filePath of filePaths) {
+				const absolute = resolveToCwd(filePath, runContext.session.cwd);
+				const file = Bun.file(absolute);
+				const data = (await fs.promises.readFile(absolute, { signal })).toString("base64");
+				files.push({ name: path.basename(absolute), type: file.type || "application/octet-stream", data });
+			}
+			if (Date.now() >= deadline) throw new ToolError("tab.uploadFile() timed out");
+			await this.#selectorAction(selector, "uploadFile", { files }, Math.max(1, Math.ceil(deadline - Date.now())));
+		} catch (error) {
+			throwIfAborted(runContext.signal);
+			if (timeoutController.signal.aborted) throw new ToolError("tab.uploadFile() timed out", { cause: error });
+			throw error;
+		} finally {
+			clearTimeout(timer);
+		}
+	}
+
 	async #request(
 		method: string,
 		params: Record<string, unknown>,
@@ -737,7 +969,12 @@ export class CmuxTab {
 		return await this.#selectorBox(this.#selectorSpec(selector));
 	}
 
-	async evaluateOnSelector<TResult>(selector: string, source: string, args: unknown[]): Promise<TResult> {
+	async evaluateOnSelector<TResult>(
+		selector: string,
+		source: string,
+		args: unknown[],
+		timeoutMs?: number,
+	): Promise<TResult> {
 		const spec = this.#selectorSpec(selector);
 		const script = `(() => {
 			const spec = ${JSON.stringify(spec)};
@@ -751,9 +988,11 @@ export class CmuxTab {
 		})()`;
 		// Envelope so a stale selector or a throwing callback reports its actual
 		// error instead of the daemon's generic js_error (see tab.evaluate()).
-		const result = (await this.#request("browser.eval", {
-			script: serializeEvalWithEnvelope(script, []),
-		})) as CmuxEvalResult;
+		const result = (await this.#request(
+			"browser.eval",
+			{ script: serializeEvalWithEnvelope(script, []) },
+			timeoutMs,
+		)) as CmuxEvalResult;
 		return unwrapEvalEnvelope<TResult>(result.value, "elementHandle.evaluate()");
 	}
 
@@ -801,47 +1040,87 @@ export class CmuxTab {
 		selector: string,
 		action: string,
 		args: Record<string, unknown> = {},
+		timeoutMs?: number,
 	): Promise<TResult> {
+		const operationTimeoutMs = timeoutMs ?? this.#runContext?.timeoutMs ?? 30_000;
+		const deadline = Date.now() + operationTimeoutMs;
+		const remaining = (): number => {
+			const value = Math.ceil(deadline - Date.now());
+			if (value <= 0) throw new ToolError(`tab.${action} timed out after ${operationTimeoutMs}ms`);
+			return value;
+		};
 		const spec = this.#selectorSpec(selector);
 		const nativeSelector = this.#nativeSelector(spec);
 		if (nativeSelector && action !== "select" && action !== "uploadFile") {
 			switch (action) {
 				case "click":
-					await this.#request("browser.click", { selector: nativeSelector });
+					await this.#request("browser.click", { selector: nativeSelector }, remaining());
 					return undefined as TResult;
 				case "dblclick":
-					await this.#request("browser.dblclick", { selector: nativeSelector });
+					await this.#request("browser.dblclick", { selector: nativeSelector }, remaining());
 					return undefined as TResult;
 				case "hover":
-					await this.#request("browser.hover", { selector: nativeSelector });
+					await this.#request("browser.hover", { selector: nativeSelector }, remaining());
 					return undefined as TResult;
 				case "focus":
-					await this.#request("browser.focus", { selector: nativeSelector });
+					await this.#request("browser.focus", { selector: nativeSelector }, remaining());
 					return undefined as TResult;
 				case "check":
-					await this.#request("browser.check", { selector: nativeSelector });
+					await this.#request("browser.check", { selector: nativeSelector }, remaining());
 					return undefined as TResult;
 				case "uncheck":
-					await this.#request("browser.uncheck", { selector: nativeSelector });
+					await this.#request("browser.uncheck", { selector: nativeSelector }, remaining());
 					return undefined as TResult;
-				case "type":
-					await this.#request("browser.type", { selector: nativeSelector, text: String(args.text ?? "") });
+				case "type": {
+					const text = String(args.text ?? "");
+					const before =
+						spec.kind === "css"
+							? await this.#evalSelectorAction<string>(spec, "editableValue", { label: "tab.type" }, remaining())
+							: undefined;
+					await this.#request("browser.type", { selector: nativeSelector, text }, remaining());
+					if (spec.kind === "css") {
+						const after = await this.#evalSelectorAction<string>(
+							spec,
+							"editableValue",
+							{ label: "tab.type" },
+							remaining(),
+						);
+						if (typeof before !== "string" || after !== before + text) {
+							throw new ToolError("tab.type did not update the editable element");
+						}
+					}
 					return undefined as TResult;
-				case "fill":
-					await this.#request("browser.fill", { selector: nativeSelector, text: String(args.value ?? "") });
+				}
+				case "fill": {
+					const value = String(args.value ?? "");
+					if (spec.kind === "css") {
+						await this.#evalSelectorAction<string>(spec, "editableValue", { label: "tab.fill" }, remaining());
+					}
+					await this.#request("browser.fill", { selector: nativeSelector, text: value }, remaining());
+					if (spec.kind === "css") {
+						const after = await this.#evalSelectorAction<string>(
+							spec,
+							"editableValue",
+							{ label: "tab.fill" },
+							remaining(),
+						);
+						if (after !== value) throw new ToolError("tab.fill did not update the editable element");
+					}
 					return undefined as TResult;
+				}
 				case "scrollIntoView":
-					await this.#request("browser.scroll_into_view", { selector: nativeSelector });
+					await this.#request("browser.scroll_into_view", { selector: nativeSelector }, remaining());
 					return undefined as TResult;
 			}
 		}
-		return await this.#evalSelectorAction<TResult>(spec, action, args);
+		return await this.#evalSelectorAction<TResult>(spec, action, args, remaining());
 	}
 
 	async #evalSelectorAction<TResult>(
 		spec: SelectorSpec,
 		action: string,
 		args: Record<string, unknown>,
+		timeoutMs?: number,
 	): Promise<TResult> {
 		const script = `(() => {
 			const spec = ${JSON.stringify(spec)};
@@ -850,16 +1129,27 @@ export class CmuxTab {
 			${PAGE_SELECTOR_HELPERS}
 			const element = findElement(spec);
 			if (!element) throw new Error("No element matched " + spec.raw);
+			if (action === "editableValue") return editableValue(element, String(args.label || "selector action"));
 			if (action !== "exists") element.scrollIntoView({ block: "center", inline: "center" });
 			switch (action) {
 				case "click":
+					assertReceivesPointerAtCenter(element);
+					if (typeof element.focus === "function") element.focus();
 					mouseEvent(element, "mousedown");
 					mouseEvent(element, "mouseup");
 					if (typeof element.click === "function") element.click();
 					else mouseEvent(element, "click");
 					return true;
 				case "dblclick":
-					mouseEvent(element, "dblclick");
+					assertReceivesPointerAtCenter(element);
+					if (typeof element.focus === "function") element.focus();
+					for (let index = 0; index < 2; index++) {
+						mouseEvent(element, "mousedown");
+						mouseEvent(element, "mouseup");
+						if (typeof element.click === "function") element.click();
+						else mouseEvent(element, "click", { detail: index + 1 });
+					}
+					mouseEvent(element, "dblclick", { detail: 2 });
 					return true;
 				case "hover":
 					mouseEvent(element, "mouseover");
@@ -878,12 +1168,14 @@ export class CmuxTab {
 					inputEvent(element);
 					return true;
 				case "type":
+					editableValue(element, "tab.type");
 					if (typeof element.focus === "function") element.focus();
-					setValue(element, String(args.text || ""), true);
+					setValue(element, String(args.text || ""), true, "tab.type");
 					return true;
 				case "fill":
+					editableValue(element, "tab.fill");
 					if (typeof element.focus === "function") element.focus();
-					setValue(element, String(args.value || ""), false);
+					setValue(element, String(args.value || ""), false, "tab.fill");
 					return true;
 				case "scrollIntoView":
 					return true;
@@ -915,8 +1207,12 @@ export class CmuxTab {
 			}
 			throw new Error("Unsupported selector action " + action);
 		})()`;
-		const result = (await this.#request("browser.eval", { script }, this.#runContext?.timeoutMs)) as CmuxEvalResult;
-		return result.value as TResult;
+		const result = (await this.#request(
+			"browser.eval",
+			{ script: serializeEvalWithEnvelope(script, []) },
+			timeoutMs ?? this.#runContext?.timeoutMs,
+		)) as CmuxEvalResult;
+		return unwrapEvalEnvelope<TResult>(result.value, `tab.${action}`);
 	}
 
 	async #waitForSelector(selector: string, timeoutMs: number): Promise<void> {
@@ -928,21 +1224,24 @@ export class CmuxTab {
 			return;
 		}
 		const deadline = Date.now() + timeoutMs;
-		while (Date.now() <= deadline) {
-			if (await this.#selectorExists(spec)) return;
-			await untilAborted(signal, () => Bun.sleep(100));
+		for (;;) {
+			const remainingMs = Math.ceil(deadline - Date.now());
+			if (remainingMs <= 0) {
+				throw new ToolError(`tab.waitFor(${JSON.stringify(selector)}) timed out after ${timeoutMs}ms`);
+			}
+			if (await this.#selectorExists(spec, remainingMs)) return;
+			await untilAborted(signal, () => Bun.sleep(Math.min(100, Math.max(1, deadline - Date.now()))));
 		}
-		throw new ToolError(`tab.waitFor(${JSON.stringify(selector)}) timed out after ${timeoutMs}ms`);
 	}
 
-	async #selectorExists(spec: SelectorSpec): Promise<boolean> {
+	async #selectorExists(spec: SelectorSpec, timeoutMs?: number): Promise<boolean> {
 		if (spec.kind === "ref") return this.#elementRefs.has(Number(spec.value));
 		const script = `(() => {
 			const spec = ${JSON.stringify(spec)};
 			${PAGE_SELECTOR_HELPERS}
 			return !!findElement(spec);
 		})()`;
-		return !!(await this.#evalScript<unknown>(script));
+		return !!(await this.#evalScript<unknown>(script, timeoutMs));
 	}
 
 	async #selectorBox(spec: SelectorSpec): Promise<BoundingBox | null> {
@@ -1116,8 +1415,12 @@ class CmuxElementHandle {
 		this.#selector = selector;
 	}
 
-	async click(): Promise<void> {
-		await this.#tab.click(this.#selector);
+	async click(timeoutMs?: number): Promise<void> {
+		await this.#tab.click(this.#selector, timeoutMs);
+	}
+
+	async dblclick(timeoutMs?: number): Promise<void> {
+		await this.#tab.dblclick(this.#selector, timeoutMs);
 	}
 
 	async type(text: string): Promise<void> {
@@ -1145,6 +1448,14 @@ class CmuxElementHandle {
 		...args: TArgs
 	): Promise<TResult> {
 		return await this.#tab.evaluateOnSelector<TResult>(this.#selector, fn.toString(), args);
+	}
+
+	async evaluateWithTimeout<TResult, TArgs extends unknown[]>(
+		fn: (element: unknown, ...args: TArgs) => TResult | Promise<TResult>,
+		args: TArgs,
+		timeoutMs: number,
+	): Promise<TResult> {
+		return await this.#tab.evaluateOnSelector<TResult>(this.#selector, fn.toString(), args, timeoutMs);
 	}
 
 	async boundingBox(): Promise<BoundingBox | null> {
@@ -1323,6 +1634,11 @@ export async function runCmuxCode(tab: CmuxTab, opts: RunCmuxCodeOptions): Promi
 	const screenshots: ScreenshotResult[] = [];
 	const runId = crypto.randomUUID();
 	tab.setRunContext({ session: opts.snapshot, output, screenshots, signal, timeoutMs: opts.timeoutMs });
+	let codexAdapter: CmuxCodexBrowserAdapter | undefined;
+	let codexRunStarted = false;
+	let attachedAgent: object | undefined;
+	let priorBrowserDescriptor: PropertyDescriptor | undefined;
+	let browserAttached = false;
 
 	const { promise: cancelRejection, reject } = Promise.withResolvers<never>();
 	// If the synchronous setup below throws (same-realm ownership conflict)
@@ -1371,6 +1687,19 @@ export async function runCmuxCode(tab: CmuxTab, opts: RunCmuxCodeOptions): Promi
 				),
 		});
 
+		const globalScope: object = globalThis;
+		if (!("agent" in globalScope) || typeof globalScope.agent !== "function") {
+			throw new ToolError("Browser JavaScript prelude did not expose callable agent");
+		}
+		const agent = globalScope.agent;
+		attachedAgent = agent;
+		priorBrowserDescriptor = Object.getOwnPropertyDescriptor(agent, "browser");
+		codexAdapter = tab.codexAdapter();
+		await codexAdapter.beginRun();
+		codexRunStarted = true;
+		attachCodexBrowserToAgent(agent, codexAdapter);
+		browserAttached = true;
+
 		const hooks: RuntimeHooks = {
 			onText: chunk => {
 				throwIfAborted(signal);
@@ -1394,9 +1723,20 @@ export async function runCmuxCode(tab: CmuxTab, opts: RunCmuxCodeOptions): Promi
 		]);
 		return { displays: output.finish(), returnValue: cloneSafe(returnValue), screenshots };
 	} finally {
-		signal.removeEventListener("abort", onAbort);
-		runAc.abort(postmortem.markExpectedCleanupError(new ToolAbortError("Browser run ended")));
-		tab.clearRunContext();
+		try {
+			if (browserAttached && attachedAgent) {
+				if (priorBrowserDescriptor) Object.defineProperty(attachedAgent, "browser", priorBrowserDescriptor);
+				else Reflect.deleteProperty(attachedAgent, "browser");
+			}
+		} finally {
+			try {
+				if (codexRunStarted) await codexAdapter?.endRun();
+			} finally {
+				signal.removeEventListener("abort", onAbort);
+				runAc.abort(postmortem.markExpectedCleanupError(new ToolAbortError("Browser run ended")));
+				tab.clearRunContext();
+			}
+		}
 	}
 }
 

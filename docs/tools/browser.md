@@ -70,6 +70,24 @@
 | --- | --- | --- | --- |
 | `code` | `string` | Yes | Async-function body executed by the shared `JsRuntime` (`src/eval/js/shared/runtime.ts`, the same engine as the `eval` JS tool). In scope: browser-specific `page`, `browser`, `tab`, `assert(cond, msg?)`, and `wait(ms)`, plus the runtime prelude helpers (`display`, `print`, `read`, `write`, `append`, `tree`, `env`, `tool`, `completion`, `agent`, `parallel`, `pipeline`, `log`, `phase`, `budget`, ...) and ambient Bun globals (`console`, timers, `URL`, `TextEncoder`/`TextDecoder`, `Buffer`). |
 
+
+## Codex-compatible facade in `run`
+
+Inside `action: "run"`, `agent` remains callable as `agent(prompt, options)` and is additionally decorated with `agent.browser`. The existing `page`, `browser`, and `tab` globals remain available. The outer lifecycle is unchanged: open, run one or more cells, then close.
+
+The facade exposes `nameSession(name)` (trimmed, non-empty), `tabs.new()`, `tabs.selected()`, `tabs.list()`, `tabs.get(id)`, and `tabs.content({ urls, contentType, timeoutMs? })`. User records are available through `user.openTabs()` and `user.history({ from, to, query, limit })` when the backend exposes them. A session has one current tab; `new`, `selected`, `list`, and `get` remain internally consistent, and public tab IDs are strings.
+
+Each tab exposes `playwright`, `cua`, `dom_cua`, `clipboard`, `content`, and `dev` families. Navigation/lifecycle methods are `goto`, `back`, `forward`, `reload`, `close`, `title`, and `url`; `content.export` returns a filesystem path, while `exportGsuite` accepts `"pdf" | "md" | "xlsx" | "csv" | "docx" | "pptx"`; clipboard methods are `read`, `readText`, `write`, and `writeText`; development diagnostics provide `logs`. The Playwright-compatible family includes DOM snapshots, element info (an array DTO), element screenshots, locators and role/text/label/placeholder/test-id/frame queries, screenshots (with `toBase64()`), waits, navigation expectations, and download/file-chooser events. Playwright load states are `load`, `domcontentloaded`, and `networkidle`. Locator `click`/`dblclick` buttons are strings `left`, `right`, or `middle`; coordinate CUA mouse actions alone use numeric buttons 1, 2, or 3. `Download.path()` returns a filesystem path. Locator, DOM-CUA, and CUA `downloadMedia` perform their effect and resolve `void`. The CUA family provides `get_visible_screenshot` (an image wrapper with `toBase64()`), `click`, `double_click`, `drag`, `keypress`, `move`, `scroll`, `type`, and `downloadMedia`; `dom_cua` provides `get_visible_dom`, node-id `click`/`double_click`, `scroll`, `type`, `keypress`, and `downloadMedia` when supported by the selected backend.
+
+Selector actions default to and are capped at 3000 ms; navigation defaults to 10000 ms. Actions validate observable postconditions. Supported method names, validation, and return/error shapes are consistent across backends; unsupported capabilities fail immediately with stable named `BrowserCapabilityError`, never by fake fallback or silent no-op.
+
+Example:
+
+```js
+const tab = await agent.browser.tabs.new();
+await tab.goto("https://example.test/docs");
+await tab.playwright.getByRole("button", { name: "Continue" }).click();
+```
 ## Outputs
 The tool returns one result per call; no streaming partial output is emitted from the browser implementation itself.
 

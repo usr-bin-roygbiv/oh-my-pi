@@ -1,5 +1,6 @@
 import type { ElementHandle, JSHandle, Page } from "puppeteer-core";
 import { ToolError } from "../../tool-errors";
+import type { CodexLocatorDescriptor } from "../codex-facade";
 import ariaBundle from "./aria-snapshot.bundle.txt" with { type: "text" };
 // `aria-snapshot.bundle.txt` is a generated, committed artifact: Playwright's
 // injected ARIA-snapshot sources (pinned, Apache-2.0) bundled to a CJS module.
@@ -12,6 +13,12 @@ export interface AriaSnapshotOptions {
 	depth?: number;
 	/** Append `[box=x,y,w,h]` bounding boxes to each node. */
 	boxes?: boolean;
+}
+
+export interface AriaElementState {
+	role: string | null;
+	name: string;
+	hidden: boolean;
 }
 
 /**
@@ -36,6 +43,8 @@ function buildEvaluator(params: string, call: string): (...args: unknown[]) => u
 // passed positionally to page.evaluate, never ones nested inside an object.
 const evaluateAriaSnapshot = buildEvaluator("root, request", "ariaSnapshot(root, request)");
 const evaluateResolveRef = buildEvaluator("ref", "resolveAriaRef(ref)");
+const evaluateAriaLocator = buildEvaluator("descriptor", "queryAriaLocator(descriptor)");
+const evaluateAriaElementState = buildEvaluator("element", "ariaElementState(element)");
 
 /**
  * Capture a Playwright-format ARIA snapshot of `root` (or the whole document when
@@ -65,6 +74,24 @@ export async function resolveAriaRefHandle(page: Page, ref: string): Promise<Ele
 		return null;
 	}
 	return element as ElementHandle;
+}
+
+/** Resolve a Codex locator with Playwright's pinned ARIA role/name implementation. */
+export async function queryAriaLocatorHandle(page: Page, descriptor: CodexLocatorDescriptor): Promise<JSHandle> {
+	return await page.evaluateHandle(evaluateAriaLocator as never, descriptor as never);
+}
+
+/** Compute canonical ARIA state for a live element without installing page globals. */
+export async function getAriaElementState(handle: ElementHandle): Promise<AriaElementState> {
+	return (await handle.evaluate(evaluateAriaElementState as never)) as AriaElementState;
+}
+
+/**
+ * Build the cmux page-runtime installer. The exported closures retain the pinned
+ * Playwright implementation and are removed by the run-scoped adapter cleanup.
+ */
+export function buildAriaRuntimeInstallerSource(): string {
+	return `() => { var module = { exports: {} };\n${ariaBundle}\nglobalThis.__ompCodexAriaQuery = module.exports.queryAriaLocator; globalThis.__ompCodexAriaState = module.exports.ariaElementState; return true; }`;
 }
 
 const ARIA_REF_PREFIXES = ["aria-ref=", "aria-ref/", "ariaref/"];

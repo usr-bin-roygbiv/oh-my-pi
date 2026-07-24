@@ -42,8 +42,10 @@ const VENDOR_FILES: Array<[string, string]> = [
 // expandos are cleared first so the fresh module's counter renumbers from e1
 // deterministically (refs are valid until the next snapshot). Installs nothing on
 // `window`.
-const ENTRY_SOURCE = `
+const ENTRY_SOURCE = String.raw`
 import { generateAriaTree, renderAriaTree } from "./injected/ariaSnapshot";
+import { beginDOMCaches, endDOMCaches, isElementVisible } from "./injected/domUtils";
+import { getAriaRole, getElementAccessibleName, isElementHiddenForAria } from "./injected/roleUtils";
 
 export interface AriaSnapshotRequest {
 	depth?: number;
@@ -61,6 +63,175 @@ function walkElements(fn: (el: Element) => void): void {
 	walk(document as unknown as { querySelectorAll(s: string): ArrayLike<Element> });
 }
 type RefElement = Element & { _ariaRef?: { role: string; name: string; ref: string } };
+
+type TextPattern =
+	| { kind: "string"; value: string; exact?: boolean }
+	| { kind: "regexp"; source: string; flags: string };
+type LocatorDescriptor =
+	| { kind: "css"; selector: string }
+	| { kind: "role"; role: string; name?: TextPattern }
+	| { kind: "text"; text: TextPattern }
+	| { kind: "label"; text: TextPattern }
+	| { kind: "placeholder"; text: TextPattern }
+	| { kind: "testId"; testId: string }
+	| { kind: "frame"; selector: string }
+	| { kind: "within"; parent: LocatorDescriptor; child: LocatorDescriptor }
+	| { kind: "and"; left: LocatorDescriptor; right: LocatorDescriptor }
+	| { kind: "or"; left: LocatorDescriptor; right: LocatorDescriptor }
+	| { kind: "filter"; locator: LocatorDescriptor; hasText?: TextPattern; hasNotText?: TextPattern; has?: LocatorDescriptor; hasNot?: LocatorDescriptor; visible?: boolean }
+	| { kind: "nth"; locator: LocatorDescriptor; index: number };
+type QueryRoot = Document | Element | ShadowRoot;
+
+function normalizeText(value: unknown): string {
+	return String(value ?? "").replace(/\s+/g, " ").trim();
+}
+
+function patternMatches(pattern: TextPattern | undefined, value: string): boolean {
+	if (!pattern) return true;
+	const normalized = normalizeText(value);
+	if (pattern.kind === "regexp") return new RegExp(pattern.source, pattern.flags).test(normalized);
+	const expected = normalizeText(pattern.value);
+	return pattern.exact ? normalized === expected : normalized.toLocaleLowerCase().includes(expected.toLocaleLowerCase());
+}
+
+function textOf(element: Element): string {
+	return normalizeText(element.textContent);
+}
+
+function isInertForAria(element: Element): boolean {
+	for (let current: Element | null = element; current; current = current.parentElement) {
+		if (current.hasAttribute("inert")) return true;
+	}
+	return false;
+}
+
+function locatorRole(element: Element): string | null {
+	if (element.tagName.toLowerCase() === "input") {
+		const type = (element.getAttribute("type") ?? "text").toLowerCase();
+		if (["color", "date", "datetime-local", "file", "hidden", "month", "password", "time", "week"].includes(type)) {
+			return null;
+		}
+	}
+	return getAriaRole(element);
+}
+
+function queryAll(root: QueryRoot, selector: string): Element[] {
+	const values: Element[] = [];
+	const visit = (scope: QueryRoot): void => {
+		for (const element of Array.from(scope.querySelectorAll(selector))) values.push(element);
+		for (const element of Array.from(scope.querySelectorAll("*"))) {
+			const shadow = (element as Element & { shadowRoot?: ShadowRoot | null }).shadowRoot;
+			if (shadow) visit(shadow);
+		}
+	};
+	visit(root);
+	return values;
+}
+
+function isFrame(element: Element): element is HTMLIFrameElement {
+	return element.tagName.toLowerCase() === "iframe";
+}
+
+function rootsFor(roots: QueryRoot[]): QueryRoot[] {
+	return roots.flatMap(root => {
+		if (!(root instanceof Element) || !isFrame(root)) return [root];
+		try {
+			if (!root.contentDocument) throw new Error("CODEX_CROSS_ORIGIN_FRAME");
+			return [root.contentDocument];
+		} catch {
+			throw new Error("CODEX_CROSS_ORIGIN_FRAME");
+		}
+	});
+}
+
+function descendants(roots: QueryRoot[]): Element[] {
+	return [...new Set(rootsFor(roots).flatMap(root => queryAll(root, "*")))];
+}
+
+function labelCandidates(element: Element): string[] {
+	const labelled = element as Element & { labels?: ArrayLike<Element> };
+	const values = Array.from(labelled.labels ?? [], textOf);
+	const ariaLabel = normalizeText(element.getAttribute("aria-label"));
+	if (ariaLabel) values.push(ariaLabel);
+	const labelledBy = element.getAttribute("aria-labelledby");
+	if (labelledBy) {
+		const name = normalizeText(labelledBy.split(/\s+/).map(id => element.ownerDocument.getElementById(id)?.textContent ?? "").join(" "));
+		if (name) values.push(name);
+	}
+	return values;
+}
+
+function queryLocator(descriptor: LocatorDescriptor, roots: QueryRoot[]): Element[] {
+	const unique = (elements: Element[]): Element[] => [...new Set(elements)];
+	switch (descriptor.kind) {
+		case "css":
+			return unique(rootsFor(roots).flatMap(root => queryAll(root, descriptor.selector)));
+		case "role":
+			return descendants(roots).filter(element =>
+				!isElementHiddenForAria(element) &&
+				!isInertForAria(element) &&
+				locatorRole(element) === descriptor.role &&
+				patternMatches(descriptor.name, normalizeText(getElementAccessibleName(element, false) || textOf(element))),
+			);
+		case "text": {
+			const matched = descendants(roots).filter(element => patternMatches(descriptor.text, textOf(element)));
+			return matched.filter(element => !Array.from(element.children).some(child => patternMatches(descriptor.text, textOf(child))));
+		}
+		case "label":
+			return descendants(roots).filter(element => labelCandidates(element).some(label => patternMatches(descriptor.text, label)));
+		case "placeholder":
+			return descendants(roots).filter(element => patternMatches(descriptor.text, element.getAttribute("placeholder") ?? ""));
+		case "testId":
+			return descendants(roots).filter(element => element.getAttribute("data-testid") === descriptor.testId);
+		case "frame":
+			return unique(rootsFor(roots).flatMap(root => queryAll(root, descriptor.selector).filter(isFrame)));
+		case "within":
+			return queryLocator(descriptor.child, queryLocator(descriptor.parent, roots));
+		case "and": {
+			const right = new Set(queryLocator(descriptor.right, roots));
+			return queryLocator(descriptor.left, roots).filter(element => right.has(element));
+		}
+		case "or":
+			return unique([...queryLocator(descriptor.left, roots), ...queryLocator(descriptor.right, roots)]);
+		case "filter":
+			return queryLocator(descriptor.locator, roots).filter(element => {
+				const text = textOf(element);
+				if (descriptor.hasText && !patternMatches(descriptor.hasText, text)) return false;
+				if (descriptor.hasNotText && patternMatches(descriptor.hasNotText, text)) return false;
+				if (descriptor.visible !== undefined && isElementVisible(element) !== descriptor.visible) return false;
+				if (descriptor.has && queryLocator(descriptor.has, [element]).length === 0) return false;
+				if (descriptor.hasNot && queryLocator(descriptor.hasNot, [element]).length > 0) return false;
+				return true;
+			});
+		case "nth": {
+			const elements = queryLocator(descriptor.locator, roots);
+			const index = descriptor.index < 0 ? elements.length + descriptor.index : descriptor.index;
+			return index >= 0 && index < elements.length ? [elements[index]!] : [];
+		}
+	}
+}
+
+export function queryAriaLocator(descriptor: LocatorDescriptor): Element[] {
+	beginDOMCaches();
+	try {
+		return queryLocator(descriptor, [document]);
+	} finally {
+		endDOMCaches();
+	}
+}
+
+export function ariaElementState(element: Element): { role: string | null; name: string; hidden: boolean } {
+	beginDOMCaches();
+	try {
+		return {
+			role: locatorRole(element),
+			name: normalizeText(getElementAccessibleName(element, false) || textOf(element)),
+			hidden: isElementHiddenForAria(element) || isInertForAria(element),
+		};
+	} finally {
+		endDOMCaches();
+	}
+}
 
 export function ariaSnapshot(root: Element | null, request: AriaSnapshotRequest = {}): string {
 	walkElements(el => {

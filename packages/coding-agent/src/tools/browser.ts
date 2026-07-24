@@ -38,6 +38,16 @@ export {
 } from "./browser/aria/aria-snapshot";
 export { cmuxSnapshotToObservation, mapWaitUntil, resolveCmuxKind, serializeEval } from "./browser/cmux/rpc";
 export { CmuxSocketClient } from "./browser/cmux/socket-client";
+export {
+	attachCodexBrowserToAgent,
+	BrowserCapabilityError,
+	type CodexBrowserAdapter,
+	type CodexBrowserFacade,
+	type CodexBrowserOperation,
+	type CodexLocatorDescriptor,
+	type CodexTabSummary,
+	createCodexBrowserFacade,
+} from "./browser/codex-facade";
 export { extractReadableFromHtml, type ReadableFormat, type ReadableResult } from "./browser/readable";
 export type { Observation, ObservationEntry } from "./browser/tab-protocol";
 

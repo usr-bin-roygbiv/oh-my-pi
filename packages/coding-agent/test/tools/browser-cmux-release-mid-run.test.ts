@@ -92,7 +92,7 @@ describe("browser tab-supervisor — cmux tab close mid-run (#4499)", () => {
 		const navGate = Promise.withResolvers<Record<string, unknown>>();
 
 		spyOn(CmuxSocketClient.prototype, "request").mockImplementation(
-			async (method: string, _params: Record<string, unknown>): Promise<Record<string, unknown>> => {
+			async (method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> => {
 				switch (method) {
 					case "browser.open_split":
 						return { surface_id: "surface-mid-run", url: "about:blank" };
@@ -100,10 +100,14 @@ describe("browser tab-supervisor — cmux tab close mid-run (#4499)", () => {
 						return { url: "about:blank" };
 					case "browser.snapshot":
 						return { page: { html: "" } };
-					case "browser.eval":
+					case "browser.eval": {
 						// `readyInfo()` needs `document.title` + geometry during
 						// `acquireCmuxTab`; return quickly so setup lands.
-						return { value: "" };
+						const script = typeof params.script === "string" ? params.script : "";
+						return {
+							value: script.includes("return globalThis.__ompCodexBrowserState.fileEventSequence") ? 0 : "",
+						};
+					}
 					case "browser.navigate":
 						navStarted.resolve();
 						return await navGate.promise;
@@ -180,7 +184,7 @@ describe("browser tab-supervisor — cmux tab close mid-run (#4499)", () => {
 		spyOn(CmuxSocketClient.prototype, "close").mockImplementation(() => undefined);
 
 		spyOn(CmuxSocketClient.prototype, "request").mockImplementation(
-			async (method: string, _params: Record<string, unknown>): Promise<Record<string, unknown>> => {
+			async (method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> => {
 				switch (method) {
 					case "browser.open_split":
 						return { surface_id: "surface-wait-mid-run", url: "about:blank" };
@@ -188,8 +192,12 @@ describe("browser tab-supervisor — cmux tab close mid-run (#4499)", () => {
 						return { url: "about:blank" };
 					case "browser.snapshot":
 						return { page: { html: "" } };
-					case "browser.eval":
-						return { value: "" };
+					case "browser.eval": {
+						const script = typeof params.script === "string" ? params.script : "";
+						return {
+							value: script.includes("return globalThis.__ompCodexBrowserState.fileEventSequence") ? 0 : "",
+						};
+					}
 					case "browser.wait":
 					case "surface.close":
 						return {};

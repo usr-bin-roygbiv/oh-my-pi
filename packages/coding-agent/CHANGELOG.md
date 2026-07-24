@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added the Codex-compatible `agent.browser` facade inside `browser` `run` cells, including Playwright, CUA, and DOM-CUA method families, while preserving the callable `agent` helper and existing browser lifecycle.
+
 ## [17.1.2] - 2026-07-24
 
 ### Added
