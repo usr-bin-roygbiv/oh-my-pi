@@ -529,6 +529,32 @@ describe("read-only contribution storage preflight", () => {
 		});
 	}
 
+	it("reuses one storage when concurrent creators resume from the same authorization gate", async () => {
+		const bothCreatorsEntered = Promise.withResolvers<void>();
+		const releaseCreators = Promise.withResolvers<void>();
+		let creatorCount = 0;
+		const beforeCreate = async (): Promise<void> => {
+			creatorCount++;
+			if (creatorCount === 2) bothCreatorsEntered.resolve();
+			await releaseCreators.promise;
+		};
+
+		const firstPromise = openAutoresearchStorage(cwd.path(), beforeCreate);
+		const secondPromise = openAutoresearchStorage(cwd.path(), beforeCreate);
+		await bothCreatorsEntered.promise;
+		releaseCreators.resolve();
+		const [first, second] = await Promise.all([firstPromise, secondPromise]);
+		const cached = await openAutoresearchStorage(cwd.path());
+		if (first !== second) {
+			const leaked = first === cached ? second : first;
+			leaked.close();
+		}
+
+		expect(creatorCount).toBe(2);
+		expect(first).toBe(second);
+		expect(cached).toBe(first);
+	});
+
 	it("blocks malformed existing storage conservatively without repairing or replacing it", async () => {
 		await openHistoricalSession(cwd.path());
 		closeAllAutoresearchStorages();
