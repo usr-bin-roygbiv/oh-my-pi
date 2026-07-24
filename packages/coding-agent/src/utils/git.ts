@@ -1759,7 +1759,7 @@ export async function writeWorktreeTree(cwd: string, signal?: AbortSignal): Prom
 				await appendIndexEntry(mode, hashed.objectId, entry.relativePath);
 			}
 		} finally {
-			await stagedRecords.return?.();
+			await stagedRecords.return?.(undefined);
 		}
 		await flushIndexBatch();
 		return parseObjectId(await runText(repository.repoRoot, ["write-tree"], { env, signal }), "tree");

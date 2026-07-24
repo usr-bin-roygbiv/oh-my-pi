@@ -5625,7 +5625,9 @@ describe("process-local contribution lifecycle", () => {
 			const concurrency = typeof tool.concurrency === "function" ? tool.concurrency({} as never) : tool.concurrency;
 			expect(concurrency).toBe("exclusive");
 		}
-		expect(init.concurrency?.({ new_segment: true })).toBe("exclusive");
+		const initConcurrency =
+			typeof init.concurrency === "function" ? init.concurrency({ new_segment: true }) : init.concurrency;
+		expect(initConcurrency).toBe("exclusive");
 		await init.execute(
 			"initial",
 			{ name: "initial", primary_metric: "runtime_ms" },
