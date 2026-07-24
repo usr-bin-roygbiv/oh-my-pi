@@ -2427,7 +2427,7 @@ describe("process-local contribution lifecycle", () => {
 			await startContribution(harness);
 			contributionStarted = true;
 			const transitionId = `named-${transition}-stop`;
-			let result: Promise<{ cancel?: boolean } | undefined> | { cancel?: boolean } | void;
+			let result: unknown;
 			if (transition === "switch") {
 				result = handlerRequired<SessionBeforeSwitchEvent, { cancel?: boolean }>(harness, "session_before_switch")(
 					{
@@ -3222,6 +3222,7 @@ describe("process-local contribution lifecycle", () => {
 		);
 		const committedHead = (await $`git -C ${cwd.path()} rev-parse HEAD`.quiet()).text().trim();
 		const committedTree = await readRawCommitTree(cwd.path(), committedHead);
+		if (!committedTree) throw new Error("Expected mutating hook commit tree");
 		const indexTree = (await $`git -C ${cwd.path()} write-tree`.quiet()).text().trim();
 		const porcelain = (await $`git -C ${cwd.path()} status --porcelain=v1 -z`.quiet()).arrayBuffer();
 
@@ -4061,7 +4062,11 @@ describe("process-local contribution lifecycle", () => {
 			harness.setCurrentBranch(branchB);
 		});
 		const stageSpy = vi.spyOn(git.stage, "files").mockResolvedValue();
-		const commitSpy = vi.spyOn(git, "commit").mockResolvedValue();
+		const commitSpy = vi.spyOn(git, "commit").mockResolvedValue({
+			exitCode: 0,
+			stdout: "",
+			stderr: "",
+		});
 		const initialHead = await git.head.sha(cwd.path());
 		const init = harness.tools.get("init_experiment");
 		if (!init) throw new Error("Expected init_experiment tool");
