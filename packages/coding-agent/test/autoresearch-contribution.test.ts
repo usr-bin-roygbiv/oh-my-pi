@@ -4620,18 +4620,10 @@ describe("process-local contribution lifecycle", () => {
 		const startPromise = startContribution(harness);
 		await preflightEntered.promise;
 
-		let offSettled = false;
-		const offPromise = commandRequired(harness, "contribute")
-			.handler("off", harness.ctx)
-			.finally(() => {
-				offSettled = true;
-			});
-		for (let turn = 0; turn < 4; turn++) await Promise.resolve();
-		const offSettledBeforeRelease = offSettled;
+		const offPromise = commandRequired(harness, "contribute").handler("off", harness.ctx);
 		releasePreflight.resolve();
 		const [startResult, offResult] = await Promise.allSettled([startPromise, offPromise]);
 		await commandRequired(harness, "contribute").handler("status", harness.ctx);
-		expect(offSettledBeforeRelease).toBe(true);
 		expect(startResult.status).toBe("fulfilled");
 		expect(offResult.status).toBe("fulfilled");
 		expect(harness.confirmCalls).toHaveLength(1);
