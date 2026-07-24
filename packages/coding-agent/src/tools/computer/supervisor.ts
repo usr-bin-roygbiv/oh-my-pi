@@ -239,20 +239,39 @@ export async function releaseComputerSessionsForOwner(ownerId: string | undefine
 	await Promise.allSettled(Array.from(controllers, controller => controller.close()));
 }
 
-export async function smokeTestComputerWorker(timeoutMs = SMOKE_TIMEOUT_MS): Promise<void> {
-	const worker = spawnComputerWorker();
-	const id = "computer-smoke";
-	const pong = Promise.withResolvers<void>();
-	const unsubscribeMessage = worker.onMessage(message => {
-		if (message.type === "pong" && message.id === id) pong.resolve();
-	});
-	const unsubscribeError = worker.onError(error => pong.reject(error));
+export async function smokeTestComputerWorker(
+	timeoutMs = SMOKE_TIMEOUT_MS,
+	createWorker: ComputerWorkerFactory = spawnComputerWorker,
+): Promise<void> {
+	const worker = createWorker();
+	const exchange = async (
+		message: ComputerWorkerInbound,
+		expected: ComputerWorkerOutbound["type"],
+		failureMessage: string,
+	): Promise<void> => {
+		const response = Promise.withResolvers<void>();
+		const unsubscribeMessage = worker.onMessage(received => {
+			if (received.type === expected) response.resolve();
+			else if (received.type === "error") response.reject(workerError(received.error));
+		});
+		const unsubscribeError = worker.onError(error => response.reject(error));
+		try {
+			worker.send(message);
+			await withTimeout(response.promise, timeoutMs, failureMessage);
+		} finally {
+			unsubscribeMessage();
+			unsubscribeError();
+		}
+	};
+
 	try {
-		worker.send({ type: "ping", id });
-		await withTimeout(pong.promise, timeoutMs, "Computer worker smoke ping timed out");
+		await exchange(
+			{ type: "init", options: { backend: "auto", display: "all", maxWidth: 1920, maxHeight: 1200 } },
+			"ready",
+			"Computer worker smoke initialization timed out",
+		);
+		await exchange({ type: "close" }, "closed", "Computer worker smoke close timed out");
 	} finally {
-		unsubscribeMessage();
-		unsubscribeError();
 		await worker.terminate();
 	}
 }

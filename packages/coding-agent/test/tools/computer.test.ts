@@ -24,6 +24,7 @@ import {
 	type ComputerWorkerHandle,
 	registerComputerController,
 	releaseComputerSessionsForOwner,
+	smokeTestComputerWorker,
 } from "@oh-my-pi/pi-coding-agent/tools/computer/supervisor";
 import { ComputerWorkerCore, type NativeDesktopSession } from "@oh-my-pi/pi-coding-agent/tools/computer/worker";
 import { computerToolRenderer } from "@oh-my-pi/pi-coding-agent/tools/computer-renderer";
@@ -159,6 +160,38 @@ class NonClosingWorker implements ComputerWorkerHandle {
 			);
 		}
 		// Deliberately ignore close: supervisor must hit its deadline and terminate.
+	}
+
+	onMessage(handler: (message: ComputerWorkerOutbound) => void): () => void {
+		this.#messageHandlers.add(handler);
+		return () => this.#messageHandlers.delete(handler);
+	}
+
+	onError(_handler: (error: Error) => void): () => void {
+		return () => {};
+	}
+
+	async terminate(): Promise<void> {
+		this.terminateCount += 1;
+	}
+
+	#emit(message: ComputerWorkerOutbound): void {
+		for (const handler of this.#messageHandlers) handler(message);
+	}
+}
+
+class SmokeWorker implements ComputerWorkerHandle {
+	readonly sent: ComputerWorkerInbound[] = [];
+	#messageHandlers = new Set<(message: ComputerWorkerOutbound) => void>();
+	terminateCount = 0;
+
+	send(message: ComputerWorkerInbound): void {
+		this.sent.push(message);
+		if (message.type === "init") {
+			queueMicrotask(() => this.#emit({ type: "ready", capabilities }));
+		} else if (message.type === "close") {
+			queueMicrotask(() => this.#emit({ type: "closed" }));
+		}
 	}
 
 	onMessage(handler: (message: ComputerWorkerOutbound) => void): () => void {
@@ -341,6 +374,19 @@ describe("native computer worker", () => {
 });
 
 describe("computer supervisor", () => {
+	it("constructs and closes a native session during install smoke", async () => {
+		const worker = new SmokeWorker();
+		await smokeTestComputerWorker(50, () => worker);
+		expect(worker.sent).toEqual([
+			{
+				type: "init",
+				options: { backend: "auto", display: "all", maxWidth: 1920, maxHeight: 1200 },
+			},
+			{ type: "close" },
+		]);
+		expect(worker.terminateCount).toBe(1);
+	});
+
 	it("force-terminates a worker that misses the bounded close handshake", async () => {
 		const worker = new NonClosingWorker();
 		const supervisor = new ComputerSupervisor(
